@@ -856,6 +856,9 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                        command=self.browse_gemini_keys_file)
         self.browse_gemini_keys_button.pack(side="left")
 
+        self.gemini_quota_label = ctk.CTkLabel(main_frame, text="")
+        self.gemini_quota_label.pack(pady=(0, 5), padx=10, anchor="w")
+
         folder_frame = ctk.CTkFrame(main_frame)
         folder_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(folder_frame, text="Папка для сохранения файлов:").pack(anchor="w")
@@ -919,6 +922,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._update_gemini_model_visibility()
         self._update_threads_visibility()
         self.update_api_keys_from_textbox()
+        self._update_gemini_quota_display()
         self.after(LOG_FLUSH_INTERVAL_MS, self.flush_log_queue)
 
     def update_threads_label(self, *args):
@@ -1000,6 +1004,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._update_gemini_model_visibility()
         self._update_threads_visibility()
         self.update_api_keys_from_textbox()
+        self._update_gemini_quota_display()
         self.save_settings()
 
     def _update_gemini_model_visibility(self):
@@ -1016,10 +1021,28 @@ class TextGeneratorApp(ctk.CTkFrame):
             if not self.threads_frame.winfo_manager():
                 self.threads_frame.pack(pady=5, padx=10, fill="x", before=self.action_frame)
 
+    def _update_gemini_quota_display(self):
+        if self.api_provider_var.get() != "Gemini":
+            if hasattr(self, "gemini_quota_label") and self.gemini_quota_label.winfo_exists():
+                self.gemini_quota_label.configure(text="")
+            return
+        gemini_model_name = self._get_selected_gemini_model()
+        per_key_limit = GEMINI_DAILY_REQUEST_LIMITS.get(gemini_model_name, 0)
+        with self.api_key_queue.mutex:
+            available_keys = set(self.api_key_queue.queue)
+        with GLOBAL_GEMINI_USAGE_LOCK:
+            all_keys = available_keys.union(GLOBAL_GEMINI_KEYS_USAGE.keys())
+            total_capacity = len(all_keys) * per_key_limit
+            available_requests = total_capacity - GLOBAL_GEMINI_RESERVED_REQUESTS
+        available_texts = max(0, available_requests // 2)
+        if hasattr(self, "gemini_quota_label") and self.gemini_quota_label.winfo_exists():
+            self.gemini_quota_label.configure(text=f"Доступно текстов: {available_texts}")
+
     def _on_gemini_model_change(self, *args):
         if self.api_provider_var.get() == "Gemini":
             self._repopulate_available_api_key_queue()
             self.update_threads_label()
+            self._update_gemini_quota_display()
             try:
                 self.save_settings()
             except Exception as e_save:
@@ -1199,6 +1222,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._initial_check_and_revive_keys()
         self._repopulate_available_api_key_queue()
         self.update_threads_label()
+        self._update_gemini_quota_display()
 
     def _update_gui_and_log_bad_key(self, bad_key):
         key_actually_removed_from_master = False
@@ -1375,6 +1399,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 GLOBAL_GEMINI_RESERVED_REQUESTS += required_requests
                 self.reserved_gemini_requests = required_requests
                 self.reserved_gemini_keys = active_keys_current
+                self._update_gemini_quota_display()
         self.set_ui_for_generation(True)
         self.waiting_for_project_slot = True
         self.log_message("Ожидание свободного слота генерации...", "INFO")
@@ -1424,6 +1449,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     GLOBAL_GEMINI_KEYS_USAGE[k] = cnt - 1
         self.reserved_gemini_requests = 0
         self.reserved_gemini_keys = set()
+        self._update_gemini_quota_display()
 
     def stop_generation(self):
         if self.generation_active or self.waiting_for_project_slot:
@@ -2375,7 +2401,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
             # filepath_to_save was determined during H1 generation
             output_format = self.output_format_var.get()
-
+            os.makedirs(os.path.dirname(filepath_to_save), exist_ok=True)
             with open(filepath_to_save, "w", encoding="utf-8") as f:
                 f.write(final_body_content)
             try:
