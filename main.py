@@ -66,6 +66,16 @@ GLOBAL_THREAD_SEMAPHORE = threading.Semaphore(MAX_THREADS)
 GLOBAL_PROJECT_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_PROJECTS)
 PER_KEY_CONCURRENCY = 10
 BAD_API_KEYS_FILE = "BAD_API.txt"
+
+# Глобальный учет лимитов Gemini
+GEMINI_DAILY_REQUEST_LIMITS = {
+    "gemini-2.5-pro": 25,
+    "gemini-2.5-flash": 250,
+    "gemini-2.5-flash-lite": 250,
+}
+GLOBAL_GEMINI_KEYS_USAGE = {}
+GLOBAL_GEMINI_RESERVED_REQUESTS = 0
+GLOBAL_GEMINI_USAGE_LOCK = threading.Lock()
 # Limit the amount of lines kept in the GUI log to avoid slowdown
 MAX_LOG_LINES = 500
 # Interval between log textbox updates in milliseconds
@@ -326,6 +336,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.stop_event = threading.Event()
         self.silent_stop = False
         self.project_slot_acquired = False
+        self.reserved_gemini_requests = 0
+        self.reserved_gemini_keys = set()
 
         # Share API key statuses across all tabs to reduce I/O
         global GLOBAL_API_KEY_STATUSES
@@ -1285,6 +1297,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 widget.configure(state=element_state)
 
     def start_generation_thread(self):
+        global GLOBAL_GEMINI_RESERVED_REQUESTS
         self.stop_event.clear()
         self.silent_stop = False
         # Reset topic to avoid leftover value from previous runs
@@ -1321,7 +1334,9 @@ class TextGeneratorApp(ctk.CTkFrame):
         with self.api_stats_lock:
             self.api_key_usage_stats.clear()
         self._initial_check_and_revive_keys()
-        if self.api_key_queue.empty():
+        with self.api_key_queue.mutex:
+            active_keys_current = set(self.api_key_queue.queue)
+        if not active_keys_current:
             self.log_message(
                 "Нет доступных API ключей в очереди после проверки. Генерация не может быть запущена.",
                 "ERROR",
@@ -1332,6 +1347,34 @@ class TextGeneratorApp(ctk.CTkFrame):
             )
             self.set_ui_for_generation(False)
             return
+        if self.api_provider_var.get() == "Gemini":
+            total_kw = self._count_total_keywords(self.keywords_file_path.get())
+            required_requests = total_kw * 2
+            gemini_model_name = self._get_selected_gemini_model()
+            per_key_limit = GEMINI_DAILY_REQUEST_LIMITS.get(gemini_model_name, 0)
+            with GLOBAL_GEMINI_USAGE_LOCK:
+                prospective_usage = GLOBAL_GEMINI_KEYS_USAGE.copy()
+                for k in active_keys_current:
+                    prospective_usage[k] = prospective_usage.get(k, 0) + 1
+                total_unique_keys = len(prospective_usage)
+                total_capacity = total_unique_keys * per_key_limit
+                available = total_capacity - GLOBAL_GEMINI_RESERVED_REQUESTS
+                if required_requests > available:
+                    self.log_message(
+                        f"Недостаточно лимита Gemini: требуется {required_requests} запросов, доступно {available}.",
+                        "ERROR",
+                    )
+                    messagebox.showerror(
+                        "Превышение лимита",
+                        "Недостаточно общего лимита Gemini для генерации.",
+                    )
+                    self.set_ui_for_generation(False)
+                    return
+                for k in active_keys_current:
+                    GLOBAL_GEMINI_KEYS_USAGE[k] = GLOBAL_GEMINI_KEYS_USAGE.get(k, 0) + 1
+                GLOBAL_GEMINI_RESERVED_REQUESTS += required_requests
+                self.reserved_gemini_requests = required_requests
+                self.reserved_gemini_keys = active_keys_current
         self.set_ui_for_generation(True)
         self.waiting_for_project_slot = True
         self.log_message("Ожидание свободного слота генерации...", "INFO")
@@ -1367,6 +1410,21 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.all_task_definitions.clear()
         threading.Thread(target=self.process_all_keywords, daemon=True).start()
 
+    def _release_gemini_quota(self):
+        global GLOBAL_GEMINI_RESERVED_REQUESTS
+        if self.reserved_gemini_requests <= 0 and not self.reserved_gemini_keys:
+            return
+        with GLOBAL_GEMINI_USAGE_LOCK:
+            GLOBAL_GEMINI_RESERVED_REQUESTS -= self.reserved_gemini_requests
+            for k in self.reserved_gemini_keys:
+                cnt = GLOBAL_GEMINI_KEYS_USAGE.get(k, 0)
+                if cnt <= 1:
+                    GLOBAL_GEMINI_KEYS_USAGE.pop(k, None)
+                else:
+                    GLOBAL_GEMINI_KEYS_USAGE[k] = cnt - 1
+        self.reserved_gemini_requests = 0
+        self.reserved_gemini_keys = set()
+
     def stop_generation(self):
         if self.generation_active or self.waiting_for_project_slot:
             self.silent_stop = True
@@ -1381,6 +1439,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.project_slot_acquired = False
             if self.waiting_for_project_slot and not self.project_slot_acquired:
                 self.waiting_for_project_slot = False
+            self._release_gemini_quota()
             self.set_ui_for_generation(False)
 
     def sanitize_filename(self, fname_base):
@@ -2577,6 +2636,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         if self.project_slot_acquired:
             GLOBAL_PROJECT_SEMAPHORE.release()
             self.project_slot_acquired = False
+        self._release_gemini_quota()
 
     def _monitor_task_queue_and_threads(self, threads_list):
         while not self.task_creation_queue.empty() and not self.stop_event.is_set():
