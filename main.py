@@ -428,8 +428,11 @@ class TextGeneratorApp(ctk.CTkFrame):
             if pass_num > 0:
                 self.log_message(f"Проход {pass_num + 1}: Проверка и оживление cooldown ключей...", "DEBUG")
                 self._initial_check_and_revive_keys()
-                if self.api_key_queue.empty():
-                    self.log_message(f"Проход {pass_num + 1}: Нет активных ключей. Пропускаем.", "WARNING")
+                if self.provider_var.get() == "OpenAI" and self.api_key_queue.empty():
+                    self.log_message(
+                        f"Проход {pass_num + 1}: Нет активных ключей. Пропускаем.",
+                        "WARNING",
+                    )
                     if not self.stop_event.is_set():
                         time.sleep(1)
                     continue
@@ -2558,14 +2561,23 @@ class TextGeneratorApp(ctk.CTkFrame):
             attempt = 0
 
             while (self.output_file_counter - kw_start_count) < quantity and not self.stop_event.is_set():
-                self._initial_check_and_revive_keys()
-                if self.api_key_queue.empty():
-                    self.log_message(
-                        f"Нет активных API ключей для '{keyword}'. Ожидание восстановления...",
-                        "WARNING",
-                    )
-                    time.sleep(1)
-                    continue
+                if self.provider_var.get() == "OpenAI":
+                    self._initial_check_and_revive_keys()
+                    if self.api_key_queue.empty():
+                        self.log_message(
+                            f"Нет активных API ключей для '{keyword}'. Ожидание восстановления...",
+                            "WARNING",
+                        )
+                        time.sleep(1)
+                        continue
+                else:
+                    if not self.api_keys_list:
+                        self.log_message(
+                            f"Нет активных API ключей для '{keyword}'. Ожидание восстановления...",
+                            "WARNING",
+                        )
+                        time.sleep(1)
+                        continue
 
                 attempt += 1
                 if MAX_KEYWORD_ATTEMPTS and attempt > MAX_KEYWORD_ATTEMPTS:
