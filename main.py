@@ -34,7 +34,8 @@ import datetime  # НОВОВВЕДЕНИЕ: Для работы со време
 from dateutil.parser import parse as parse_datetime  # Для парсинга ISO дат, если понадобится при чтении
 from dateutil.relativedelta import relativedelta  # Для парсинга "1m", "60s"
 # Utilities for HTML parsing and shutdown handling
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Tag
+from typing import TypedDict, Optional, Dict, Any
 import sys
 import atexit
 import signal
@@ -47,6 +48,18 @@ else:
 
 def app_path(name: str) -> str:
     return os.path.join(APP_DIR, name)
+
+
+class ApiKeyStatus(TypedDict, total=False):
+    status: str
+    limit_requests: Optional[int]
+    remaining_requests: Optional[int]
+    reset_requests_at: Optional[datetime.datetime]
+    limit_tokens: Optional[int]
+    remaining_tokens: Optional[int]
+    reset_tokens_at: Optional[datetime.datetime]
+    last_updated: Optional[datetime.datetime]
+    error_message: Optional[str]
 
 DEFAULT_CONFIG_FILE = "settings.ini"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -73,7 +86,7 @@ GEMINI_DAILY_REQUEST_LIMITS = {
     "gemini-2.5-flash": 250,
     "gemini-2.5-flash-lite": 250,
 }
-GLOBAL_GEMINI_KEYS_USAGE = {}
+GLOBAL_GEMINI_KEYS_USAGE: Dict[str, int] = {}
 GLOBAL_GEMINI_RESERVED_REQUESTS = 0
 GLOBAL_GEMINI_USAGE_LOCK = threading.Lock()
 # Limit the amount of lines kept in the GUI log to avoid slowdown
@@ -114,11 +127,11 @@ PROJECTS_FILE = "projects.txt"
 BAD_API_KEYS_CACHE = None
 BAD_API_KEYS_CACHE_LOCK = threading.Lock()
 # Храним время последнего запроса к API для каждого ключа
-api_key_last_call_time = {}
+api_key_last_call_time: Dict[str, float] = {}
 api_key_last_call_time_lock = threading.Lock()
 
 # Global API key statuses shared across all project windows
-GLOBAL_API_KEY_STATUSES = None
+GLOBAL_API_KEY_STATUSES: Dict[str, ApiKeyStatus] | None = None
 GLOBAL_API_KEY_STATUSES_LOCK = threading.RLock()
 GLOBAL_API_KEY_STATUSES_LOADED = False
 
@@ -625,12 +638,17 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.progress_data[keyword] = sorted(self.progress_data[keyword])
         # Progress persistence removed
 
-    def _get_default_api_key_status(self):
+    def _get_default_api_key_status(self) -> ApiKeyStatus:
         return {
             "status": "active",
-            "limit_requests": None, "remaining_requests": None, "reset_requests_at": None,
-            "limit_tokens": None, "remaining_tokens": None, "reset_tokens_at": None,
-            "last_updated": None, "error_message": None
+            "limit_requests": None,
+            "remaining_requests": None,
+            "reset_requests_at": None,
+            "limit_tokens": None,
+            "remaining_tokens": None,
+            "reset_tokens_at": None,
+            "last_updated": None,
+            "error_message": None,
         }
 
     def _initial_check_and_revive_keys(self):
@@ -640,7 +658,9 @@ class TextGeneratorApp(ctk.CTkFrame):
         refreshed_any_key = False
         with self.api_key_statuses_lock:
             for key_str in keys_to_check:
-                status_entry = self.api_key_statuses.get(key_str, self._get_default_api_key_status())
+                status_entry: ApiKeyStatus = self.api_key_statuses.get(
+                    key_str, self._get_default_api_key_status()
+                )
                 changed = False
                 if status_entry["status"] in ["cooldown_requests", "cooldown_both"]:
                     if status_entry["reset_requests_at"] and now_utc >= status_entry["reset_requests_at"]:
@@ -681,7 +701,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             gemini_model = self._get_selected_gemini_model() if self.api_provider_var.get() == "Gemini" else None
             gemini_limit = GEMINI_RPM_LIMITS.get(gemini_model) if gemini_model else None
             for key_str in current_master_keys:
-                status_data = self.api_key_statuses.get(key_str)
+                status_data: Optional[ApiKeyStatus] = self.api_key_statuses.get(key_str)
                 if not status_data:
                     status_data = self._get_default_api_key_status()
                 if gemini_limit is not None:
@@ -761,7 +781,9 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _update_api_key_status_from_headers(self, api_key, headers, is_error=False, status_code=None):
         if not api_key or not headers: return
         with self.api_key_statuses_lock:
-            status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
+            status_entry: ApiKeyStatus = self.api_key_statuses.get(
+                api_key, self._get_default_api_key_status()
+            )
             changed_in_function = False
             try:
                 limit_req_hdr = headers.get('x-ratelimit-limit-requests')
@@ -974,7 +996,9 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def browse_folder(self):
         fld = filedialog.askdirectory()
-        if fld: self.output_folder.set(fld); self.log_message(f"Папка для сохранения: {fld}")
+        if fld:
+            self.output_folder.set(fld)
+            self.log_message(f"Папка для сохранения: {fld}")
 
     def browse_keywords_file(self):
         f_path = filedialog.askopenfilename(title="Выберите файл с ключевыми словами",
@@ -1545,16 +1569,16 @@ class TextGeneratorApp(ctk.CTkFrame):
         if not body_root:
             return False
         for child in body_root.children:
-            if not hasattr(child, "name"):
-                if str(child).strip():
+            if isinstance(child, NavigableString):
+                if child.strip():
                     return True
                 continue
             if child.name == "h2":
                 break
-            if child.name in ["p", "li"]:
+            if child.name in ["p", "li"] and isinstance(child, Tag):
                 if child.get_text(strip=True):
                     return True
-            elif hasattr(child, "find_all"):
+            elif isinstance(child, Tag):
                 for sub in child.find_all(["p", "li"], recursive=False):
                     if sub.get_text(strip=True):
                         return True
@@ -1588,8 +1612,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                 specific_error_type = None
                 try:
                     if hasattr(rle, 'response') and rle.response is not None:
-                        error_details = rle.response.json().get("error", {}); specific_error_type = error_details.get(
-                            "type")
+                        error_details = rle.response.json().get("error", {})
+                        specific_error_type = error_details.get("type")
                     elif hasattr(rle, 'body') and rle.body is not None and 'error' in rle.body:
                         specific_error_type = rle.body.get('error', {}).get('type')
                 except Exception as e_parse:
@@ -1601,8 +1625,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return "INVALID_API_KEY_ERROR"
                 current_delay = delay_seconds * (2 ** attempt)
                 if attempt + 1 < retries:
-                    self.log_message(f"Ожидание {current_delay} секунд перед следующей попыткой...",
-                                     "INFO"); time.sleep(current_delay)
+                    self.log_message(
+                        f"Ожидание {current_delay} секунд перед следующей попыткой...",
+                        "INFO",
+                    )
+                    time.sleep(current_delay)
                 else:
                     return None
             except APIStatusError as ase:
@@ -1622,9 +1649,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                     specific_error_type_ase = None
                     try:
                         if hasattr(ase, 'response') and ase.response is not None:
-                            error_details_ase = ase.response.json().get("error",
-                                                                        {}); specific_error_type_ase = error_details_ase.get(
-                                "type")
+                            error_details_ase = ase.response.json().get("error", {})
+                            specific_error_type_ase = error_details_ase.get("type")
                         elif hasattr(ase, 'body') and ase.body is not None and 'error' in ase.body:
                             specific_error_type_ase = ase.body.get('error', {}).get('type')
                     except Exception as e_parse_ase:
@@ -1641,8 +1667,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                 else:
                     current_delay = delay_seconds * (2 ** attempt)
                 if attempt + 1 < retries:
-                    self.log_message(f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
-                                     "INFO"); time.sleep(current_delay)
+                    self.log_message(
+                        f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
+                        "INFO",
+                    )
+                    time.sleep(current_delay)
                 else:
                     return None
             except APIConnectionError as ace:
@@ -2521,7 +2550,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 "DEBUG",
             )
 
-    def process_all_keywords(self):
+    def process_all_keywords(self) -> None:
         keywords_input_list_local = []
         total_expected = 0
         try:
@@ -2822,8 +2851,8 @@ class ApiKeyStatusWindow(ctk.CTkToplevel):
             last_upd_display = "N/A"
             if isinstance(last_upd, datetime.datetime):
                 try:
-                    last_upd_local = last_upd.astimezone() if last_upd.tzinfo else last_upd; last_upd_display = last_upd_local.strftime(
-                        "%H:%M:%S")
+                    last_upd_local = last_upd.astimezone() if last_upd.tzinfo else last_upd
+                    last_upd_display = last_upd_local.strftime("%H:%M:%S")
                 except Exception:
                     last_upd_display = last_upd.strftime("%H:%M:%S (UTC?)")
             error_msg = status_data.get("error_message", "")
