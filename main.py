@@ -367,6 +367,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_usage_file = os.path.join(os.path.dirname(self.config_file), "gemini_key_usage.json")
         self.gemini_key_usage = {}
         self.gemini_limiters = {}
+        self.gemini_wait_logged = {}
+        self.gemini_429_counts = {}
         self.generation_active = False
         self.waiting_for_project_slot = False
         self.stop_event = threading.Event()
@@ -1676,10 +1678,14 @@ class TextGeneratorApp(ctk.CTkFrame):
             next_ts = usage.get("next_allowed_ts", 0.0)
             if next_ts > now:
                 wait = next_ts - now
-                if wait > 0:
+                last_logged = self.gemini_wait_logged.get(api_key_used_for_call)
+                if last_logged != next_ts:
                     self.log_message(f"Ключ ...{key_tail} ждёт {int(wait)} секунд", "INFO")
-                    time.sleep(wait)
+                    self.gemini_wait_logged[api_key_used_for_call] = next_ts
+                time.sleep(wait)
                 continue
+            else:
+                self.gemini_wait_logged.pop(api_key_used_for_call, None)
             if usage.get("used_today", 0) >= 250:
                 self.log_message(f"Ключ {api_key_used_for_call[:7]}... исчерпан сегодня.", "ERROR")
                 self._mark_gemini_key_exhausted(api_key_used_for_call)
@@ -1710,6 +1716,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.gemini_key_usage[api_key_used_for_call] = usage
                 self._save_gemini_key_usage()
                 self.update_gemini_capacity_label()
+                self.gemini_429_counts[api_key_used_for_call] = 0
                 if usage["used_today"] >= 250:
                     self._mark_gemini_key_exhausted(api_key_used_for_call)
                 backoff = 1.0
@@ -1726,6 +1733,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                 except Exception:
                     pass
                 wait = max(retry_delay, backoff) * random.uniform(0.5, 1.5)
+                count = self.gemini_429_counts.get(api_key_used_for_call, 0) + 1
+                self.gemini_429_counts[api_key_used_for_call] = count
+                if count >= 5:
+                    wait = max(wait, 120)
+                    self.gemini_429_counts[api_key_used_for_call] = 0
                 self.log_message(f"Ключ ...{key_tail} 429, ожидание {int(wait)} секунд", "WARNING")
                 usage["next_allowed_ts"] = time.time() + wait
                 self.gemini_key_usage[api_key_used_for_call] = usage
