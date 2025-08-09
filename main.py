@@ -739,7 +739,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._save_api_key_statuses()
 
     def _current_per_key_concurrency(self):
-        return 1 if self.provider_var.get() == PROVIDER_GEMINI else PER_KEY_CONCURRENCY
+        return PER_KEY_CONCURRENCY
 
     def _repopulate_available_api_key_queue(self):
         with self.api_key_management_lock:
