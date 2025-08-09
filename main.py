@@ -23,6 +23,7 @@ import threading
 import os
 import time
 import re
+from collections import deque
 from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 import google.generativeai as genai
 from queue import Queue, Empty
@@ -123,6 +124,8 @@ GEMINI_BATCH_LIMITS = {
     "gemini-2.5-flash-lite": 10,
 }
 GEMINI_THREAD_MULTIPLIER = 1
+GEMINI_RPM_LOCK = threading.Lock()
+GEMINI_REQUEST_TIMESTAMPS: Dict[str, deque] = {model: deque() for model in GEMINI_RPM_LIMITS}
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
 
@@ -1724,6 +1727,24 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
         return None
 
+    def _wait_for_global_gemini_rate(self, model_name: str):
+        limit = GEMINI_RPM_LIMITS.get(model_name)
+        if not limit:
+            return
+        dq = GEMINI_REQUEST_TIMESTAMPS.setdefault(model_name, deque())
+        while True:
+            with GEMINI_RPM_LOCK:
+                now = time.time()
+                while dq and now - dq[0] >= 60:
+                    dq.popleft()
+                if len(dq) < limit:
+                    dq.append(now)
+                    return
+                wait = 60 - (now - dq[0])
+            if self.stop_event.is_set():
+                return
+            time.sleep(wait)
+
     def call_gemini_api(self, model_name, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
         prompt = "\n".join([m.get("content", "") for m in messages])
         for attempt in range(retries):
@@ -1731,6 +1752,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message("API вызов прерван сигналом остановки.", "WARNING")
                 return None
             try:
+                self._wait_for_global_gemini_rate(model_name)
                 genai.configure(api_key=api_key_used_for_call)
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(prompt)
