@@ -1682,7 +1682,13 @@ class TextGeneratorApp(ctk.CTkFrame):
                         f"[{context}] Попытка {attempt + 1}/{retries} отправки запроса Gemini ключом {key_short}",
                         "DEBUG",
                     )
-                    resp = requests.post(url, params=params, headers=headers, json=payload, timeout=(10, 30))
+                    resp = requests.post(
+                        url,
+                        params=params,
+                        headers=headers,
+                        json=payload,
+                        timeout=(10, 120),
+                    )
                     self.log_message(
                         f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
                         "DEBUG",
@@ -1748,6 +1754,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                                     f"[{context}] Не удалось обработать RetryInfo для ключа {key_short}",
                                     "DEBUG",
                                 )
+                except requests.exceptions.Timeout as e:
+                    self.log_message(
+                        f"[{context}] Таймаут Gemini API: {e}",
+                        "WARNING",
+                    )
                 except Exception as e:
                     self.log_message(f"[{context}] Gemini API request failed: {e}", "ERROR")
                 if attempt + 1 < retries:
