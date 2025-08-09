@@ -85,6 +85,13 @@ PER_KEY_CALL_INTERVAL = 0.05
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
 
+# Gemini integration constants
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_EXTRA_BODY_SUFFIX = (
+    "Сделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
+)
+EXHAUSTED_KEYS_FILE = "exhausted-limit-keys.txt"
+
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
 PROJECTS_FILE = "projects.txt"
@@ -328,6 +335,11 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.output_folder = tk.StringVar()
         self.keywords_file_path = tk.StringVar()
         self.num_threads_var = tk.IntVar(value=5)
+        self.provider_var = tk.StringVar(value="OpenAI")
+        self.openai_keys_file = tk.StringVar()
+        self.gemini_keys_file = tk.StringVar()
+        self.gemini_usage_file = os.path.join(os.path.dirname(self.config_file), "gemini_key_usage.json")
+        self.gemini_key_usage = {}
         self.generation_active = False
         self.waiting_for_project_slot = False
         self.stop_event = threading.Event()
@@ -392,6 +404,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.last_output_scan_time = 0.0
 
         self._load_api_key_statuses()
+        self._load_gemini_key_usage()
         self.load_settings()
         self.load_progress_data()
         self._initial_check_and_revive_keys()
@@ -405,7 +418,7 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _run_task_batch(self):
         """Run generation loops for current self.all_task_definitions."""
         self._initial_check_and_revive_keys()
-        if self.api_key_queue.empty():
+        if self.provider_var.get() == "OpenAI" and self.api_key_queue.empty():
             self.log_message("Нет доступных API ключей для начала генерации. Проверьте статусы.", "ERROR")
             return
         for pass_num in range(MAX_RETRY_PASSES):
@@ -450,36 +463,53 @@ class TextGeneratorApp(ctk.CTkFrame):
                 break
 
             threads = []
-            num_available_keys_for_threads = self.api_key_queue.qsize()
-            num_active_threads_to_start = min(self.num_threads_var.get(), num_available_keys_for_threads,
-                                              len(tasks_for_this_pass))
-            if num_active_threads_to_start < self.num_threads_var.get() and num_active_threads_to_start > 0:
-                self.log_message(
-                    f"Количество потоков уменьшено до {num_active_threads_to_start} (ограничено ключами/задачами).",
-                    "INFO")
-            if num_active_threads_to_start == 0 and len(tasks_for_this_pass) > 0:
-                self.log_message(f"Нет доступных API ключей или задач для запуска потоков на проходе {pass_num + 1}.",
-                                 "WARNING")
-                if not self.stop_event.is_set():
-                    time.sleep(1)
-                continue
-            for i in range(num_active_threads_to_start):
-                if self.stop_event.is_set():
-                    break
-                acquired = GLOBAL_THREAD_SEMAPHORE.acquire(blocking=False)
-                if not acquired:
+            if self.provider_var.get() == "OpenAI":
+                num_available_keys_for_threads = self.api_key_queue.qsize()
+                num_active_threads_to_start = min(self.num_threads_var.get(), num_available_keys_for_threads,
+                                                  len(tasks_for_this_pass))
+                if num_active_threads_to_start < self.num_threads_var.get() and num_active_threads_to_start > 0:
                     self.log_message(
-                        "Достигнут глобальный предел потоков. Ожидание освобождения слотов...",
-                        "INFO",
-                    )
-                    while not acquired and not self.stop_event.is_set():
-                        acquired = GLOBAL_THREAD_SEMAPHORE.acquire(timeout=1)
-                    if not acquired:
+                        f"Количество потоков уменьшено до {num_active_threads_to_start} (ограничено ключами/задачами).",
+                        "INFO")
+                if num_active_threads_to_start == 0 and len(tasks_for_this_pass) > 0:
+                    self.log_message(f"Нет доступных API ключей или задач для запуска потоков на проходе {pass_num + 1}.",
+                                     "WARNING")
+                    if not self.stop_event.is_set():
+                        time.sleep(1)
+                    continue
+                for i in range(num_active_threads_to_start):
+                    if self.stop_event.is_set():
                         break
-                t = threading.Thread(target=self.worker_thread, name=f"Worker-{i + 1}", daemon=True)
-                threads.append(t)
-                t.start()
-                time.sleep(0.01)
+                    acquired = GLOBAL_THREAD_SEMAPHORE.acquire(blocking=False)
+                    if not acquired:
+                        self.log_message(
+                            "Достигнут глобальный предел потоков. Ожидание освобождения слотов...",
+                            "INFO",
+                        )
+                        while not acquired and not self.stop_event.is_set():
+                            acquired = GLOBAL_THREAD_SEMAPHORE.acquire(timeout=1)
+                        if not acquired:
+                            break
+                    t = threading.Thread(target=self.worker_thread, name=f"Worker-{i + 1}", daemon=True)
+                    threads.append(t)
+                    t.start()
+                    time.sleep(0.01)
+            else:
+                keys = self.api_keys_list[:]
+                for i, key in enumerate(keys):
+                    if self.stop_event.is_set():
+                        break
+                    acquired = GLOBAL_THREAD_SEMAPHORE.acquire(blocking=False)
+                    if not acquired:
+                        while not acquired and not self.stop_event.is_set():
+                            acquired = GLOBAL_THREAD_SEMAPHORE.acquire(timeout=1)
+                        if not acquired:
+                            break
+                    t = threading.Thread(target=self.gemini_worker_thread, args=(key,),
+                                         name=f"GeminiWorker-{i + 1}", daemon=True)
+                    threads.append(t)
+                    t.start()
+                    time.sleep(10)
             if self.stop_event.is_set():
                 self.log_message("Генерация остановлена во время запуска потоков.", "INFO")
             self._monitor_task_queue_and_threads(threads)
@@ -595,6 +625,65 @@ class TextGeneratorApp(ctk.CTkFrame):
             except Exception as e:
                 self.log_message(f"Ошибка сохранения статусов API ключей в {API_KEY_STATUSES_FILE}: {e}", "ERROR")
 
+    # Gemini usage tracking helpers
+    def _load_gemini_key_usage(self):
+        if os.path.exists(self.gemini_usage_file):
+            try:
+                with open(self.gemini_usage_file, "r", encoding="utf-8") as f:
+                    self.gemini_key_usage = json.load(f)
+                today = datetime.date.today().isoformat()
+                for key, data in list(self.gemini_key_usage.items()):
+                    if data.get("date") != today:
+                        self.gemini_key_usage[key] = {"date": today, "used_today": 0, "next_allowed_ts": 0.0}
+            except Exception:
+                self.gemini_key_usage = {}
+
+    def _save_gemini_key_usage(self):
+        try:
+            with open(self.gemini_usage_file, "w", encoding="utf-8") as f:
+                json.dump(self.gemini_key_usage, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _mark_gemini_key_exhausted(self, api_key):
+        exhausted_path = app_path(EXHAUSTED_KEYS_FILE)
+        try:
+            with open(exhausted_path, "a", encoding="utf-8") as f:
+                f.write(api_key + "\n")
+        except Exception:
+            pass
+        with self.api_key_management_lock:
+            if api_key in self.api_keys_list:
+                self.api_keys_list.remove(api_key)
+        self.gemini_key_usage.pop(api_key, None)
+        self._save_gemini_key_usage()
+        self.update_gemini_capacity_label()
+        if not self.api_keys_list:
+            kyiv_now = datetime.datetime.now()
+            tomorrow = (kyiv_now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            hours_left = max(0, (tomorrow - kyiv_now).total_seconds() / 3600.0)
+            self.log_message(
+                f"Все ключи Gemini исчерпаны сегодня. Ожидайте {hours_left:.1f} часов Europe/Kyiv.",
+                "ERROR",
+            )
+
+    def update_gemini_capacity_label(self):
+        if not hasattr(self, 'gemini_capacity_label') or not self.gemini_capacity_label.winfo_exists():
+            return
+        total_keys = len(self.api_keys_list)
+        total_remaining = 0
+        today = datetime.date.today().isoformat()
+        for k in self.api_keys_list:
+            usage = self.gemini_key_usage.get(k, {})
+            if usage.get("date") != today:
+                remaining = 250
+            else:
+                remaining = max(0, 250 - usage.get("used_today", 0))
+            total_remaining += remaining
+        texts_available = total_remaining // 2
+        self.gemini_capacity_label.configure(
+            text=f"Ключей: {total_keys} · доступно сегодня: {texts_available} текстов")
+
     def load_progress_data(self):
         """Initialize in-memory progress tracking (file persistence removed)."""
         self.progress_data = {}
@@ -622,6 +711,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         }
 
     def _initial_check_and_revive_keys(self):
+        if self.provider_var.get() != "OpenAI":
+            return
         with self.api_key_management_lock:
             keys_to_check = self.api_keys_list[:]
         now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -661,6 +752,9 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._save_api_key_statuses()
 
     def _repopulate_available_api_key_queue(self):
+        if self.provider_var.get() != "OpenAI":
+            self.api_key_queue = Queue()
+            return
         with self.api_key_management_lock:
             current_master_keys = self.api_keys_list[:]
         new_queue = Queue()
@@ -783,13 +877,36 @@ class TextGeneratorApp(ctk.CTkFrame):
     def create_widgets(self):
         main_frame = ctk.CTkFrame(self)
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
-        api_frame = ctk.CTkFrame(main_frame)
-        api_frame.pack(pady=(10, 5), padx=10, fill="x")
-        ctk.CTkLabel(api_frame, text="API Ключи ChatGPT (каждый с новой строки):").pack(anchor="w", pady=(0, 5))
-        self.api_keys_textbox = ctk.CTkTextbox(api_frame, height=80)
-        self.api_keys_textbox.pack(fill="x", expand=True)
-        if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
-        self.api_keys_textbox.bind("<KeyRelease>", self.handle_api_keys_textbox_change)
+        provider_frame = ctk.CTkFrame(main_frame)
+        provider_frame.pack(pady=(10, 5), padx=10, fill="x")
+        ctk.CTkLabel(provider_frame, text="Провайдер:").pack(side="left", padx=(0, 10))
+        self.provider_combobox = ctk.CTkComboBox(
+            provider_frame,
+            values=["OpenAI", "Gemini 2.5 Flash"],
+            variable=self.provider_var,
+            command=lambda _: self.update_provider_ui(),
+        )
+        self.provider_combobox.pack(side="left")
+
+        self.openai_keys_frame = ctk.CTkFrame(main_frame)
+        ctk.CTkLabel(self.openai_keys_frame, text="Файл с ключами OpenAI:").pack(anchor="w")
+        self.openai_keys_entry = ctk.CTkEntry(self.openai_keys_frame, textvariable=self.openai_keys_file, width=350)
+        self.openai_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.openai_keys_browse = ctk.CTkButton(
+            self.openai_keys_frame, text="Выбрать...", command=self.browse_openai_keys_file
+        )
+        self.openai_keys_browse.pack(side="left")
+
+        self.gemini_keys_frame = ctk.CTkFrame(main_frame)
+        ctk.CTkLabel(self.gemini_keys_frame, text="Файл с ключами Gemini:").pack(anchor="w")
+        self.gemini_keys_entry = ctk.CTkEntry(self.gemini_keys_frame, textvariable=self.gemini_keys_file, width=350)
+        self.gemini_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.gemini_keys_browse = ctk.CTkButton(
+            self.gemini_keys_frame, text="Выбрать...", command=self.browse_gemini_keys_file
+        )
+        self.gemini_keys_browse.pack(side="left")
+        self.gemini_capacity_label = ctk.CTkLabel(self.gemini_keys_frame, text="")
+        self.gemini_capacity_label.pack(anchor="w", pady=(5, 0))
         folder_frame = ctk.CTkFrame(main_frame)
         folder_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(folder_frame, text="Папка для сохранения файлов:").pack(anchor="w")
@@ -823,13 +940,13 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.format_segmented_button = ctk.CTkSegmentedButton(format_frame, values=["TXT", "HTML"],
                                                               variable=self.output_format_var)
         self.format_segmented_button.pack(side="left", fill="x", expand=True)
-        threads_frame = ctk.CTkFrame(main_frame)
-        threads_frame.pack(pady=5, padx=10, fill="x")
-        ctk.CTkLabel(threads_frame, text="Количество потоков:").pack(side="left", padx=(0, 10))
-        self.threads_slider = ctk.CTkSlider(threads_frame, from_=1, to=MAX_THREADS,
+        self.threads_frame = ctk.CTkFrame(main_frame)
+        self.threads_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.threads_frame, text="Количество потоков:").pack(side="left", padx=(0, 10))
+        self.threads_slider = ctk.CTkSlider(self.threads_frame, from_=1, to=MAX_THREADS,
                                             variable=self.num_threads_var, number_of_steps=MAX_THREADS - 1)
         self.threads_slider.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.threads_label = ctk.CTkLabel(threads_frame, text=str(self.num_threads_var.get()))
+        self.threads_label = ctk.CTkLabel(self.threads_frame, text=str(self.num_threads_var.get()))
         self.threads_label.pack(side="left")
         self.num_threads_var.trace_add("write", self.update_threads_label)
         action_frame = ctk.CTkFrame(main_frame)
@@ -852,17 +969,14 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.log_textbox.pack(fill="both", expand=True)
         self.after(100, self._repopulate_available_api_key_queue)
         self.after(LOG_FLUSH_INTERVAL_MS, self.flush_log_queue)
-
-    def handle_api_keys_textbox_change(self, event=None):
-        self.update_api_keys_from_textbox()
-        self._initial_check_and_revive_keys()
-        self._repopulate_available_api_key_queue()
-        self.update_threads_label()
+        self.update_provider_ui()
 
     def update_threads_label(self, *args):
         current_var_val = self.num_threads_var.get()
         if hasattr(self, 'threads_label') and self.threads_label.winfo_exists():
             self.threads_label.configure(text=str(current_var_val))
+        if self.provider_var.get() != "OpenAI":
+            return
         if hasattr(self, 'threads_slider') and self.threads_slider.winfo_exists():
             num_active_keys = self.api_key_queue.qsize()
             if num_active_keys == 0:
@@ -909,6 +1023,22 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.keywords_file_path.set(f_path)
             self.log_message(f"Файл с ключевыми словами: {f_path}")
             self._apply_special_params_from_keywords_file(f_path)
+
+    def browse_openai_keys_file(self):
+        f_path = filedialog.askopenfilename(title="Файл ключей OpenAI",
+                                            filetypes=(("Text files", "*.txt"), ("All files", "*.*")))
+        if f_path:
+            self.openai_keys_file.set(f_path)
+            self.load_api_keys_from_file()
+            self.save_settings()
+
+    def browse_gemini_keys_file(self):
+        f_path = filedialog.askopenfilename(title="Файл ключей Gemini",
+                                            filetypes=(("Text files", "*.txt"), ("All files", "*.*")))
+        if f_path:
+            self.gemini_keys_file.set(f_path)
+            self.load_api_keys_from_file()
+            self.save_settings()
 
     def _apply_special_params_from_keywords_file(self, path):
         """Extract link, language and topic markers from the keywords file."""
@@ -976,32 +1106,53 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.log_message(f"Ошибка подсчета количества ключевых слов: {e}", "ERROR")
         return total
 
+    def load_api_keys_from_file(self):
+        provider = self.provider_var.get()
+        path = self.openai_keys_file.get() if provider == "OpenAI" else self.gemini_keys_file.get()
+        keys = []
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    keys = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                self.log_message(f"Ошибка чтения файла ключей: {e}", "ERROR")
+        with self.api_key_management_lock:
+            self.api_keys_list = keys
+        if provider == "OpenAI":
+            self._repopulate_available_api_key_queue()
+        else:
+            self.api_key_queue = Queue()
+            self.update_gemini_capacity_label()
+
+    def update_provider_ui(self):
+        prov = self.provider_var.get()
+        if prov == "OpenAI":
+            self.gemini_keys_frame.pack_forget()
+            self.openai_keys_frame.pack(pady=(5, 5), padx=10, fill="x")
+            self.threads_frame.pack(pady=5, padx=10, fill="x")
+        else:
+            self.openai_keys_frame.pack_forget()
+            self.gemini_keys_frame.pack(pady=(5, 5), padx=10, fill="x")
+            self.threads_frame.pack_forget()
+            self.update_gemini_capacity_label()
+        self.load_api_keys_from_file()
+
     def load_settings(self):
         cfg = configparser.ConfigParser()
-        initial_keys_loaded = []
         if os.path.exists(self.config_file):
             try:
                 cfg.read(self.config_file, encoding='utf-8')
                 if "Settings" in cfg:
                     s = cfg["Settings"]
                     self.output_folder.set(s.get("OutputFolder", ""))
-                    api_keys_raw = s.get("ApiKeys", "")
-                    if api_keys_raw:
-                        initial_keys_loaded = [k.strip() for k in api_keys_raw.splitlines() if k.strip()]
-                    else:
-                        initial_keys_loaded = load_shared_keys()
-                    with self.api_key_management_lock:
-                        bad_keys_loaded = load_bad_api_keys(self.log_message)
-                        if bad_keys_loaded:
-                            initial_keys_loaded = [k for k in initial_keys_loaded if k not in bad_keys_loaded]
-                        self.api_keys_list = initial_keys_loaded
-                    if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                        self.api_keys_textbox.delete("1.0", tk.END)
-                        if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
+                    self.provider_var.set(s.get("Provider", "OpenAI"))
+                    self.openai_keys_file.set(s.get("OpenAIKeysFile", ""))
+                    self.gemini_keys_file.set(s.get("GeminiKeysFile", ""))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
                     self.output_format_var.set(s.get("OutputFormat", "TXT"))
+                    self.load_api_keys_from_file()
                     self.log_message("Настройки загружены.")
                 else:
                     self.log_message("Секция 'Settings' не найдена в файле конфигурации.", "WARNING")
@@ -1009,23 +1160,21 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ошибка загрузки настроек: {e}", "ERROR")
         else:
             self.log_message("Файл настроек не найден. Будут использованы значения по умолчанию.", "INFO")
-            with self.api_key_management_lock:
-                self.api_keys_list = load_shared_keys()
-            if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                self.api_keys_textbox.delete("1.0", tk.END)
-                if self.api_keys_list:
-                    self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
+            self.load_api_keys_from_file()
 
     def save_settings(self):
         self._save_api_key_statuses()
         cfg = configparser.ConfigParser()
-        with self.api_key_management_lock:
-            keys_to_save = "\n".join(self.api_keys_list)
-            save_shared_keys(self.api_keys_list)
-        cfg["Settings"] = {"OutputFolder": self.output_folder.get(), "ApiKeys": keys_to_save,
-                           "NumThreads": str(self.num_threads_var.get()),
-                           "GenerationLanguage": self.generation_language_var.get(),
-                           "TargetLink": self.target_link_var.get(), "OutputFormat": self.output_format_var.get()}
+        cfg["Settings"] = {
+            "OutputFolder": self.output_folder.get(),
+            "Provider": self.provider_var.get(),
+            "OpenAIKeysFile": self.openai_keys_file.get(),
+            "GeminiKeysFile": self.gemini_keys_file.get(),
+            "NumThreads": str(self.num_threads_var.get()),
+            "GenerationLanguage": self.generation_language_var.get(),
+            "TargetLink": self.target_link_var.get(),
+            "OutputFormat": self.output_format_var.get(),
+        }
         try:
             with open(self.config_file, "w", encoding="utf-8") as cf:
                 cfg.write(cf)
@@ -1050,33 +1199,6 @@ class TextGeneratorApp(ctk.CTkFrame):
         PROGRAM_EXITED_VIA_UI = True
         self.save_settings()
         self.destroy()
-
-    def update_api_keys_from_textbox(self):
-        if not hasattr(self, 'api_keys_textbox') or not self.api_keys_textbox.winfo_exists(): return
-        keys_str = self.api_keys_textbox.get("1.0", tk.END).strip()
-        new_keys_list = [k.strip() for k in keys_str.split("\n") if k.strip()]
-        with self.api_key_management_lock:
-            old_keys_set = set(self.api_keys_list)
-            new_keys_set = set(new_keys_list)
-            added_keys = new_keys_set - old_keys_set
-            removed_keys = old_keys_set - new_keys_set
-            self.api_keys_list = new_keys_list
-        with self.api_key_statuses_lock:
-            for key_to_remove in removed_keys:
-                if key_to_remove in self.api_key_statuses:
-                    del self.api_key_statuses[key_to_remove]
-                    self.log_message(f"Статус для удаленного ключа {key_to_remove[:7]}... очищен.", "DEBUG")
-            for key_to_add in added_keys:
-                if key_to_add not in self.api_key_statuses:
-                    self.api_key_statuses[key_to_add] = self._get_default_api_key_status()
-                    self.log_message(f"Добавлен новый ключ {key_to_add[:7]}... в отслеживание статусов.", "DEBUG")
-        if added_keys or removed_keys:
-            self._save_api_key_statuses()
-            save_shared_keys(self.api_keys_list)
-            try:
-                self.save_settings()
-            except Exception as e_save:
-                self.log_message(f"Ошибка автосохранения настроек: {e_save}", "ERROR")
 
     def _update_gui_and_log_bad_key(self, bad_key):
         key_actually_removed_from_master = False
@@ -1105,16 +1227,18 @@ class TextGeneratorApp(ctk.CTkFrame):
                             BAD_API_KEYS_CACHE.add(bad_key)
             except Exception as e:
                 self.log_message(f"Не удалось записать плохой ключ {bad_key[:7]}... в файл: {e}", "ERROR")
-            if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                self.api_keys_textbox.delete("1.0", tk.END)
-                if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
             self._repopulate_available_api_key_queue()
             self._save_api_key_statuses()
 
     def validate_inputs(self):
-        if self.api_key_queue.empty():
+        if not self.api_keys_list:
             messagebox.showerror("Ошибка валидации",
-                                 "Нет доступных API ключей для работы. Проверьте введенные ключи и их статусы.")
+                                 "Нет доступных API ключей. Укажите корректный файл с ключами.")
+            return False
+        prov = self.provider_var.get()
+        key_file = self.openai_keys_file.get() if prov == "OpenAI" else self.gemini_keys_file.get()
+        if not key_file or not os.path.isfile(key_file):
+            messagebox.showerror("Ошибка валидации", "Укажите файл с API ключами.")
             return False
         if not self.output_folder.get():
             messagebox.showerror("Ошибка валидации", "Пожалуйста, выберите папку для сохранения файлов.")
@@ -1149,9 +1273,11 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def set_ui_for_generation(self, active):
         self.generation_active = active
-        widgets_to_disable = [self.api_keys_textbox, self.folder_entry, self.browse_button, self.keywords_entry,
-                              self.browse_keywords_button, self.threads_slider, self.language_combobox,
-                              self.target_link_entry, self.format_segmented_button]
+        widgets_to_disable = [self.provider_combobox, self.openai_keys_entry, self.openai_keys_browse,
+                              self.gemini_keys_entry, self.gemini_keys_browse, self.folder_entry,
+                              self.browse_button, self.keywords_entry, self.browse_keywords_button,
+                              self.threads_slider, self.language_combobox, self.target_link_entry,
+                              self.format_segmented_button]
         button_state_if_active = "disabled"
         button_state_if_inactive = "normal"
         element_state = "disabled" if active else "normal"
@@ -1167,6 +1293,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.silent_stop = False
         # Reset topic to avoid leftover value from previous runs
         self.topic_word = ""
+        self.load_api_keys_from_file()
         if not self.validate_inputs():
             return
         target_link = self.target_link_var.get().strip()
@@ -1229,14 +1356,19 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.after(1000, self._wait_for_project_slot)
 
     def _begin_generation_after_slot(self):
-        with self.api_key_queue.mutex:
-            active_keys = set(self.api_key_queue.queue)
-        target_threads = min(MAX_THREADS, len(active_keys) * PER_KEY_CONCURRENCY)
-        self.num_threads_var.set(target_threads)
+        if self.provider_var.get() == "OpenAI":
+            with self.api_key_queue.mutex:
+                active_keys = set(self.api_key_queue.queue)
+            target_threads = min(MAX_THREADS, len(active_keys) * PER_KEY_CONCURRENCY)
+            self.num_threads_var.set(target_threads)
+            active_keys_count = self.api_key_queue.qsize()
+        else:
+            active_keys_count = len(self.api_keys_list)
+            self.num_threads_var.set(active_keys_count)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
         self.log_message(
-            f"Запуск генерации: {self.num_threads_var.get()} поток(а/ов), активных ключей в очереди: {self.api_key_queue.qsize()}."
+            f"Запуск генерации: {self.num_threads_var.get()} поток(а/ов), активных ключей: {active_keys_count}."
         )
         self.successful_task_ids.clear()
         self.all_task_definitions.clear()
@@ -1455,6 +1587,49 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
         return None
 
+    def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3):
+        today = datetime.date.today().isoformat()
+        usage = self.gemini_key_usage.get(api_key_used_for_call, {})
+        if usage.get("date") != today:
+            usage = {"date": today, "used_today": 0, "next_allowed_ts": 0.0}
+        self.gemini_key_usage[api_key_used_for_call] = usage
+        for attempt in range(retries):
+            if self.stop_event.is_set():
+                return None
+            if usage["used_today"] >= 250:
+                self.log_message(f"Ключ {api_key_used_for_call[:7]}... исчерпан сегодня.", "ERROR")
+                self._mark_gemini_key_exhausted(api_key_used_for_call)
+                return None
+            wait = max(0.0, usage.get("next_allowed_ts", 0.0) - time.time())
+            if wait > 0:
+                time.sleep(wait)
+            headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
+            data = {"contents": [{"parts": [{"text": prompt_text}]}]}
+            try:
+                resp = requests.post(GEMINI_API_URL, headers=headers, json=data, timeout=120)
+                if resp.status_code == 200:
+                    try:
+                        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    except Exception:
+                        text = resp.text
+                    usage["used_today"] = usage.get("used_today", 0) + 1
+                    if usage["used_today"] % 10 == 0:
+                        usage["next_allowed_ts"] = time.time() + 65
+                    else:
+                        usage["next_allowed_ts"] = time.time() + 6.5
+                    self.gemini_key_usage[api_key_used_for_call] = usage
+                    self._save_gemini_key_usage()
+                    self.update_gemini_capacity_label()
+                    if usage["used_today"] >= 250:
+                        self._mark_gemini_key_exhausted(api_key_used_for_call)
+                    return text
+                else:
+                    self.log_message(f"Gemini API error: {resp.text}", "ERROR")
+            except Exception as e:
+                self.log_message(f"Gemini API exception: {e}", "ERROR")
+            time.sleep(1)
+        return None
+
     # ================================================================================
     # НОВЫЙ МЕТОД ДЛЯ ОЧИСТКИ HTML (УБЕДИТЕСЬ, ЧТО ОН ВНУТРИ КЛАССА TextGeneratorApp)
     # ================================================================================
@@ -1578,7 +1753,7 @@ class TextGeneratorApp(ctk.CTkFrame):
     # (ЗАМЕНИТЕ СУЩЕСТВУЮЩИЙ ПОЛНОСТЬЮ)
     # ================================================================================
     def generate_single_article_content(self, task_id, keyword_phrase, task_num_for_keyword, total_tasks_for_keyword,
-                                        global_task_num, total_global_tasks):
+                                        global_task_num, total_global_tasks, key_override=None):
         if self.stop_event.is_set(): return False
 
         retrieved_api_key_str = None
@@ -1597,32 +1772,25 @@ class TextGeneratorApp(ctk.CTkFrame):
         link_inserted_flag = False
 
         try:
-            retrieved_api_key_str = self.api_key_queue.get(block=True, timeout=20)
+            if self.provider_var.get() == "OpenAI" and not key_override:
+                retrieved_api_key_str = self.api_key_queue.get(block=True, timeout=20)
+            else:
+                retrieved_api_key_str = key_override
             with self.api_stats_lock:
-                self.api_key_usage_stats[retrieved_api_key_str] = self.api_key_usage_stats.get(retrieved_api_key_str,
-                                                                                               0) + 1
-            key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(
-                retrieved_api_key_str) > 5 else retrieved_api_key_str
+                self.api_key_usage_stats[retrieved_api_key_str] = self.api_key_usage_stats.get(retrieved_api_key_str, 0) + 1
+            key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(retrieved_api_key_str) > 5 else retrieved_api_key_str
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
-            openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-            if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
+            if self.provider_var.get() == "OpenAI":
+                openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
+                if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
         except Empty:
             self.log_message(f"{log_prefix_base} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
             self._initial_check_and_revive_keys()
             return False
         except Exception as e_init:
             self.log_message(
-                f"{log_prefix_base} Ошибка инициализации клиента OpenAI ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
+                f"{log_prefix_base} Ошибка инициализации клиента ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
                 "ERROR")
-            if retrieved_api_key_str:
-                with self.api_key_statuses_lock:
-                    status_data = self.api_key_statuses.get(retrieved_api_key_str, self._get_default_api_key_status())
-                if status_data.get("status") == "active":
-                    self.api_key_queue.put(retrieved_api_key_str)
-                else:
-                    self.log_message(
-                        f"Ключ {key_short_display} не возвращен в очередь, статус: {status_data.get('status')}.",
-                        "DEBUG")
             return False
 
         try:
@@ -1651,21 +1819,25 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "content": f"Сделай так, чтобы главный первый заголовок не был похож вообще на этот, проработай тщательно начало и конец, чтобы не было повторений: \"{self.previous_h1_text}\". ОБЗЯТАТЕЛЬНО НАЧАЛО НЕ ДОЛЖНО СОВПАДАТЬ!!!"
                     })
 
-            original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            if self.provider_var.get() == "OpenAI":
+                original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
 
-            if original_h1_text_raw == "INVALID_API_KEY_ERROR":
-                self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
-                self.after(0, self._update_gui_and_log_bad_key, retrieved_api_key_str)
-                key_marked_as_bad_in_this_task = True
-                return False
+                if original_h1_text_raw == "INVALID_API_KEY_ERROR":
+                    self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
+                    self.after(0, self._update_gui_and_log_bad_key, retrieved_api_key_str)
+                    key_marked_as_bad_in_this_task = True
+                    return False
 
-            with self.api_key_statuses_lock:
-                current_key_status_after_h1 = self.api_key_statuses.get(retrieved_api_key_str, {}).get("status", "active")
-            if current_key_status_after_h1 != "active":
-                key_went_to_cooldown_in_this_task = True
-                self.log_message(
-                    f"{log_prefix} Ключ {key_short_display} перешел в '{current_key_status_after_h1}' после H1.",
-                    "INFO")
+                with self.api_key_statuses_lock:
+                    current_key_status_after_h1 = self.api_key_statuses.get(retrieved_api_key_str, {}).get("status", "active")
+                if current_key_status_after_h1 != "active":
+                    key_went_to_cooldown_in_this_task = True
+                    self.log_message(
+                        f"{log_prefix} Ключ {key_short_display} перешел в '{current_key_status_after_h1}' после H1.",
+                        "INFO")
+            else:
+                h1_prompt_text = "\n".join([m["content"] for m in base_h1_prompt])
+                original_h1_text_raw = self.call_gemini_api(retrieved_api_key_str, h1_prompt_text)
 
             if not original_h1_text_raw or self.stop_event.is_set():
                 self.log_message(
@@ -1797,29 +1969,29 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
-            article_body_raw_from_api = self.call_openai_api(openai_client,
-                                                             [{"role": "system", "content": body_prompt_system},
-                                                              # Теперь body_prompt_system определена
-                                                              {"role": "user", "content": body_prompt_user}],
-                                                             # Теперь body_prompt_user определена
-                                                             retrieved_api_key_str)
+            if self.provider_var.get() == "OpenAI":
+                article_body_raw_from_api = self.call_openai_api(openai_client,
+                                                                 [{"role": "system", "content": body_prompt_system},
+                                                                  {"role": "user", "content": body_prompt_user}],
+                                                                 retrieved_api_key_str)
+                if article_body_raw_from_api == "INVALID_API_KEY_ERROR":
+                    self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (тело). Обработка...", "ERROR")
+                    self.after(0, self._update_gui_and_log_bad_key, retrieved_api_key_str)
+                    key_marked_as_bad_in_this_task = True
+                    return False
+            else:
+                body_prompt_text = body_prompt_system + "\n" + body_prompt_user + "\n" + GEMINI_EXTRA_BODY_SUFFIX
+                article_body_raw_from_api = self.call_gemini_api(retrieved_api_key_str, body_prompt_text)
 
-            # ... (остальной код вашего метода)
-
-            if article_body_raw_from_api == "INVALID_API_KEY_ERROR":  # Обработка невалидного ключа
-                self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (тело). Обработка...", "ERROR")
-                self.after(0, self._update_gui_and_log_bad_key, retrieved_api_key_str)
-                key_marked_as_bad_in_this_task = True
-                return False
-
-            with self.api_key_statuses_lock:  # Проверка статуса ключа
-                current_key_status_after_body = self.api_key_statuses.get(retrieved_api_key_str, {}).get("status",
-                                                                                                         "active")
-            if current_key_status_after_body != "active" and not key_went_to_cooldown_in_this_task:
-                key_went_to_cooldown_in_this_task = True
-                self.log_message(
-                    f"{log_prefix} Ключ {key_short_display} перешел в '{current_key_status_after_body}' после тела.",
-                    "INFO")
+            if self.provider_var.get() == "OpenAI":
+                with self.api_key_statuses_lock:  # Проверка статуса ключа
+                    current_key_status_after_body = self.api_key_statuses.get(retrieved_api_key_str, {}).get("status",
+                                                                                                            "active")
+                if current_key_status_after_body != "active" and not key_went_to_cooldown_in_this_task:
+                    key_went_to_cooldown_in_this_task = True
+                    self.log_message(
+                        f"{log_prefix} Ключ {key_short_display} перешел в '{current_key_status_after_body}' после тела.",
+                        "INFO")
 
             if not article_body_raw_from_api or self.stop_event.is_set():
                 self.log_message(
@@ -2178,7 +2350,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         finally:  # Возвращение ключа в очередь и освобождение пути
             if 'filepath_to_save' in locals():
                 self.release_filepath(filepath_to_save)
-            if retrieved_api_key_str:
+            if retrieved_api_key_str and self.provider_var.get() == "OpenAI":
                 if key_marked_as_bad_in_this_task:
                     pass
                 elif key_went_to_cooldown_in_this_task:
@@ -2251,6 +2423,45 @@ class TextGeneratorApp(ctk.CTkFrame):
                 f"Рабочий поток ({threading.current_thread().name}) завершил свою работу.",
                 "DEBUG",
             )
+
+    def gemini_worker_thread(self, api_key):
+        try:
+            while not self.stop_event.is_set() and api_key in self.api_keys_list:
+                task_payload = None
+                task_dequeued_this_iteration = False
+                try:
+                    task_payload = self.task_creation_queue.get(timeout=1)
+                    task_dequeued_this_iteration = True
+                    if self.stop_event.is_set():
+                        break
+                    task_id, keyword, num_for_kw, total_for_kw, global_num, total_global = task_payload
+                    self.generate_single_article_content(
+                        task_id,
+                        keyword,
+                        num_for_kw,
+                        total_for_kw,
+                        global_num,
+                        total_global,
+                        key_override=api_key,
+                    )
+                except Empty:
+                    if self.task_creation_queue.empty():
+                        break
+                    if self.stop_event.is_set():
+                        break
+                    continue
+                except Exception as e_worker_critical:
+                    task_id_for_log = task_payload[0] if task_payload and isinstance(task_payload, tuple) and len(
+                        task_payload) > 0 else "UNKNOWN_TASK_ID"
+                    self.log_message(
+                        f"Критическая ошибка в потоке {threading.current_thread().name} при обработке задачи {task_id_for_log}:{type(e_worker_critical).__name__} - {e_worker_critical}",
+                        "CRITICAL")
+                    self.log_message(f"Traceback: {traceback.format_exc()}", "DEBUG")
+                finally:
+                    if task_dequeued_this_iteration:
+                        self.task_creation_queue.task_done()
+        finally:
+            GLOBAL_THREAD_SEMAPHORE.release()
 
     def process_all_keywords(self):
         keywords_input_list_local = []
@@ -2466,119 +2677,81 @@ class ApiKeyStatusWindow(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _create_table_headers(self):
-        headers = ["Ключ (хвост)", "Статус", "Запросов (Ост/Лимит)", "Сброс Запросов",
+        headers = ["Провайдер", "Ключ (хвост)", "Статус", "Запросов (Ост/Лимит)", "Сброс Запросов",
                    "Токенов (Ост/Лимит)", "Сброс Токенов", "Обновлено", "Ошибка"]
         for col, header_text in enumerate(headers):
             header_label = ctk.CTkLabel(self.scrollable_frame, text=header_text, font=ctk.CTkFont(weight="bold"),
                                         anchor="w")
             header_label.grid(row=0, column=col, padx=5, pady=(5, 10), sticky="ew")
             self.header_labels.append(header_label)
-            self.scrollable_frame.grid_columnconfigure(col, weight=1 if col == 7 else 0)  # Колонка ошибок растягивается
+            self.scrollable_frame.grid_columnconfigure(col, weight=1 if col == 8 else 0)  # Колонка ошибок растягивается
 
     def populate_table_data(self):
         if not (hasattr(self, 'scrollable_frame') and self.scrollable_frame.winfo_exists()):
             return
 
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        statuses_copy = {}
-        with self.master_app.api_key_statuses_lock:
-            # Сортируем ключи для консистентного отображения, если они добавляются/удаляются
-            sorted_keys_from_master = sorted(self.master_app.api_key_statuses.keys())
-            for key in sorted_keys_from_master:
-                if key in self.master_app.api_key_statuses:  # Доп. проверка на случай изменения словаря в другом потоке
-                    statuses_copy[key] = self.master_app.api_key_statuses[key].copy()
+        for row_widgets in self.data_row_map.values():
+            for w in row_widgets:
+                if w.winfo_exists():
+                    w.destroy()
+        self.data_row_map.clear()
 
-        current_displayed_keys = set(self.data_row_map.keys())
-        keys_in_new_data = set(statuses_copy.keys())
+        prov = self.master_app.provider_var.get()
+        row_idx = 1
+        if prov == "OpenAI":
+            with self.master_app.api_key_statuses_lock:
+                items = list(self.master_app.api_key_statuses.items())
+            for api_key_str, status_data in items:
+                key_display = f"...{api_key_str[-7:]}" if len(api_key_str) > 7 else api_key_str
+                status_val = status_data.get("status", "N/A")
+                rem_req = status_data.get("remaining_requests")
+                lim_req = status_data.get("limit_requests")
+                req_display = f"{rem_req}/{lim_req}" if lim_req is not None and rem_req is not None else "N/A"
+                reset_req_at = status_data.get("reset_requests_at")
+                reset_req_display = str(reset_req_at)[:19] if reset_req_at else "N/A"
+                rem_tok = status_data.get("remaining_tokens")
+                lim_tok = status_data.get("limit_tokens")
+                tok_display = f"{rem_tok}/{lim_tok}" if lim_tok is not None and rem_tok is not None else "N/A"
+                reset_tok_at = status_data.get("reset_tokens_at")
+                reset_tok_display = str(reset_tok_at)[:19] if reset_tok_at else "N/A"
+                last_upd = status_data.get("last_updated")
+                last_upd_display = last_upd.strftime("%H:%M:%S") if isinstance(last_upd, datetime.datetime) else "N/A"
+                error_msg = status_data.get("error_message", "")
+                values = ["OpenAI", key_display, status_val, req_display, reset_req_display, tok_display,
+                          reset_tok_display, last_upd_display, error_msg]
+                row_widgets = []
+                for col, val in enumerate(values):
+                    lbl = ctk.CTkLabel(self.scrollable_frame, text=str(val), anchor="w",
+                                       wraplength=150 if col == 8 else 120)
+                    lbl.grid(row=row_idx, column=col, padx=5, pady=2, sticky="ew")
+                    row_widgets.append(lbl)
+                self.data_row_map[api_key_str] = row_widgets
+                row_idx += 1
+        else:
+            today = datetime.date.today().isoformat()
+            keys = self.master_app.api_keys_list[:]
+            for api_key_str in keys:
+                usage = self.master_app.gemini_key_usage.get(api_key_str,
+                                                            {"date": today, "used_today": 0, "next_allowed_ts": 0.0})
+                key_display = f"...{api_key_str[-7:]}" if len(api_key_str) > 7 else api_key_str
+                used_today = usage.get("used_today", 0)
+                status_val = "exhausted (сегодня)" if used_today >= 250 else "active"
+                req_display = f"{used_today}/250"
+                next_in = max(0, int(usage.get("next_allowed_ts", 0) - time.time()))
+                next_display = str(datetime.timedelta(seconds=next_in))
+                reset_date = (datetime.datetime.now() + datetime.timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d")
+                values = ["Gemini", key_display, status_val, req_display, next_display, "-", reset_date, "", ""]
+                row_widgets = []
+                for col, val in enumerate(values):
+                    lbl = ctk.CTkLabel(self.scrollable_frame, text=str(val), anchor="w",
+                                       wraplength=150 if col == 8 else 120)
+                    lbl.grid(row=row_idx, column=col, padx=5, pady=2, sticky="ew")
+                    row_widgets.append(lbl)
+                self.data_row_map[api_key_str] = row_widgets
+                row_idx += 1
 
-        keys_to_remove = current_displayed_keys - keys_in_new_data
-        for api_key_to_remove in keys_to_remove:
-            if api_key_to_remove in self.data_row_map:
-                for label_widget in self.data_row_map[api_key_to_remove]:
-                    if label_widget.winfo_exists(): label_widget.destroy()
-                del self.data_row_map[api_key_to_remove]
-
-        row_idx_counter = 1
-        for api_key_str in sorted_keys_from_master:  # Используем отсортированный список
-            status_data = statuses_copy.get(api_key_str)
-            if not status_data: continue
-
-            key_display = f"...{api_key_str[-7:]}" if len(api_key_str) > 7 else api_key_str
-            status_val = status_data.get("status", "N/A")
-            rem_req = status_data.get("remaining_requests")
-            lim_req = status_data.get("limit_requests")
-            req_display = f"{rem_req}/{lim_req}" if lim_req is not None and rem_req is not None else "N/A"
-
-            reset_req_at = status_data.get("reset_requests_at")
-            reset_req_display = "N/A"
-            if isinstance(reset_req_at, datetime.datetime):
-                if reset_req_at > now_utc:
-                    delta = relativedelta(reset_req_at, now_utc)
-                    parts = []
-                    if delta.days > 0: parts.append(f"{delta.days}д")
-                    if delta.hours > 0: parts.append(f"{delta.hours}ч")
-                    if delta.minutes > 0: parts.append(f"{delta.minutes}м")
-                    if delta.seconds > 0 or not parts: parts.append(f"{delta.seconds}с")
-                    reset_req_display = " ".join(parts) if parts else "~0с"
-                else:
-                    reset_req_display = "Сброшен"
-            elif reset_req_at:
-                reset_req_display = str(reset_req_at)[:19]
-
-            rem_tok = status_data.get("remaining_tokens")
-            lim_tok = status_data.get("limit_tokens")
-            tok_display = f"{rem_tok}/{lim_tok}" if lim_tok is not None and rem_tok is not None else "N/A"
-
-            reset_tok_at = status_data.get("reset_tokens_at")
-            reset_tok_display = "N/A"
-            if isinstance(reset_tok_at, datetime.datetime):
-                if reset_tok_at > now_utc:
-                    delta = relativedelta(reset_tok_at, now_utc)
-                    parts = []
-                    if delta.days > 0: parts.append(f"{delta.days}д")
-                    if delta.hours > 0: parts.append(f"{delta.hours}ч")
-                    if delta.minutes > 0: parts.append(f"{delta.minutes}м")
-                    if delta.seconds > 0 or not parts: parts.append(f"{delta.seconds}с")
-                    reset_tok_display = " ".join(parts) if parts else "~0с"
-                else:
-                    reset_tok_display = "Сброшен"
-            elif reset_tok_at:
-                reset_tok_display = str(reset_tok_at)[:19]
-
-            last_upd = status_data.get("last_updated")
-            last_upd_display = "N/A"
-            if isinstance(last_upd, datetime.datetime):
-                try:
-                    last_upd_local = last_upd.astimezone() if last_upd.tzinfo else last_upd; last_upd_display = last_upd_local.strftime(
-                        "%H:%M:%S")
-                except Exception:
-                    last_upd_display = last_upd.strftime("%H:%M:%S (UTC?)")
-            error_msg = status_data.get("error_message", "")
-            values_to_display = [key_display, status_val, req_display, reset_req_display, tok_display,
-                                 reset_tok_display, last_upd_display, error_msg]
-
-            if api_key_str in self.data_row_map:
-                labels_for_key = self.data_row_map[api_key_str]
-                for col, new_text in enumerate(values_to_display):
-                    if labels_for_key[col].winfo_exists(): labels_for_key[col].configure(text=str(new_text))
-                for col, label_widget in enumerate(labels_for_key):  # Перегридовка для сохранения порядка
-                    if label_widget.winfo_exists(): label_widget.grid(row=row_idx_counter, column=col, padx=5, pady=2,
-                                                                      sticky="ew")
-            else:
-                new_labels_row = []
-                for col, val_text in enumerate(values_to_display):
-                    cell_label = ctk.CTkLabel(self.scrollable_frame, text=str(val_text),
-                                              wraplength=150 if col == 7 else 120, anchor="w")  # Увеличил wraplength
-                    cell_label.grid(row=row_idx_counter, column=col, padx=5, pady=2, sticky="ew")
-                    new_labels_row.append(cell_label)
-                self.data_row_map[api_key_str] = new_labels_row
-            row_idx_counter += 1
-
-        # Обработка случая, когда нет ключей для отображения
-        if "_no_data_message_" in self.data_row_map and keys_in_new_data:  # Если были "нет данных", а теперь есть
-            for widget in self.data_row_map["_no_data_message_"]: widget.destroy()
-            del self.data_row_map["_no_data_message_"]
-        elif not keys_in_new_data and "_no_data_message_" not in self.data_row_map:  # Если данных нет и сообщения тоже
+        if row_idx == 1:
             no_keys_label = ctk.CTkLabel(self.scrollable_frame, text="Нет API ключей для отображения.")
             no_keys_label.grid(row=1, column=0, columnspan=len(self.header_labels), padx=5, pady=10, sticky="ew")
             self.data_row_map["_no_data_message_"] = [no_keys_label]
