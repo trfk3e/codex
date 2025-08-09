@@ -26,6 +26,7 @@ import re
 from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import random
 import traceback
@@ -2499,12 +2500,15 @@ class TextGeneratorApp(ctk.CTkFrame):
                 "DEBUG",
             )
 
+    
     def gemini_worker_thread(self, api_key):
         self.log_message(f"Ключ ...{api_key[-5:]}:")
+        executor = ThreadPoolExecutor(max_workers=PER_KEY_CONCURRENCY,
+                                      thread_name_prefix=f"GeminiKey-{api_key[-5:]}-")
         try:
             while not self.stop_event.is_set() and api_key in self.api_keys_list:
                 batch = []
-                for _ in range(10):
+                for _ in range(PER_KEY_CONCURRENCY):
                     if self.stop_event.is_set():
                         break
                     try:
@@ -2516,25 +2520,15 @@ class TextGeneratorApp(ctk.CTkFrame):
                     if self.stop_event.is_set() or self.task_creation_queue.unfinished_tasks == 0:
                         break
                     continue
-                for task_payload in batch:
-                    task_id, keyword, num_for_kw, total_for_kw, global_num, total_global = task_payload
-                    try:
-                        self.generate_single_article_content(
-                            task_id,
-                            keyword,
-                            num_for_kw,
-                            total_for_kw,
-                            global_num,
-                            total_global,
-                            key_override=api_key,
-                        )
-                    finally:
-                        self.task_creation_queue.task_done()
-                    if self.stop_event.is_set():
-                        break
+
+                futures = [
+                    executor.submit(self._gemini_task_wrapper, api_key, task_payload)
+                    for task_payload in batch
+                ]
+                wait(futures)
                 if self.stop_event.is_set():
                     break
-                if len(batch) == 10:
+                if len(batch) == PER_KEY_CONCURRENCY:
                     self.log_message(
                         f"Ключ ...{api_key[-5:]}: ожидание 65 секунд после 10 генераций..."
                     )
@@ -2543,7 +2537,23 @@ class TextGeneratorApp(ctk.CTkFrame):
                             break
                         time.sleep(1)
         finally:
+            executor.shutdown(wait=False)
             GLOBAL_THREAD_SEMAPHORE.release()
+
+    def _gemini_task_wrapper(self, api_key, task_payload):
+        task_id, keyword, num_for_kw, total_for_kw, global_num, total_global = task_payload
+        try:
+            self.generate_single_article_content(
+                task_id,
+                keyword,
+                num_for_kw,
+                total_for_kw,
+                global_num,
+                total_global,
+                key_override=api_key,
+            )
+        finally:
+            self.task_creation_queue.task_done()
 
     def process_all_keywords(self):
         keywords_input_list_local = []
