@@ -1922,7 +1922,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
         try:
             if self.provider_var.get() == "Gemini 2.5 Flash":
-                self.log_message(f"{log_prefix} Начало генерации... Пауза 2сек...")
+                self.log_message(f"Одновременно - {log_prefix} Начало генерации...")
             else:
                 self.log_message(f"{log_prefix} Начало генерации...")
             h1_user_prompt_variations = [
@@ -2449,7 +2449,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             )
 
     def gemini_worker_thread(self, api_key):
-        self.log_message(f"Ключ ...{api_key[-5:]}:")
+        self.log_message(f"Одновременно - Ключ ...{api_key[-5:]}:")
         try:
             articles_in_cycle = 0
             cycle_start = time.time()
@@ -2488,8 +2488,6 @@ class TextGeneratorApp(ctk.CTkFrame):
                             time.sleep(remaining)
                         cycle_start = time.time()
                         articles_in_cycle = 0
-                    else:
-                        time.sleep(2)
                 except Empty:
                     if self.task_creation_queue.empty():
                         break
