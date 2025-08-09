@@ -1394,6 +1394,8 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.num_threads_var.set(active_keys_count)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
+        if self.provider_var.get() == "Gemini 2.5 Flash":
+            self.log_message(f"Модель Gemini запущена, обнаружено {active_keys_count} ключей. Запуск по 10 штук для каждого:")
         self.log_message(
             f"Запуск генерации: {self.num_threads_var.get()} поток(а/ов), активных ключей: {active_keys_count}."
         )
@@ -1918,7 +1920,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             with self.api_stats_lock:
                 self.api_key_usage_stats[retrieved_api_key_str] = self.api_key_usage_stats.get(retrieved_api_key_str, 0) + 1
             key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(retrieved_api_key_str) > 5 else retrieved_api_key_str
-            log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
+            if self.provider_var.get() == "Gemini 2.5 Flash":
+                log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}), Общая {global_task_num}/{total_global_tasks}]"
+            else:
+                log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
             if self.provider_var.get() == "OpenAI":
                 openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
                 if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
@@ -1933,7 +1938,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             return False
 
         try:
-            self.log_message(f"{log_prefix} Начало генерации...")
+            if self.provider_var.get() == "Gemini 2.5 Flash":
+                self.log_message(f"{log_prefix} Начало генерации - затем 65 секунд ожидания...")
+            else:
+                self.log_message(f"{log_prefix} Начало генерации...")
             h1_user_prompt_variations = [
                 f"Язык: {selected_lang}. Тема: {self.topic_word} - Придумай короткий, ясный, интригующий SEO H1 для статьи на тему I-Gaming (Не упоминай термин 'I-Gaming' в заголовке): {keyword_phrase}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {keyword_phrase} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
                 f"Язык: {selected_lang}. Тема: {self.topic_word} - Создай привлекающий внимание SEO заголовок H1 для текста о {keyword_phrase}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {keyword_phrase} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
@@ -2458,6 +2466,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             )
 
     def gemini_worker_thread(self, api_key):
+        self.log_message(f"Ключ ...{api_key[-5:]}:")
         try:
             while not self.stop_event.is_set() and api_key in self.api_keys_list:
                 task_payload = None
@@ -2477,6 +2486,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                         total_global,
                         key_override=api_key,
                     )
+                    if not self.stop_event.is_set():
+                        time.sleep(65)
                 except Empty:
                     if self.task_creation_queue.empty():
                         break
