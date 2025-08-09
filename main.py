@@ -1549,6 +1549,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             to_wait = PER_KEY_CALL_INTERVAL - (time.time() - last_ts)
             if to_wait > 0:
                 time.sleep(to_wait)
+            self.log_message("Глобальная задержка 10с перед вызовом OpenAI", "DEBUG")
+            if self.stop_event.wait(10):
+                self.log_message("Глобальная задержка перед OpenAI прервана", "DEBUG")
+                return None
             try:
                 raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
         messages=messages, timeout=300)
@@ -1656,6 +1660,10 @@ class TextGeneratorApp(ctk.CTkFrame):
                 "DEBUG",
             )
             return "GEMINI_KEY_EXHAUSTED"
+        self.log_message(f"[{context}] Глобальная задержка 10с перед запросом Gemini", "DEBUG")
+        if self.stop_event.wait(10):
+            self.log_message(f"[{context}] Глобальная задержка перед Gemini прервана", "DEBUG")
+            return None
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         params = {"key": api_key_used_for_call}
         headers = {"Content-Type": "application/json"}
