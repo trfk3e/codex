@@ -69,7 +69,7 @@ MAX_RETRY_PASSES = 3
 # Увеличено до 10, чтобы снизить вероятность недостающих файлов
 # Limit of generation attempts per keyword. If None, retries continue
 # until the required number of files is produced.
-MAX_KEYWORD_ATTEMPTS = None
+MAX_KEYWORD_ATTEMPTS: int | None = None
 # Максимальное количество потоков
 MAX_THREADS = 200
 # Limit how many projects can run generation simultaneously
@@ -116,6 +116,11 @@ GEMINI_RPM_LIMITS = {
     "gemini-2.5-flash": 10,
     "gemini-2.5-flash-lite": 10,
 }
+GEMINI_BATCH_LIMITS = {
+    "gemini-2.5-pro": 5,
+    "gemini-2.5-flash": 10,
+    "gemini-2.5-flash-lite": 10,
+}
 GEMINI_THREAD_MULTIPLIER = 1
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
@@ -129,6 +134,8 @@ BAD_API_KEYS_CACHE_LOCK = threading.Lock()
 # Храним время последнего запроса к API для каждого ключа
 api_key_last_call_time: Dict[str, float] = {}
 api_key_last_call_time_lock = threading.Lock()
+api_key_batch_counts: Dict[str, int] = {}
+api_key_cooldown_until: Dict[str, float] = {}
 
 # Global API key statuses shared across all project windows
 GLOBAL_API_KEY_STATUSES: Dict[str, ApiKeyStatus] | None = None
@@ -728,10 +735,10 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.api_key_queue = new_queue
         self.update_threads_label()
 
-    def _acquire_api_key_with_cooldown(self, required_interval):
-        """Возвращает API ключ, учитывая минимальный интервал между запросами."""
+    def _acquire_api_key_with_cooldown(self, required_interval: float, batch_limit: Optional[int] = None):
+        """Возвращает API ключ, учитывая минимальный интервал и лимит пакета запросов."""
         while True:
-            wait_times = []
+            wait_times: list[float] = []
             qsize = self.api_key_queue.qsize()
             for _ in range(max(1, qsize)):
                 try:
@@ -740,12 +747,24 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
                 now = time.time()
                 with api_key_last_call_time_lock:
-                    last_ts = api_key_last_call_time.get(key, 0.0)
-                    elapsed = now - last_ts
-                    if elapsed >= required_interval:
-                        api_key_last_call_time[key] = now
-                        return key
-                    wait_times.append(required_interval - elapsed)
+                    cooldown_end = api_key_cooldown_until.get(key, 0.0)
+                    if now < cooldown_end:
+                        wait_times.append(cooldown_end - now)
+                    else:
+                        last_ts = api_key_last_call_time.get(key, 0.0)
+                        elapsed = now - last_ts
+                        if elapsed >= required_interval:
+                            api_key_last_call_time[key] = now
+                            if batch_limit:
+                                count = api_key_batch_counts.get(key, 0) + 1
+                                if count >= batch_limit:
+                                    api_key_batch_counts[key] = 0
+                                    api_key_cooldown_until[key] = now + GEMINI_RATE_LIMIT_INTERVAL
+                                else:
+                                    api_key_batch_counts[key] = count
+                            return key
+                        else:
+                            wait_times.append(required_interval - elapsed)
                 self.api_key_queue.put(key)
             if wait_times:
                 time.sleep(min(wait_times))
@@ -1237,6 +1256,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         with api_key_last_call_time_lock:
             for key_to_remove in removed_keys:
                 api_key_last_call_time.pop(key_to_remove, None)
+                api_key_batch_counts.pop(key_to_remove, None)
+                api_key_cooldown_until.pop(key_to_remove, None)
         if added_keys or removed_keys:
             self._save_api_key_statuses()
             try:
@@ -1817,9 +1838,10 @@ class TextGeneratorApp(ctk.CTkFrame):
 
                 # PASS 4: Очистка пустых тегов <p> или тегов <p>, содержащих только пробелы/&nbsp
                 for p_tag in list(soup.find_all('p')):
-                    if not p_tag.parent: continue
+                    if not isinstance(p_tag, Tag) or not p_tag.parent:
+                        continue
 
-                    text_content = p_tag.get_text(separator="", strip=False)  # Получаем весь текст, включая пробелы
+                    text_content = p_tag.get_text("", False)  # Получаем весь текст, включая пробелы
                     is_effectively_empty = not text_content.strip()  # Если после strip() ничего не осталось
 
                     # Дополнительная проверка на &nbsp; если strip=False оставляет его
@@ -1880,10 +1902,11 @@ class TextGeneratorApp(ctk.CTkFrame):
 
         try:
             cooldown_required = PER_KEY_CALL_INTERVAL
+            batch_limit = None
             if api_provider == "Gemini":
                 gemini_model_name = self._get_selected_gemini_model()
-                cooldown_required = GEMINI_RATE_LIMIT_INTERVAL
-            retrieved_api_key_str = self._acquire_api_key_with_cooldown(cooldown_required)
+                batch_limit = GEMINI_BATCH_LIMITS.get(gemini_model_name, 10)
+            retrieved_api_key_str = self._acquire_api_key_with_cooldown(cooldown_required, batch_limit)
             if not retrieved_api_key_str:
                 raise Empty
             with self.api_stats_lock:
