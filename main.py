@@ -623,7 +623,9 @@ class TextGeneratorApp(ctk.CTkFrame):
         with GEMINI_USAGE_LOCK:
             for key, info in data.items():
                 if info.get("date") != today:
-                    info = {"date": today, "used_today": 0, "next_allowed_ts": 0.0}
+                    info = {"date": today, "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0}
+                else:
+                    info.setdefault("window_count", 0)
                 self.gemini_usage[key] = info
 
     def _save_gemini_usage(self):
@@ -652,26 +654,42 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def _before_gemini_call(self, api_key):
         today = datetime.date.today().isoformat()
-        with GEMINI_USAGE_LOCK:
-            info = self.gemini_usage.setdefault(api_key, {"date": today, "used_today": 0, "next_allowed_ts": 0.0})
-            if info.get("date") != today:
-                info.update({"date": today, "used_today": 0, "next_allowed_ts": 0.0})
-            if info["used_today"] >= 250:
-                return False
-            wait = info.get("next_allowed_ts", 0.0) - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        return True
+        while True:
+            with GEMINI_USAGE_LOCK:
+                info = self.gemini_usage.setdefault(
+                    api_key,
+                    {"date": today, "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
+                )
+                if info.get("date") != today:
+                    info.update({"date": today, "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0})
+                if info["used_today"] >= 250:
+                    return False
+                now = time.time()
+                next_ts = info.get("next_allowed_ts", 0.0)
+                if now < next_ts:
+                    wait = next_ts - now
+                elif info.get("window_count", 0) >= 10:
+                    info["next_allowed_ts"] = now + 65
+                    info["window_count"] = 0
+                    wait = 65
+                else:
+                    info["used_today"] += 1
+                    info["window_count"] = info.get("window_count", 0) + 1
+                    self._save_gemini_usage()
+                    return True
+            if wait > 0:
+                time.sleep(wait)
 
     def _after_gemini_call(self, api_key):
         with GEMINI_USAGE_LOCK:
-            info = self.gemini_usage.setdefault(api_key, {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0})
-            info["used_today"] += 1
-            if info["used_today"] % 10 == 0:
-                info["next_allowed_ts"] = time.time() + 65
-            self._save_gemini_usage()
+            info = self.gemini_usage.setdefault(
+                api_key,
+                {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
+            )
             if info["used_today"] >= 250:
                 self._mark_gemini_key_exhausted(api_key)
+            else:
+                self._save_gemini_usage()
 
     def load_progress_data(self):
         """Initialize in-memory progress tracking (file persistence removed)."""
@@ -1622,6 +1640,26 @@ class TextGeneratorApp(ctk.CTkFrame):
                         f"Gemini API error {resp.status_code}: {resp.text}",
                         "ERROR",
                     )
+                    if resp.status_code == 429:
+                        try:
+                            data = resp.json()
+                            for detail in data.get("error", {}).get("details", []):
+                                if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
+                                    delay = detail.get("retryDelay", "0s")
+                                    seconds = 0.0
+                                    if delay.endswith("s"):
+                                        seconds = float(delay[:-1])
+                                    with GEMINI_USAGE_LOCK:
+                                        info = self.gemini_usage.setdefault(
+                                            api_key_used_for_call,
+                                            {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
+                                        )
+                                        info["next_allowed_ts"] = time.time() + seconds
+                                        info["window_count"] = 0
+                                        self._save_gemini_usage()
+                                    break
+                        except Exception:
+                            pass
             except Exception as e:
                 self.log_message(f"Gemini API request failed: {e}", "ERROR")
             if attempt + 1 < retries:
