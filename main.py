@@ -25,6 +25,7 @@ import time
 import re
 from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
+from collections import deque
 
 import random
 import traceback
@@ -340,6 +341,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_keys_file = tk.StringVar()
         self.gemini_usage_file = os.path.join(os.path.dirname(self.config_file), "gemini_key_usage.json")
         self.gemini_key_usage = {}
+        self.gemini_request_history = {}
         self.generation_active = False
         self.waiting_for_project_slot = False
         self.stop_event = threading.Event()
@@ -1618,6 +1620,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         if usage.get("date") != today:
             usage = {"date": today, "used_today": 0, "next_allowed_ts": 0.0}
         self.gemini_key_usage[api_key_used_for_call] = usage
+        history = self.gemini_request_history.setdefault(api_key_used_for_call, deque(maxlen=10))
         for attempt in range(retries):
             if self.stop_event.is_set():
                 return None
@@ -1625,9 +1628,10 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ключ {api_key_used_for_call[:7]}... исчерпан сегодня.", "ERROR")
                 self._mark_gemini_key_exhausted(api_key_used_for_call)
                 return None
-            wait = max(0.0, usage.get("next_allowed_ts", 0.0) - time.time())
-            if wait > 0:
-                time.sleep(wait)
+            if len(history) == 10:
+                wait = 65 - (time.time() - history[0])
+                if wait > 0:
+                    time.sleep(wait)
             headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
             data = {"contents": [{"parts": [{"text": prompt_text}]}]}
             try:
@@ -1637,16 +1641,22 @@ class TextGeneratorApp(ctk.CTkFrame):
                         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                     except Exception:
                         text = resp.text
+                    now_ts = time.time()
+                    history.append(now_ts)
                     usage["used_today"] = usage.get("used_today", 0) + 1
-                    if usage["used_today"] % 10 == 0:
-                        usage["next_allowed_ts"] = time.time() + 65
+                    if len(history) == 10:
+                        usage["next_allowed_ts"] = history[0] + 65
                     else:
-                        usage["next_allowed_ts"] = time.time() + 6.5
+                        usage["next_allowed_ts"] = now_ts
                     self.gemini_key_usage[api_key_used_for_call] = usage
                     self._save_gemini_key_usage()
                     self.update_gemini_capacity_label()
                     if usage["used_today"] >= 250:
                         self._mark_gemini_key_exhausted(api_key_used_for_call)
+                    else:
+                        next_time = datetime.datetime.fromtimestamp(usage["next_allowed_ts"]).strftime("%H:%M:%S")
+                        self.log_message(
+                            f"Gemini ключ ...{api_key_used_for_call[-5:]} следующий запрос после {next_time}")
                     return text
                 else:
                     self.log_message(f"Gemini API error: {resp.text}", "ERROR")
