@@ -2521,9 +2521,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     if self.stop_event.is_set():
                         break
                 except Empty:
-                    if self.task_creation_queue.empty():
-                        break
-                    if self.stop_event.is_set():
+                    if self.stop_event.is_set() or self.task_creation_queue.unfinished_tasks == 0:
                         break
                     continue
                 except Exception as e_worker_critical:
@@ -2691,13 +2689,12 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.project_slot_acquired = False
 
     def _monitor_task_queue_and_threads(self, threads_list):
-        while not self.task_creation_queue.empty() and not self.stop_event.is_set():
+        while self.task_creation_queue.unfinished_tasks > 0 and not self.stop_event.is_set():
             time.sleep(0.05)
         if self.stop_event.is_set():
             self.log_message("Мониторинг: процесс остановлен. Завершаем без ожидания потоков.", "WARNING")
             return
-        if self.task_creation_queue.empty():
-            self.log_message("Мониторинг: все задачи переданы. Ожидание выполнения...", "INFO")
+        self.log_message("Мониторинг: все задачи выполнены. Ожидание завершения потоков...", "INFO")
         self.log_message(f"Ожидание завершения {len(threads_list)} рабочих потоков...", "INFO")
         for t in threads_list:
             while t.is_alive():
