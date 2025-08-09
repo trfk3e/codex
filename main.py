@@ -65,7 +65,6 @@ MAX_CONCURRENT_PROJECTS = 3
 GLOBAL_THREAD_SEMAPHORE = threading.Semaphore(MAX_THREADS)
 GLOBAL_PROJECT_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_PROJECTS)
 PER_KEY_CONCURRENCY = 10
-MAX_API_KEYS = 100
 BAD_API_KEYS_FILE = "BAD_API.txt"
 # Limit the amount of lines kept in the GUI log to avoid slowdown
 MAX_LOG_LINES = 500
@@ -1005,12 +1004,6 @@ class TextGeneratorApp(ctk.CTkFrame):
             return []
         if not keys:
             messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с ключами")
-        if len(keys) > MAX_API_KEYS:
-            self.log_message(
-                f"Загружено {len(keys)} ключей, используются только первые {MAX_API_KEYS}",
-                "WARNING",
-            )
-            keys = keys[:MAX_API_KEYS]
         return keys
 
     def _prepare_api_keys(self):
