@@ -1366,39 +1366,38 @@ class TextGeneratorApp(ctk.CTkFrame):
                 widget.configure(state=element_state)
 
     def start_generation_thread(self):
+        if not self.validate_inputs():
+            return
+        threading.Thread(target=self._start_generation_background, daemon=True).start()
+
+    def _start_generation_background(self):
         global GLOBAL_GEMINI_RESERVED_REQUESTS
         self.stop_event.clear()
         self.silent_stop = False
-        # Reset topic to avoid leftover value from previous runs
         self.topic_word = ""
-        if not self.validate_inputs():
-            return
         target_link = self.target_link_var.get().strip()
+        keywords_path = self.keywords_file_path.get()
+        output_folder = self.output_folder.get()
+        lang = self.generation_language_var.get()
         if target_link:
-            total_kw = self._count_total_keywords(self.keywords_file_path.get())
+            total_kw = self._count_total_keywords(keywords_path)
             sanitized_folder_name = self.sanitize_filename(target_link.replace("https://", "").replace("http://", ""))
-            base_folder = os.path.join(self.output_folder.get(), f"{sanitized_folder_name}_{total_kw}")
+            base_folder = os.path.join(output_folder, f"{sanitized_folder_name}_{total_kw}")
             dest_folder = base_folder
-            lang_suffix = self.sanitize_filename(self.generation_language_var.get())
-            try:
-                os.makedirs(dest_folder, exist_ok=False)
-            except FileExistsError:
-                dest_folder = os.path.join(self.output_folder.get(), f"{sanitized_folder_name}_{lang_suffix}_{total_kw}")
-                suffix_counter = 1
-                while True:
-                    try:
-                        os.makedirs(dest_folder, exist_ok=False)
-                        break
-                    except FileExistsError:
-                        dest_folder = os.path.join(
-                            self.output_folder.get(),
-                            f"{sanitized_folder_name}_{lang_suffix}_{suffix_counter}_{total_kw}"
-                        )
-                        suffix_counter += 1
-            self.output_folder.set(dest_folder)
-            if self.folder_entry.winfo_exists():
-                self.folder_entry.delete(0, tk.END)
-                self.folder_entry.insert(0, dest_folder)
+            lang_suffix = self.sanitize_filename(lang)
+            suffix_counter = 1
+            while True:
+                try:
+                    os.makedirs(dest_folder, exist_ok=False)
+                    break
+                except FileExistsError:
+                    dest_folder = os.path.join(
+                        output_folder,
+                        f"{sanitized_folder_name}_{lang_suffix}_{suffix_counter}_{total_kw}"
+                    )
+                    suffix_counter += 1
+            self.after(0, lambda: self.output_folder.set(dest_folder))
+            self.after(0, lambda: self._update_folder_entry(dest_folder))
         self.load_progress_data()
         with self.api_stats_lock:
             self.api_key_usage_stats.clear()
@@ -1410,14 +1409,14 @@ class TextGeneratorApp(ctk.CTkFrame):
                 "Нет доступных API ключей в очереди после проверки. Генерация не может быть запущена.",
                 "ERROR",
             )
-            messagebox.showerror(
+            self.after(0, lambda: messagebox.showerror(
                 "Ошибка API ключей",
                 "Нет доступных API ключей. Проверьте статусы ключей или добавьте новые.",
-            )
-            self.set_ui_for_generation(False)
+            ))
+            self.after(0, lambda: self.set_ui_for_generation(False))
             return
         if self.api_provider_var.get() == "Gemini":
-            total_kw = self._count_total_keywords(self.keywords_file_path.get())
+            total_kw = self._count_total_keywords(keywords_path)
             required_requests = total_kw * 2
             gemini_model_name = self._get_selected_gemini_model()
             per_key_limit = GEMINI_DAILY_REQUEST_LIMITS.get(gemini_model_name, 0)
@@ -1433,22 +1432,27 @@ class TextGeneratorApp(ctk.CTkFrame):
                         f"Недостаточно лимита Gemini: требуется {required_requests} запросов, доступно {available}.",
                         "ERROR",
                     )
-                    messagebox.showerror(
+                    self.after(0, lambda: messagebox.showerror(
                         "Превышение лимита",
                         "Недостаточно общего лимита Gemini для генерации.",
-                    )
-                    self.set_ui_for_generation(False)
+                    ))
+                    self.after(0, lambda: self.set_ui_for_generation(False))
                     return
                 for k in active_keys_current:
                     GLOBAL_GEMINI_KEYS_USAGE[k] = GLOBAL_GEMINI_KEYS_USAGE.get(k, 0) + 1
                 GLOBAL_GEMINI_RESERVED_REQUESTS += required_requests
                 self.reserved_gemini_requests = required_requests
                 self.reserved_gemini_keys = active_keys_current
-                self._update_gemini_quota_display()
-        self.set_ui_for_generation(True)
+            self.after(0, self._update_gemini_quota_display)
+        self.after(0, lambda: self.set_ui_for_generation(True))
         self.waiting_for_project_slot = True
         self.log_message("Ожидание свободного слота генерации...", "INFO")
-        self._wait_for_project_slot()
+        self.after(0, self._wait_for_project_slot)
+
+    def _update_folder_entry(self, dest_folder: str):
+        if self.folder_entry.winfo_exists():
+            self.folder_entry.delete(0, tk.END)
+            self.folder_entry.insert(0, dest_folder)
 
     def _wait_for_project_slot(self):
         if self.stop_event.is_set():
