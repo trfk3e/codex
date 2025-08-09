@@ -81,36 +81,35 @@ MAX_ARTICLE_SIZE = 45 * 1024
 MAX_TOC_ITEM_CHARS = 200
 # Максимальная суммарная длина всех заголовков в оглавлении
 MAX_TOC_TOTAL_CHARS = 2000
-# Минимальный интервал между запросами одним и тем же API ключом (секунды)
 PER_KEY_CALL_INTERVAL = 0.05
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
 
 
-class TokenBucketRateLimiter:
-    def __init__(self, interval: float, capacity: int = 1):
-        self.interval = interval
+class KeyBatchLimiter:
+    def __init__(self, capacity: int, window: float):
         self.capacity = capacity
+        self.window = window
         self.tokens = capacity
+        self.reset_time = 0.0
         self.lock = threading.Lock()
-        self.last_refill = time.monotonic()
 
     def acquire(self):
         while True:
             with self.lock:
                 now = time.monotonic()
-                if self.tokens < self.capacity:
-                    added = int((now - self.last_refill) / self.interval)
-                    if added > 0:
-                        self.tokens = min(self.capacity, self.tokens + added)
-                        self.last_refill += added * self.interval
-                if self.tokens >= 1:
+                if now >= self.reset_time:
+                    self.tokens = self.capacity
+                if self.tokens > 0:
                     self.tokens -= 1
+                    if self.tokens == 0:
+                        self.reset_time = now + self.window
                     return
-                wait_time = self.interval - (now - self.last_refill)
-                if wait_time < 0:
-                    wait_time = self.interval
-            time.sleep(wait_time)
+                wait = self.reset_time - now
+            if wait > 0:
+                time.sleep(wait)
+            else:
+                time.sleep(self.window)
 
 # Gemini integration constants
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
@@ -118,9 +117,6 @@ GEMINI_BODY_EXTRA_INSTRUCTION = (
     "Сделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
 )
 EXHAUSTED_KEYS_FILE = "exhausted-limit-keys.txt"
-
-# Глобальный централизованный rate limiter: 1 токен каждые 6.5 секунд, бурст до 2
-GEMINI_RATE_LIMITER = TokenBucketRateLimiter(6.5, capacity=2)
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -370,6 +366,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_keys_file = tk.StringVar()
         self.gemini_usage_file = os.path.join(os.path.dirname(self.config_file), "gemini_key_usage.json")
         self.gemini_key_usage = {}
+        self.gemini_limiters = {}
         self.generation_active = False
         self.waiting_for_project_slot = False
         self.stop_event = threading.Event()
@@ -532,20 +529,24 @@ class TextGeneratorApp(ctk.CTkFrame):
                 for i, key in enumerate(keys):
                     if self.stop_event.is_set():
                         break
-                    acquired = GLOBAL_THREAD_SEMAPHORE.acquire(blocking=False)
-                    if not acquired:
-                        while not acquired and not self.stop_event.is_set():
-                            acquired = GLOBAL_THREAD_SEMAPHORE.acquire(timeout=1)
-                        if not acquired:
+                    for j in range(PER_KEY_CONCURRENCY):
+                        if self.stop_event.is_set():
                             break
-                    t = threading.Thread(
-                        target=self.gemini_worker_thread,
-                        args=(key,),
-                        name=f"GeminiWorker-{i + 1}",
-                        daemon=True,
-                    )
-                    threads.append(t)
-                    t.start()
+                        acquired = GLOBAL_THREAD_SEMAPHORE.acquire(blocking=False)
+                        if not acquired:
+                            while not acquired and not self.stop_event.is_set():
+                                acquired = GLOBAL_THREAD_SEMAPHORE.acquire(timeout=1)
+                            if not acquired:
+                                break
+                        t = threading.Thread(
+                            target=self.gemini_worker_thread,
+                            args=(key,),
+                            name=f"GeminiWorker-{i + 1}-{j + 1}",
+                            daemon=True,
+                        )
+                        threads.append(t)
+                        t.start()
+                        time.sleep(0.01)
             if self.stop_event.is_set():
                 self.log_message("Генерация остановлена во время запуска потоков.", "INFO")
             self._monitor_task_queue_and_threads(threads)
@@ -1171,6 +1172,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             self._repopulate_available_api_key_queue()
         else:
             self.api_key_queue = Queue()
+            self.gemini_limiters = {k: KeyBatchLimiter(10, 65) for k in keys}
             self.update_gemini_capacity_label()
 
     def update_provider_ui(self):
@@ -1682,8 +1684,9 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ключ {api_key_used_for_call[:7]}... исчерпан сегодня.", "ERROR")
                 self._mark_gemini_key_exhausted(api_key_used_for_call)
                 return None
-            GEMINI_RATE_LIMITER.acquire()
-            self.log_message(f"Ключ ...{key_tail} получил токен", "DEBUG")
+            limiter = self.gemini_limiters.get(api_key_used_for_call)
+            if limiter:
+                limiter.acquire()
             headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
             data = {"contents": [{"parts": [{"text": prompt_text}]}]}
             try:
