@@ -93,7 +93,7 @@ PROVIDER_GEMINI = "Gemini 2.5 Flash"
 # Файлы для провайдера Gemini
 GEMINI_USAGE_FILE = "gemini_key_usage.json"
 EXHAUSTED_GEMINI_KEYS_FILE = "exhausted-limit-keys.txt"
-GEMINI_USAGE_LOCK = threading.Lock()
+GEMINI_USAGE_LOCK = threading.RLock()
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -1672,6 +1672,10 @@ class TextGeneratorApp(ctk.CTkFrame):
                 resp = requests.post(url, params=params, headers=headers, json=payload, timeout=(10, 30))
                 self.log_message(
                     f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
+                    "DEBUG",
+                )
+                self.log_message(
+                    f"[{context}] Тело ответа Gemini (первые 200 символов): {resp.text[:200]}",
                     "DEBUG",
                 )
                 if resp.status_code == 200:
