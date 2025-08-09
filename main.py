@@ -85,6 +85,14 @@ PER_KEY_CALL_INTERVAL = 0.05
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
 
+# Поддерживаемые провайдеры
+PROVIDER_OPENAI = "OpenAI"
+PROVIDER_GEMINI = "Gemini 2.5 Flash"
+
+# Файлы для провайдера Gemini
+GEMINI_USAGE_FILE = "gemini_key_usage.json"
+EXHAUSTED_GEMINI_KEYS_FILE = "exhausted-limit-keys.txt"
+
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
 PROJECTS_FILE = "projects.txt"
@@ -353,6 +361,10 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.target_link_var = tk.StringVar()
         self.topic_word = ""
         self.output_format_var = tk.StringVar(value="TXT")
+
+        self.provider_var = tk.StringVar(value=PROVIDER_OPENAI)
+        self.openai_keys_file_var = tk.StringVar()
+        self.gemini_keys_file_var = tk.StringVar()
 
         self.article_toc_background_colors = [
             "#f9f9f9", "#fcf3f2", "#fcfcfe", "#fff5f3", "#f5f8ff", "#f8fcf3",
@@ -783,13 +795,30 @@ class TextGeneratorApp(ctk.CTkFrame):
     def create_widgets(self):
         main_frame = ctk.CTkFrame(self)
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
-        api_frame = ctk.CTkFrame(main_frame)
-        api_frame.pack(pady=(10, 5), padx=10, fill="x")
-        ctk.CTkLabel(api_frame, text="API Ключи ChatGPT (каждый с новой строки):").pack(anchor="w", pady=(0, 5))
-        self.api_keys_textbox = ctk.CTkTextbox(api_frame, height=80)
-        self.api_keys_textbox.pack(fill="x", expand=True)
-        if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
-        self.api_keys_textbox.bind("<KeyRelease>", self.handle_api_keys_textbox_change)
+        provider_frame = ctk.CTkFrame(main_frame)
+        provider_frame.pack(pady=(10, 5), padx=10, fill="x")
+        ctk.CTkLabel(provider_frame, text="Провайдер:").pack(side="left", padx=(0, 10))
+        self.provider_combobox = ctk.CTkComboBox(provider_frame,
+                                                 values=[PROVIDER_OPENAI, PROVIDER_GEMINI],
+                                                 variable=self.provider_var,
+                                                 command=self._on_provider_change)
+        self.provider_combobox.pack(side="left", fill="x", expand=True)
+
+        self.openai_keys_frame = ctk.CTkFrame(main_frame)
+        self.openai_keys_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.openai_keys_frame, text="Файл с ключами OpenAI (.txt):").pack(anchor="w")
+        self.openai_keys_entry = ctk.CTkEntry(self.openai_keys_frame, textvariable=self.openai_keys_file_var, width=350)
+        self.openai_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.openai_keys_browse = ctk.CTkButton(self.openai_keys_frame, text="Выбрать...", command=self._browse_openai_keys_file)
+        self.openai_keys_browse.pack(side="left")
+
+        self.gemini_keys_frame = ctk.CTkFrame(main_frame)
+        self.gemini_keys_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.gemini_keys_frame, text="Файл с ключами Gemini (.txt):").pack(anchor="w")
+        self.gemini_keys_entry = ctk.CTkEntry(self.gemini_keys_frame, textvariable=self.gemini_keys_file_var, width=350)
+        self.gemini_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.gemini_keys_browse = ctk.CTkButton(self.gemini_keys_frame, text="Выбрать...", command=self._browse_gemini_keys_file)
+        self.gemini_keys_browse.pack(side="left")
         folder_frame = ctk.CTkFrame(main_frame)
         folder_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(folder_frame, text="Папка для сохранения файлов:").pack(anchor="w")
@@ -823,13 +852,13 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.format_segmented_button = ctk.CTkSegmentedButton(format_frame, values=["TXT", "HTML"],
                                                               variable=self.output_format_var)
         self.format_segmented_button.pack(side="left", fill="x", expand=True)
-        threads_frame = ctk.CTkFrame(main_frame)
-        threads_frame.pack(pady=5, padx=10, fill="x")
-        ctk.CTkLabel(threads_frame, text="Количество потоков:").pack(side="left", padx=(0, 10))
-        self.threads_slider = ctk.CTkSlider(threads_frame, from_=1, to=MAX_THREADS,
+        self.threads_frame = ctk.CTkFrame(main_frame)
+        self.threads_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.threads_frame, text="Количество потоков:").pack(side="left", padx=(0, 10))
+        self.threads_slider = ctk.CTkSlider(self.threads_frame, from_=1, to=MAX_THREADS,
                                             variable=self.num_threads_var, number_of_steps=MAX_THREADS - 1)
         self.threads_slider.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.threads_label = ctk.CTkLabel(threads_frame, text=str(self.num_threads_var.get()))
+        self.threads_label = ctk.CTkLabel(self.threads_frame, text=str(self.num_threads_var.get()))
         self.threads_label.pack(side="left")
         self.num_threads_var.trace_add("write", self.update_threads_label)
         action_frame = ctk.CTkFrame(main_frame)
@@ -852,6 +881,56 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.log_textbox.pack(fill="both", expand=True)
         self.after(100, self._repopulate_available_api_key_queue)
         self.after(LOG_FLUSH_INTERVAL_MS, self.flush_log_queue)
+        self._on_provider_change()
+
+    def _browse_openai_keys_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if path:
+            self.openai_keys_file_var.set(path)
+
+    def _browse_gemini_keys_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if path:
+            self.gemini_keys_file_var.set(path)
+
+    def _on_provider_change(self, *_):
+        provider = self.provider_var.get()
+        if provider == PROVIDER_OPENAI:
+            self.gemini_keys_frame.pack_forget()
+            self.openai_keys_frame.pack(pady=5, padx=10, fill="x")
+            self.threads_frame.pack(pady=5, padx=10, fill="x")
+        else:
+            self.openai_keys_frame.pack_forget()
+            self.gemini_keys_frame.pack(pady=5, padx=10, fill="x")
+            self.threads_frame.pack_forget()
+
+
+    def _load_api_keys_from_file(self, path):
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Ошибка", f"Файл с ключами не найден: {path}")
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                keys=[line.strip() for line in f if line.strip()]
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл ключей: {e}")
+            return []
+        if not keys:
+            messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с ключами")
+        return keys
+
+    def _prepare_api_keys(self):
+        provider=self.provider_var.get()
+        if provider==PROVIDER_OPENAI:
+            keys=self._load_api_keys_from_file(self.openai_keys_file_var.get())
+        else:
+            keys=self._load_api_keys_from_file(self.gemini_keys_file_var.get())
+        if not keys:
+            return False
+        with self.api_key_management_lock:
+            self.api_keys_list=keys
+        self._repopulate_available_api_key_queue()
+        return True
 
     def handle_api_keys_textbox_change(self, event=None):
         self.update_api_keys_from_textbox()
@@ -978,26 +1057,15 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def load_settings(self):
         cfg = configparser.ConfigParser()
-        initial_keys_loaded = []
         if os.path.exists(self.config_file):
             try:
                 cfg.read(self.config_file, encoding='utf-8')
                 if "Settings" in cfg:
                     s = cfg["Settings"]
                     self.output_folder.set(s.get("OutputFolder", ""))
-                    api_keys_raw = s.get("ApiKeys", "")
-                    if api_keys_raw:
-                        initial_keys_loaded = [k.strip() for k in api_keys_raw.splitlines() if k.strip()]
-                    else:
-                        initial_keys_loaded = load_shared_keys()
-                    with self.api_key_management_lock:
-                        bad_keys_loaded = load_bad_api_keys(self.log_message)
-                        if bad_keys_loaded:
-                            initial_keys_loaded = [k for k in initial_keys_loaded if k not in bad_keys_loaded]
-                        self.api_keys_list = initial_keys_loaded
-                    if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                        self.api_keys_textbox.delete("1.0", tk.END)
-                        if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
+                    self.provider_var.set(s.get("Provider", PROVIDER_OPENAI))
+                    self.openai_keys_file_var.set(s.get("OpenAIKeysFile", ""))
+                    self.gemini_keys_file_var.set(s.get("GeminiKeysFile", ""))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
@@ -1009,23 +1077,20 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ошибка загрузки настроек: {e}", "ERROR")
         else:
             self.log_message("Файл настроек не найден. Будут использованы значения по умолчанию.", "INFO")
-            with self.api_key_management_lock:
-                self.api_keys_list = load_shared_keys()
-            if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                self.api_keys_textbox.delete("1.0", tk.END)
-                if self.api_keys_list:
-                    self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
 
     def save_settings(self):
         self._save_api_key_statuses()
         cfg = configparser.ConfigParser()
-        with self.api_key_management_lock:
-            keys_to_save = "\n".join(self.api_keys_list)
-            save_shared_keys(self.api_keys_list)
-        cfg["Settings"] = {"OutputFolder": self.output_folder.get(), "ApiKeys": keys_to_save,
-                           "NumThreads": str(self.num_threads_var.get()),
-                           "GenerationLanguage": self.generation_language_var.get(),
-                           "TargetLink": self.target_link_var.get(), "OutputFormat": self.output_format_var.get()}
+        cfg["Settings"] = {
+            "OutputFolder": self.output_folder.get(),
+            "Provider": self.provider_var.get(),
+            "OpenAIKeysFile": self.openai_keys_file_var.get(),
+            "GeminiKeysFile": self.gemini_keys_file_var.get(),
+            "NumThreads": str(self.num_threads_var.get()),
+            "GenerationLanguage": self.generation_language_var.get(),
+            "TargetLink": self.target_link_var.get(),
+            "OutputFormat": self.output_format_var.get(),
+        }
         try:
             with open(self.config_file, "w", encoding="utf-8") as cf:
                 cfg.write(cf)
@@ -1149,7 +1214,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def set_ui_for_generation(self, active):
         self.generation_active = active
-        widgets_to_disable = [self.api_keys_textbox, self.folder_entry, self.browse_button, self.keywords_entry,
+        widgets_to_disable = [self.folder_entry, self.browse_button, self.keywords_entry,
                               self.browse_keywords_button, self.threads_slider, self.language_combobox,
                               self.target_link_entry, self.format_segmented_button]
         button_state_if_active = "disabled"
@@ -1167,6 +1232,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.silent_stop = False
         # Reset topic to avoid leftover value from previous runs
         self.topic_word = ""
+        if not self._prepare_api_keys():
+            return
         if not self.validate_inputs():
             return
         target_link = self.target_link_var.get().strip()
@@ -1455,6 +1522,24 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
         return None
 
+    def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5):
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
+        payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+        for attempt in range(retries):
+            if self.stop_event.is_set():
+                return None
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            except Exception:
+                pass
+            if attempt + 1 < retries:
+                time.sleep(delay_seconds * (attempt + 1))
+        return ""
+
     # ================================================================================
     # НОВЫЙ МЕТОД ДЛЯ ОЧИСТКИ HTML (УБЕДИТЕСЬ, ЧТО ОН ВНУТРИ КЛАССА TextGeneratorApp)
     # ================================================================================
@@ -1604,8 +1689,11 @@ class TextGeneratorApp(ctk.CTkFrame):
             key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(
                 retrieved_api_key_str) > 5 else retrieved_api_key_str
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
-            openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-            if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
+            if self.provider_var.get() == PROVIDER_OPENAI:
+                openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
+                if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
+            else:
+                openai_client = None
         except Empty:
             self.log_message(f"{log_prefix_base} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
             self._initial_check_and_revive_keys()
@@ -1651,7 +1739,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "content": f"Сделай так, чтобы главный первый заголовок не был похож вообще на этот, проработай тщательно начало и конец, чтобы не было повторений: \"{self.previous_h1_text}\". ОБЗЯТАТЕЛЬНО НАЧАЛО НЕ ДОЛЖНО СОВПАДАТЬ!!!"
                     })
 
-            original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            if self.provider_var.get() == PROVIDER_OPENAI:
+                original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            else:
+                prompt_text = "\n".join([m["content"] for m in base_h1_prompt]) + "\nСделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
+                original_h1_text_raw = self.call_gemini_api(retrieved_api_key_str, prompt_text)
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -1797,12 +1889,14 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
-            article_body_raw_from_api = self.call_openai_api(openai_client,
-                                                             [{"role": "system", "content": body_prompt_system},
-                                                              # Теперь body_prompt_system определена
-                                                              {"role": "user", "content": body_prompt_user}],
-                                                             # Теперь body_prompt_user определена
-                                                             retrieved_api_key_str)
+            if self.provider_var.get() == PROVIDER_OPENAI:
+                article_body_raw_from_api = self.call_openai_api(openai_client,
+                                                                 [{"role": "system", "content": body_prompt_system},
+                                                                  {"role": "user", "content": body_prompt_user}],
+                                                                 retrieved_api_key_str)
+            else:
+                prompt_text = body_prompt_system + "\n" + body_prompt_user + "\nСделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
+                article_body_raw_from_api = self.call_gemini_api(retrieved_api_key_str, prompt_text)
 
             # ... (остальной код вашего метода)
 
