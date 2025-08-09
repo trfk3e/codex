@@ -65,7 +65,8 @@ MAX_CONCURRENT_PROJECTS = 3
 # Global limit of concurrently running worker threads across all tabs
 GLOBAL_THREAD_SEMAPHORE = threading.Semaphore(MAX_THREADS)
 GLOBAL_PROJECT_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_PROJECTS)
-PER_KEY_CONCURRENCY = 10
+GEMINI_KEY_MAX_REQUESTS = 10  # allow up to 10 calls per key
+GEMINI_KEY_SLOT_SECONDS = 65  # slots replenish after 65 seconds
 BAD_API_KEYS_FILE = "BAD_API.txt"
 # Limit the amount of lines kept in the GUI log to avoid slowdown
 MAX_LOG_LINES = 500
@@ -374,7 +375,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_key_locks = defaultdict(threading.Lock)
         # Квота 10 запросов на ключ с восстановлением слота через 65 секунд
         self.gemini_key_quota = defaultdict(
-            lambda: threading.BoundedSemaphore(PER_KEY_CONCURRENCY)
+            lambda: threading.BoundedSemaphore(GEMINI_KEY_MAX_REQUESTS)
         )
 
         self.article_toc_background_colors = [
@@ -757,7 +758,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._save_api_key_statuses()
 
     def _current_per_key_concurrency(self):
-        return PER_KEY_CONCURRENCY
+        return GEMINI_KEY_MAX_REQUESTS
 
     def _repopulate_available_api_key_queue(self):
         with self.api_key_management_lock:
@@ -1622,7 +1623,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5, context=""):
         key_short = api_key_used_for_call[:7]
-        token_delay = 65
+        token_delay = GEMINI_KEY_SLOT_SECONDS
         lock = self.gemini_key_locks[api_key_used_for_call]
         bucket = self.gemini_key_quota[api_key_used_for_call]
         self.log_message(f"[{context}] Ожидание ключа {key_short}", "DEBUG")
