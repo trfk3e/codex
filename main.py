@@ -512,7 +512,6 @@ class TextGeneratorApp(ctk.CTkFrame):
                                          name=f"GeminiWorker-{i + 1}", daemon=True)
                     threads.append(t)
                     t.start()
-                    time.sleep(10)
             if self.stop_event.is_set():
                 self.log_message("Генерация остановлена во время запуска потоков.", "INFO")
             self._monitor_task_queue_and_threads(threads)
@@ -1921,10 +1920,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             return False
 
         try:
-            if self.provider_var.get() == "Gemini 2.5 Flash":
-                self.log_message(f"Одновременно - {log_prefix} Начало генерации...")
-            else:
-                self.log_message(f"{log_prefix} Начало генерации...")
+            self.log_message(f"{log_prefix} Начало генерации...")
             h1_user_prompt_variations = [
                 f"Язык: {selected_lang}. Тема: {self.topic_word} - Придумай короткий, ясный, интригующий SEO H1 для статьи на тему I-Gaming (Не упоминай термин 'I-Gaming' в заголовке): {keyword_phrase}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {keyword_phrase} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
                 f"Язык: {selected_lang}. Тема: {self.topic_word} - Создай привлекающий внимание SEO заголовок H1 для текста о {keyword_phrase}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {keyword_phrase} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
@@ -2449,7 +2445,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             )
 
     def gemini_worker_thread(self, api_key):
-        self.log_message(f"Одновременно - Ключ ...{api_key[-5:]}:")
+        self.log_message(f"Ключ ...{api_key[-5:]}:")
         try:
             articles_in_cycle = 0
             cycle_start = time.time()
