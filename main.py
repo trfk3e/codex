@@ -58,7 +58,8 @@ MAX_RETRY_PASSES = 3
 # until the required number of files is produced.
 MAX_KEYWORD_ATTEMPTS = None
 # Максимальное количество потоков
-MAX_THREADS = 200
+# Increase to support thousands of concurrent Gemini workers
+MAX_THREADS = 5000
 # Limit how many projects can run generation simultaneously
 MAX_CONCURRENT_PROJECTS = 3
 # Global limit of concurrently running worker threads across all tabs
@@ -514,7 +515,6 @@ class TextGeneratorApp(ctk.CTkFrame):
                                          name=f"GeminiWorker-{i + 1}", daemon=True)
                     threads.append(t)
                     t.start()
-                    time.sleep(10)
             if self.stop_event.is_set():
                 self.log_message("Генерация остановлена во время запуска потоков.", "INFO")
             self._monitor_task_queue_and_threads(threads)
