@@ -672,6 +672,19 @@ class TextGeneratorApp(ctk.CTkFrame):
                 "ERROR",
             )
 
+    def _ensure_gemini_slots(self, api_key, needed_slots=1):
+        """Block until `needed_slots` Gemini requests are allowed for this key."""
+        recent_calls = self.gemini_recent_calls.setdefault(api_key, deque())
+        while not self.stop_event.is_set():
+            now = time.time()
+            while recent_calls and now - recent_calls[0] >= 65:
+                recent_calls.popleft()
+            if len(recent_calls) + needed_slots <= 10:
+                return
+            wait = 65 - (now - recent_calls[0])
+            if wait > 0:
+                time.sleep(wait)
+
     def update_gemini_capacity_label(self):
         if not hasattr(self, 'gemini_capacity_label') or not self.gemini_capacity_label.winfo_exists():
             return
@@ -1959,6 +1972,8 @@ class TextGeneratorApp(ctk.CTkFrame):
 
         try:
             self.log_message(f"{log_prefix} Начало генерации...")
+            if self.provider_var.get() == "Gemini 2.5 Flash":
+                self._ensure_gemini_slots(retrieved_api_key_str, 2)
             h1_user_prompt_variations = [
                 f"Язык: {selected_lang}. Тема: {self.topic_word} - Придумай короткий, ясный, интригующий SEO H1 для статьи на тему I-Gaming (Не упоминай термин 'I-Gaming' в заголовке): {keyword_phrase}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {keyword_phrase} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
                 f"Язык: {selected_lang}. Тема: {self.topic_word} - Создай привлекающий внимание SEO заголовок H1 для текста о {keyword_phrase}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {keyword_phrase} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
