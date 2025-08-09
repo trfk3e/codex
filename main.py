@@ -655,6 +655,8 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _before_gemini_call(self, api_key):
         today = datetime.date.today().isoformat()
         while True:
+            if self.stop_event.is_set():
+                return False
             with GEMINI_USAGE_LOCK:
                 info = self.gemini_usage.setdefault(
                     api_key,
@@ -673,7 +675,13 @@ class TextGeneratorApp(ctk.CTkFrame):
                 if info["used_today"] >= 250:
                     return False
                 now = time.time()
-                next_ts = info.get("next_allowed_ts", 0.0)
+                try:
+                    next_ts = float(info.get("next_allowed_ts", 0.0))
+                except Exception:
+                    next_ts = 0.0
+                if next_ts - now > 65:
+                    next_ts = now + 65
+                    info["next_allowed_ts"] = next_ts
                 if now < next_ts:
                     wait = next_ts - now
                 elif info.get("window_count", 0) >= 10:
@@ -686,7 +694,12 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self._save_gemini_usage()
                     return True
             if wait > 0:
-                time.sleep(wait)
+                self.log_message(
+                    f"Ожидание {wait:.1f}с перед вызовом Gemini для ключа {api_key[:7]}...",
+                    "DEBUG",
+                )
+                if self.stop_event.wait(wait):
+                    return False
 
     def _after_gemini_call(self, api_key):
         with GEMINI_USAGE_LOCK:
@@ -1625,13 +1638,14 @@ class TextGeneratorApp(ctk.CTkFrame):
         if not self._before_gemini_call(api_key_used_for_call):
             return "GEMINI_KEY_EXHAUSTED"
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-        headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
+        params = {"key": api_key_used_for_call}
+        headers = {"Content-Type": "application/json"}
         payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
         for attempt in range(retries):
             if self.stop_event.is_set():
                 return None
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=30)
+                resp = requests.post(url, params=params, headers=headers, json=payload, timeout=(10, 30))
                 if resp.status_code == 200:
                     data = resp.json()
                     text = (
