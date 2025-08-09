@@ -39,6 +39,7 @@ import atexit
 import signal
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 from collections import deque, defaultdict
+import itertools
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -774,9 +775,10 @@ class TextGeneratorApp(ctk.CTkFrame):
         per_key = self._current_per_key_concurrency()
         if active_keys_for_queue:
             random.shuffle(active_keys_for_queue)
-            for _ in range(per_key):
-                for key_str in active_keys_for_queue:
-                    new_queue.put(key_str)
+            rr_cycle = itertools.cycle(active_keys_for_queue)
+            total_entries = per_key * len(active_keys_for_queue)
+            for _ in range(total_entries):
+                new_queue.put(next(rr_cycle))
             self.log_message(
                 f"Очередь API ключей обновлена. Активных ключей: {len(active_keys_for_queue)}",
                 "INFO",
