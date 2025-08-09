@@ -654,9 +654,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def _before_gemini_call(self, api_key):
         today = datetime.date.today().isoformat()
-        while True:
-            if self.stop_event.is_set():
-                return False
+        while not self.stop_event.is_set():
             with GEMINI_USAGE_LOCK:
                 info = self.gemini_usage.setdefault(
                     api_key,
@@ -673,6 +671,10 @@ class TextGeneratorApp(ctk.CTkFrame):
                     )
                 wait = 0.0
                 if info["used_today"] >= 250:
+                    self.log_message(
+                        f"Ключ {api_key[:7]} исчерпал дневной лимит Gemini",
+                        "INFO",
+                    )
                     return False
                 now = time.time()
                 try:
@@ -692,14 +694,22 @@ class TextGeneratorApp(ctk.CTkFrame):
                     info["used_today"] += 1
                     info["window_count"] = info.get("window_count", 0) + 1
                     self._save_gemini_usage()
+                    self.log_message(
+                        f"Предварительная проверка Gemini пройдена для ключа {api_key[:7]}",
+                        "DEBUG",
+                    )
                     return True
-            if wait > 0:
+            self.log_message(
+                f"Ожидание {wait:.1f}с перед вызовом Gemini для ключа {api_key[:7]}...",
+                "DEBUG",
+            )
+            if self.stop_event.wait(wait):
                 self.log_message(
-                    f"Ожидание {wait:.1f}с перед вызовом Gemini для ключа {api_key[:7]}...",
+                    f"Ожидание перед вызовом Gemini прервано сигналом остановки для ключа {api_key[:7]}",
                     "DEBUG",
                 )
-                if self.stop_event.wait(wait):
-                    return False
+                return False
+        return False
 
     def _after_gemini_call(self, api_key):
         with GEMINI_USAGE_LOCK:
@@ -1634,8 +1644,17 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
         return None
 
-    def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5):
+    def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5, context=""):
+        key_short = api_key_used_for_call[:7]
+        self.log_message(
+            f"[{context}] Подготовка запроса к Gemini для ключа {key_short}, длина промпта {len(prompt_text)}",
+            "DEBUG",
+        )
         if not self._before_gemini_call(api_key_used_for_call):
+            self.log_message(
+                f"[{context}] Ключ {key_short} не прошёл предварительную проверку Gemini",
+                "DEBUG",
+            )
             return "GEMINI_KEY_EXHAUSTED"
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         params = {"key": api_key_used_for_call}
@@ -1643,9 +1662,18 @@ class TextGeneratorApp(ctk.CTkFrame):
         payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
         for attempt in range(retries):
             if self.stop_event.is_set():
+                self.log_message(f"[{context}] Прекращено из-за стоп-сигнала", "DEBUG")
                 return None
             try:
+                self.log_message(
+                    f"[{context}] Попытка {attempt + 1}/{retries} отправки запроса Gemini ключом {key_short}",
+                    "DEBUG",
+                )
                 resp = requests.post(url, params=params, headers=headers, json=payload, timeout=(10, 30))
+                self.log_message(
+                    f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
+                    "DEBUG",
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     text = (
@@ -1656,10 +1684,14 @@ class TextGeneratorApp(ctk.CTkFrame):
                     )
                     if text:
                         self._after_gemini_call(api_key_used_for_call)
+                        self.log_message(
+                            f"[{context}] Получен текст длиной {len(text)} символов от Gemini ключом {key_short}",
+                            "DEBUG",
+                        )
                         return text
                 else:
                     self.log_message(
-                        f"Gemini API error {resp.status_code}: {resp.text}",
+                        f"[{context}] Gemini API error {resp.status_code}: {resp.text}",
                         "ERROR",
                     )
                     if resp.status_code == 429:
@@ -1681,11 +1713,18 @@ class TextGeneratorApp(ctk.CTkFrame):
                                         self._save_gemini_usage()
                                     break
                         except Exception:
-                            pass
+                            self.log_message(
+                                f"[{context}] Не удалось обработать RetryInfo для ключа {key_short}",
+                                "DEBUG",
+                            )
             except Exception as e:
-                self.log_message(f"Gemini API request failed: {e}", "ERROR")
+                self.log_message(f"[{context}] Gemini API request failed: {e}", "ERROR")
             if attempt + 1 < retries:
-                time.sleep(delay_seconds * (attempt + 1))
+                pause = delay_seconds * (attempt + 1)
+                self.log_message(
+                    f"[{context}] Повтор через {pause:.2f}с", "DEBUG",
+                )
+                time.sleep(pause)
         self._after_gemini_call(api_key_used_for_call)
         return ""
 
@@ -1892,11 +1931,21 @@ class TextGeneratorApp(ctk.CTkFrame):
                 original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
             else:
                 prompt_text = "\n".join([m["content"] for m in base_h1_prompt]) + "\nСделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
-                original_h1_text_raw = self.call_gemini_api(retrieved_api_key_str, prompt_text)
+                self.log_message(
+                    f"{log_prefix} [H1] Отправка запроса к Gemini, длина промпта {len(prompt_text)}",
+                    "DEBUG",
+                )
+                original_h1_text_raw = self.call_gemini_api(
+                    retrieved_api_key_str, prompt_text, context=f"H1 {task_id}"
+                )
                 if original_h1_text_raw == "GEMINI_KEY_EXHAUSTED":
                     self._mark_gemini_key_exhausted(retrieved_api_key_str)
                     key_marked_as_bad_in_this_task = True
                     return False
+                self.log_message(
+                    f"{log_prefix} [H1] Получено {len(original_h1_text_raw)} символов",
+                    "DEBUG",
+                )
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -2049,11 +2098,21 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                  retrieved_api_key_str)
             else:
                 prompt_text = body_prompt_system + "\n" + body_prompt_user + "\nСделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
-                article_body_raw_from_api = self.call_gemini_api(retrieved_api_key_str, prompt_text)
+                self.log_message(
+                    f"{log_prefix} [BODY] Отправка запроса к Gemini, длина промпта {len(prompt_text)}",
+                    "DEBUG",
+                )
+                article_body_raw_from_api = self.call_gemini_api(
+                    retrieved_api_key_str, prompt_text, context=f"BODY {task_id}"
+                )
                 if article_body_raw_from_api == "GEMINI_KEY_EXHAUSTED":
                     self._mark_gemini_key_exhausted(retrieved_api_key_str)
                     key_marked_as_bad_in_this_task = True
                     return False
+                self.log_message(
+                    f"{log_prefix} [BODY] Получено {len(article_body_raw_from_api)} символов",
+                    "DEBUG",
+                )
 
             # ... (остальной код вашего метода)
 
