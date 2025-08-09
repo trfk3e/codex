@@ -1388,13 +1388,17 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def _begin_generation_after_slot(self):
         with self.api_key_queue.mutex:
-            active_keys = set(self.api_key_queue.queue)
-        target_threads = min(self.num_threads_var.get(), len(active_keys)) or 1
+            queued_keys = list(self.api_key_queue.queue)
+        active_key_count = len(set(queued_keys))
+        # Как минимум по одному потоку на каждый активный ключ,
+        # но не больше глобального лимита потоков.
+        target_threads = max(self.num_threads_var.get(), active_key_count) or 1
+        target_threads = min(target_threads, MAX_THREADS)
         self.num_threads_var.set(target_threads)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
         self.log_message(
-            f"Запуск генерации: {self.num_threads_var.get()} поток(а/ов), активных ключей в очереди: {self.api_key_queue.qsize()}."
+            f"Запуск генерации: {self.num_threads_var.get()} поток(а/ов), активных ключей в очереди: {active_key_count}."
         )
         self.successful_task_ids.clear()
         self.all_task_definitions.clear()
