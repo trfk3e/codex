@@ -1419,8 +1419,7 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _begin_generation_after_slot(self):
         with self.api_key_queue.mutex:
             active_keys = set(self.api_key_queue.queue)
-        per_key = self._current_per_key_concurrency()
-        target_threads = min(MAX_THREADS, len(active_keys) * per_key)
+        target_threads = 1
         self.num_threads_var.set(target_threads)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
@@ -1430,7 +1429,6 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.successful_task_ids.clear()
         self.all_task_definitions.clear()
         threading.Thread(target=self.process_all_keywords, daemon=True).start()
-
     def stop_generation(self):
         if self.generation_active or self.waiting_for_project_slot:
             self.silent_stop = True
@@ -1660,10 +1658,6 @@ class TextGeneratorApp(ctk.CTkFrame):
                 "DEBUG",
             )
             return "GEMINI_KEY_EXHAUSTED"
-        self.log_message(f"[{context}] Глобальная задержка 10с перед запросом Gemini", "DEBUG")
-        if self.stop_event.wait(10):
-            self.log_message(f"[{context}] Глобальная задержка перед Gemini прервана", "DEBUG")
-            return None
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         params = {"key": api_key_used_for_call}
         headers = {"Content-Type": "application/json"}
@@ -1700,6 +1694,10 @@ class TextGeneratorApp(ctk.CTkFrame):
                             f"[{context}] Получен текст длиной {len(text)} символов от Gemini ключом {key_short}",
                             "DEBUG",
                         )
+                        self.log_message(f"[{context}] Ожидание 10с после запроса Gemini", "DEBUG")
+                        if self.stop_event.wait(10):
+                            self.log_message(f"[{context}] Ожидание после Gemini прервано", "DEBUG")
+                            return None
                         return text
                 else:
                     self.log_message(
@@ -1745,6 +1743,10 @@ class TextGeneratorApp(ctk.CTkFrame):
                             )
             except Exception as e:
                 self.log_message(f"[{context}] Gemini API request failed: {e}", "ERROR")
+            self.log_message(f"[{context}] Ожидание 10с после запроса Gemini", "DEBUG")
+            if self.stop_event.wait(10):
+                self.log_message(f"[{context}] Ожидание после Gemini прервано", "DEBUG")
+                return None
             if attempt + 1 < retries:
                 pause = delay_seconds * (attempt + 1)
                 self.log_message(
