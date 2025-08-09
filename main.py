@@ -38,6 +38,7 @@ import sys
 import atexit
 import signal
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
+from collections import deque
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -92,6 +93,7 @@ PROVIDER_GEMINI = "Gemini 2.5 Flash"
 # Файлы для провайдера Gemini
 GEMINI_USAGE_FILE = "gemini_key_usage.json"
 EXHAUSTED_GEMINI_KEYS_FILE = "exhausted-limit-keys.txt"
+GEMINI_USAGE_LOCK = threading.Lock()
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -366,6 +368,9 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.openai_keys_file_var = tk.StringVar()
         self.gemini_keys_file_var = tk.StringVar()
 
+        self.gemini_usage = {}
+        self._load_gemini_usage()
+
         self.article_toc_background_colors = [
             "#f9f9f9", "#fcf3f2", "#fcfcfe", "#fff5f3", "#f5f8ff", "#f8fcf3",
             "#f6f7f7", "#fafcf5", "#fdfbfb", "#f9f9f2", "#fcfbf6", "#f4f8f8",
@@ -607,6 +612,67 @@ class TextGeneratorApp(ctk.CTkFrame):
             except Exception as e:
                 self.log_message(f"Ошибка сохранения статусов API ключей в {API_KEY_STATUSES_FILE}: {e}", "ERROR")
 
+    def _load_gemini_usage(self):
+        path = app_path(GEMINI_USAGE_FILE)
+        today = datetime.date.today().isoformat()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        with GEMINI_USAGE_LOCK:
+            for key, info in data.items():
+                if info.get("date") != today:
+                    info = {"date": today, "used_today": 0, "next_allowed_ts": 0.0}
+                self.gemini_usage[key] = info
+
+    def _save_gemini_usage(self):
+        with GEMINI_USAGE_LOCK:
+            path = app_path(GEMINI_USAGE_FILE)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self.gemini_usage, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    def _mark_gemini_key_exhausted(self, api_key):
+        with GEMINI_USAGE_LOCK:
+            info = self.gemini_usage.get(api_key)
+            if info:
+                info["used_today"] = 250
+        with open(app_path(EXHAUSTED_GEMINI_KEYS_FILE), "a", encoding="utf-8") as f:
+            f.write(api_key + "\n")
+        self._remove_key_from_queue(api_key)
+        self.log_message(f"Ключ {api_key[:7]}... исчерпан по лимиту сегодня.", "INFO")
+        self._save_gemini_usage()
+
+    def _remove_key_from_queue(self, api_key):
+        with self.api_key_queue.mutex:
+            self.api_key_queue.queue = deque([k for k in self.api_key_queue.queue if k != api_key])
+
+    def _before_gemini_call(self, api_key):
+        today = datetime.date.today().isoformat()
+        with GEMINI_USAGE_LOCK:
+            info = self.gemini_usage.setdefault(api_key, {"date": today, "used_today": 0, "next_allowed_ts": 0.0})
+            if info.get("date") != today:
+                info.update({"date": today, "used_today": 0, "next_allowed_ts": 0.0})
+            if info["used_today"] >= 250:
+                return False
+            wait = info.get("next_allowed_ts", 0.0) - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        return True
+
+    def _after_gemini_call(self, api_key):
+        with GEMINI_USAGE_LOCK:
+            info = self.gemini_usage.setdefault(api_key, {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0})
+            info["used_today"] += 1
+            if info["used_today"] % 10 == 0:
+                info["next_allowed_ts"] = time.time() + 65
+            self._save_gemini_usage()
+            if info["used_today"] >= 250:
+                self._mark_gemini_key_exhausted(api_key)
+
     def load_progress_data(self):
         """Initialize in-memory progress tracking (file persistence removed)."""
         self.progress_data = {}
@@ -672,6 +738,9 @@ class TextGeneratorApp(ctk.CTkFrame):
             self._repopulate_available_api_key_queue()
         self._save_api_key_statuses()
 
+    def _current_per_key_concurrency(self):
+        return 1 if self.provider_var.get() == PROVIDER_GEMINI else PER_KEY_CONCURRENCY
+
     def _repopulate_available_api_key_queue(self):
         with self.api_key_management_lock:
             current_master_keys = self.api_keys_list[:]
@@ -685,10 +754,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                 elif not status_data:
                     self.api_key_statuses[key_str] = self._get_default_api_key_status()
                     active_keys_for_queue.append(key_str)
+        per_key = self._current_per_key_concurrency()
         if active_keys_for_queue:
             random.shuffle(active_keys_for_queue)
             for key_str in active_keys_for_queue:
-                for _ in range(PER_KEY_CONCURRENCY):
+                for _ in range(per_key):
                     new_queue.put(key_str)
             self.log_message(
                 f"Очередь API ключей обновлена. Активных ключей: {len(active_keys_for_queue)}",
@@ -943,11 +1013,13 @@ class TextGeneratorApp(ctk.CTkFrame):
         if hasattr(self, 'threads_label') and self.threads_label.winfo_exists():
             self.threads_label.configure(text=str(current_var_val))
         if hasattr(self, 'threads_slider') and self.threads_slider.winfo_exists():
-            num_active_keys = self.api_key_queue.qsize()
+            with self.api_key_queue.mutex:
+                num_active_keys = len(set(self.api_key_queue.queue))
+            per_key = self._current_per_key_concurrency()
             if num_active_keys == 0:
                 s_max_logical_limit = max(1, current_var_val)
             else:
-                s_max_logical_limit = min(MAX_THREADS, num_active_keys * PER_KEY_CONCURRENCY)
+                s_max_logical_limit = min(MAX_THREADS, num_active_keys * per_key)
             s_max_logical_limit = max(1, s_max_logical_limit)
             slider_from_value = 1
             slider_actual_to = slider_from_value + 1 if s_max_logical_limit == slider_from_value else s_max_logical_limit
@@ -1298,7 +1370,8 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _begin_generation_after_slot(self):
         with self.api_key_queue.mutex:
             active_keys = set(self.api_key_queue.queue)
-        target_threads = min(MAX_THREADS, len(active_keys) * PER_KEY_CONCURRENCY)
+        per_key = self._current_per_key_concurrency()
+        target_threads = min(MAX_THREADS, len(active_keys) * per_key)
         self.num_threads_var.set(target_threads)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
@@ -1523,6 +1596,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         return None
 
     def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5):
+        if not self._before_gemini_call(api_key_used_for_call):
+            return "GEMINI_KEY_EXHAUSTED"
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
         payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
@@ -1540,6 +1615,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         .get("text", "")
                     )
                     if text:
+                        self._after_gemini_call(api_key_used_for_call)
                         return text
                 else:
                     self.log_message(
@@ -1550,6 +1626,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Gemini API request failed: {e}", "ERROR")
             if attempt + 1 < retries:
                 time.sleep(delay_seconds * (attempt + 1))
+        self._after_gemini_call(api_key_used_for_call)
         return ""
 
     # ================================================================================
@@ -1756,6 +1833,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             else:
                 prompt_text = "\n".join([m["content"] for m in base_h1_prompt]) + "\nСделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
                 original_h1_text_raw = self.call_gemini_api(retrieved_api_key_str, prompt_text)
+                if original_h1_text_raw == "GEMINI_KEY_EXHAUSTED":
+                    self._mark_gemini_key_exhausted(retrieved_api_key_str)
+                    key_marked_as_bad_in_this_task = True
+                    return False
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -1909,6 +1990,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             else:
                 prompt_text = body_prompt_system + "\n" + body_prompt_user + "\nСделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
                 article_body_raw_from_api = self.call_gemini_api(retrieved_api_key_str, prompt_text)
+                if article_body_raw_from_api == "GEMINI_KEY_EXHAUSTED":
+                    self._mark_gemini_key_exhausted(retrieved_api_key_str)
+                    key_marked_as_bad_in_this_task = True
+                    return False
 
             # ... (остальной код вашего метода)
 
