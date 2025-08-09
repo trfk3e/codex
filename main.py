@@ -1326,17 +1326,39 @@ class TextGeneratorApp(ctk.CTkFrame):
         with self.api_stats_lock:
             self.api_key_usage_stats.clear()
         self._initial_check_and_revive_keys()
-        if self.api_key_queue.empty():
-            self.log_message(
-                "Нет доступных API ключей в очереди после проверки. Генерация не может быть запущена.",
-                "ERROR",
-            )
-            messagebox.showerror(
-                "Ошибка API ключей",
-                "Нет доступных API ключей. Проверьте статусы ключей или добавьте новые.",
-            )
-            self.set_ui_for_generation(False)
-            return
+        if self.provider_var.get() == "OpenAI":
+            if self.api_key_queue.empty():
+                self.log_message(
+                    "Нет доступных API ключей в очереди после проверки. Генерация не может быть запущена.",
+                    "ERROR",
+                )
+                messagebox.showerror(
+                    "Ошибка API ключей",
+                    "Нет доступных API ключей. Проверьте статусы ключей или добавьте новые.",
+                )
+                self.set_ui_for_generation(False)
+                return
+        else:
+            available_keys = [
+                k for k in self.api_keys_list
+                if self.gemini_key_usage.get(k, {}).get("used_today", 0) < 250
+            ]
+            if not available_keys:
+                kyiv_now = datetime.datetime.now()
+                tomorrow = (kyiv_now + datetime.timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                hours_left = max(0, (tomorrow - kyiv_now).total_seconds() / 3600.0)
+                self.log_message(
+                    f"Все ключи Gemini исчерпаны сегодня. Ожидайте {hours_left:.1f} часов Europe/Kyiv.",
+                    "ERROR",
+                )
+                messagebox.showerror(
+                    "Ошибка API ключей",
+                    "Все ключи Gemini исчерпаны сегодня. Попробуйте позже.",
+                )
+                self.set_ui_for_generation(False)
+                return
         self.set_ui_for_generation(True)
         self.waiting_for_project_slot = True
         self.log_message("Ожидание свободного слота генерации...", "INFO")
