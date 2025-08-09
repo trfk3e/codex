@@ -370,7 +370,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
         self.gemini_usage = {}
         self._load_gemini_usage()
-        self.gemini_key_locks = defaultdict(lambda: threading.Semaphore(1))
+        self.gemini_key_locks = defaultdict(threading.Lock)
         # Квота 10 запросов на ключ с восстановлением слота через 65 секунд
         self.gemini_key_quota = defaultdict(
             lambda: threading.BoundedSemaphore(PER_KEY_CONCURRENCY)
@@ -1619,18 +1619,29 @@ class TextGeneratorApp(ctk.CTkFrame):
         token_delay = 65
         lock = self.gemini_key_locks[api_key_used_for_call]
         bucket = self.gemini_key_quota[api_key_used_for_call]
+        self.log_message(f"[{context}] Ожидание ключа {key_short}", "DEBUG")
+        while not self.stop_event.is_set():
+            if lock.acquire(timeout=1):
+                break
+        else:
+            return None
+        with api_key_last_call_time_lock:
+            last = api_key_last_call_time.get(api_key_used_for_call, 0.0)
+        wait_needed = last + 10.0 - time.time()
+        if wait_needed > 0:
+            self.log_message(
+                f"[{context}] Пауза {wait_needed:.2f}с перед запросом Gemini ключом {key_short}",
+                "DEBUG",
+            )
+            if self.stop_event.wait(wait_needed):
+                lock.release()
+                return None
         self.log_message(f"[{context}] Ожидание квоты ключа {key_short}", "DEBUG")
         while not self.stop_event.is_set():
             if bucket.acquire(timeout=1):
                 break
         else:
-            return None
-        self.log_message(f"[{context}] Ожидание освобождения ключа {key_short}", "DEBUG")
-        while not self.stop_event.is_set():
-            if lock.acquire(timeout=1):
-                break
-        else:
-            bucket.release()
+            lock.release()
             return None
         try:
             self.log_message(
@@ -1656,6 +1667,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                         f"[{context}] Попытка {attempt + 1}/{retries} отправки запроса Gemini ключом {key_short}",
                         "DEBUG",
                     )
+                    with api_key_last_call_time_lock:
+                        api_key_last_call_time[api_key_used_for_call] = time.time()
                     resp = requests.post(
                         url,
                         params=params,
@@ -1687,40 +1700,41 @@ class TextGeneratorApp(ctk.CTkFrame):
                             )
                             return text
                     else:
-                        self.log_message(
-                            f"[{context}] Gemini API error {resp.status_code}: {resp.text}",
-                            "ERROR",
-                        )
-                        if resp.status_code == 429:
+                        err_msg = resp.text
+                        retry_wait = None
+                        if resp.headers.get("Content-Type", "").startswith("application/json"):
                             try:
                                 data = resp.json()
+                                err_msg = data.get("error", {}).get("message", err_msg)
                                 for detail in data.get("error", {}).get("details", []):
                                     if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
                                         delay = detail.get("retryDelay", "0s")
-                                        seconds = 0.0
+                                        secs = 0.0
                                         if delay.endswith("s"):
                                             try:
-                                                seconds = float(delay[:-1])
+                                                secs = float(delay[:-1])
                                             except Exception:
-                                                seconds = 0.0
-                                        wait_for = seconds + 10.0
-                                        self.log_message(
-                                            f"[{context}] Превышен лимит Gemini для ключа {key_short}, ожидание {wait_for:.1f}с",
-                                            "WARNING",
-                                        )
-                                        token_delay = max(token_delay, wait_for)
-                                        if self.stop_event.wait(wait_for):
-                                            self.log_message(
-                                                f"[{context}] Ожидание после 429 прервано стоп-сигналом",
-                                                "DEBUG",
-                                            )
-                                            return None
-                                        break
+                                                secs = 0.0
+                                        retry_wait = secs + 10.0
                             except Exception:
+                                err_msg = err_msg[:200]
+                        self.log_message(
+                            f"[{context}] Gemini API error {resp.status_code}: {err_msg[:200]}",
+                            "ERROR",
+                        )
+                        if resp.status_code == 429:
+                            wait_for = retry_wait if retry_wait is not None else 10.0
+                            self.log_message(
+                                f"[{context}] Повтор через {wait_for:.1f}с после 429",
+                                "WARNING",
+                            )
+                            token_delay = max(token_delay, wait_for)
+                            if self.stop_event.wait(wait_for):
                                 self.log_message(
-                                    f"[{context}] Не удалось обработать RetryInfo для ключа {key_short}",
+                                    f"[{context}] Ожидание после 429 прервано стоп-сигналом",
                                     "DEBUG",
                                 )
+                                return None
                 except requests.exceptions.Timeout as e:
                     self.log_message(
                         f"[{context}] Таймаут Gemini API: {e}",
