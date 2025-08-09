@@ -661,7 +661,15 @@ class TextGeneratorApp(ctk.CTkFrame):
                     {"date": today, "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
                 )
                 if info.get("date") != today:
-                    info.update({"date": today, "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0})
+                    info.update(
+                        {
+                            "date": today,
+                            "used_today": 0,
+                            "next_allowed_ts": 0.0,
+                            "window_count": 0,
+                        }
+                    )
+                wait = 0.0
                 if info["used_today"] >= 250:
                     return False
                 now = time.time()
@@ -1616,15 +1624,14 @@ class TextGeneratorApp(ctk.CTkFrame):
     def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5):
         if not self._before_gemini_call(api_key_used_for_call):
             return "GEMINI_KEY_EXHAUSTED"
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-        params = {"key": api_key_used_for_call}
-        headers = {"Content-Type": "application/json"}
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
         payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
         for attempt in range(retries):
             if self.stop_event.is_set():
                 return None
             try:
-                resp = requests.post(url, params=params, headers=headers, json=payload, timeout=30)
+                resp = requests.post(url, headers=headers, json=payload, timeout=30)
                 if resp.status_code == 200:
                     data = resp.json()
                     text = (
