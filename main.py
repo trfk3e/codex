@@ -112,10 +112,15 @@ class KeyBatchLimiter:
                 time.sleep(self.window)
 
 # Gemini integration constants
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_API_URL_TEMPLATE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+GEMINI_H1_MODEL = "gemini-2.5-flash"
+GEMINI_BODY_MODEL = "gemini-2.5-pro"
 GEMINI_BODY_EXTRA_INSTRUCTION = (
     "Сделай текст не слишком длинным и используй настоящую, проверяемую информацию; избегай вымышленных фактов."
 )
+GEMINI_WORKER_COUNT = 3
 EXHAUSTED_KEYS_FILE = "exhausted-limit-keys.txt"
 
 # Файлы для совместного использования API ключей и списка проектов
@@ -366,7 +371,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_keys_file = tk.StringVar()
         self.gemini_usage_file = os.path.join(os.path.dirname(self.config_file), "gemini_key_usage.json")
         self.gemini_key_usage = {}
-        self.gemini_limiters = {}
+        self.gemini_limiter = None
         self.gemini_wait_logged = {}
         self.gemini_429_counts = {}
         self.generation_active = False
@@ -527,11 +532,9 @@ class TextGeneratorApp(ctk.CTkFrame):
                     t.start()
                     time.sleep(0.01)
             else:
-                keys = self.api_keys_list[:]
-                for i, key in enumerate(keys):
-                    if self.stop_event.is_set():
-                        break
-                    for j in range(PER_KEY_CONCURRENCY):
+                key = self.api_keys_list[0] if self.api_keys_list else None
+                if key:
+                    for j in range(GEMINI_WORKER_COUNT):
                         if self.stop_event.is_set():
                             break
                         acquired = GLOBAL_THREAD_SEMAPHORE.acquire(blocking=False)
@@ -543,7 +546,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         t = threading.Thread(
                             target=self.gemini_worker_thread,
                             args=(key,),
-                            name=f"GeminiWorker-{i + 1}-{j + 1}",
+                            name=f"GeminiWorker-{j + 1}",
                             daemon=True,
                         )
                         threads.append(t)
@@ -1169,12 +1172,20 @@ class TextGeneratorApp(ctk.CTkFrame):
             except Exception as e:
                 self.log_message(f"Ошибка чтения файла ключей: {e}", "ERROR")
         with self.api_key_management_lock:
-            self.api_keys_list = keys
+            if provider == "Gemini 2.5 Flash" and keys:
+                self.api_keys_list = [keys[0]]
+                if len(keys) > 1:
+                    self.log_message(
+                        "Используется только первый Gemini ключ; остальные игнорируются из-за проектных квот.",
+                        "WARNING",
+                    )
+            else:
+                self.api_keys_list = keys
         if provider == "OpenAI":
             self._repopulate_available_api_key_queue()
         else:
             self.api_key_queue = Queue()
-            self.gemini_limiters = {k: KeyBatchLimiter(10, 65) for k in keys}
+            self.gemini_limiter = KeyBatchLimiter(10, 65)
             self.update_gemini_capacity_label()
 
     def update_provider_ui(self):
@@ -1439,11 +1450,12 @@ class TextGeneratorApp(ctk.CTkFrame):
             active_keys_count = self.api_key_queue.qsize()
         else:
             active_keys_count = len(self.api_keys_list)
-            self.num_threads_var.set(active_keys_count)
+            self.num_threads_var.set(GEMINI_WORKER_COUNT)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
         if self.provider_var.get() == "Gemini 2.5 Flash":
-            self.log_message(f"Модель Gemini запущена, обнаружено {active_keys_count} ключей. Запуск воркеров для каждого:")
+            self.log_message(
+                f"Модель Gemini запущена, обнаружено {active_keys_count} ключей. Запуск {GEMINI_WORKER_COUNT} воркеров:")
         self.log_message(
             f"Запуск генерации: {self.num_threads_var.get()} поток(а/ов), активных ключей: {active_keys_count}."
         )
@@ -1664,7 +1676,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
         return None
 
-    def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3):
+    def call_gemini_api(self, api_key_used_for_call, prompt_text, model, retries=3, max_output_tokens=None):
         today = datetime.date.today().isoformat()
         usage = self.gemini_key_usage.get(api_key_used_for_call, {})
         if usage.get("date") != today:
@@ -1690,13 +1702,15 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ключ {api_key_used_for_call[:7]}... исчерпан сегодня.", "ERROR")
                 self._mark_gemini_key_exhausted(api_key_used_for_call)
                 return None
-            limiter = self.gemini_limiters.get(api_key_used_for_call)
-            if limiter:
-                limiter.acquire()
+            self.gemini_limiter.acquire()
             headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
             data = {"contents": [{"parts": [{"text": prompt_text}]}]}
+            if max_output_tokens:
+                data["generationConfig"] = {"maxOutputTokens": max_output_tokens}
+            data["safetySettings"] = [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}]
             try:
-                resp = requests.post(GEMINI_API_URL, headers=headers, json=data, timeout=30)
+                url = GEMINI_API_URL_TEMPLATE.format(model)
+                resp = requests.post(url, headers=headers, json=data, timeout=120)
             except requests.exceptions.Timeout:
                 self.log_message(f"Ключ ...{key_tail} таймаут запроса", "DEBUG")
                 attempt += 1
@@ -1707,10 +1721,20 @@ class TextGeneratorApp(ctk.CTkFrame):
                 time.sleep(1)
                 continue
             if resp.status_code == 200:
-                try:
-                    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                except Exception:
-                    text = resp.text
+                data_resp = resp.json()
+                pf = data_resp.get("promptFeedback", {})
+                if pf.get("blockReason"):
+                    self.log_message(f"Ключ ...{key_tail} блокировка safety: {pf.get('blockReason')}", "WARNING")
+                    return None
+                cand = data_resp.get("candidates", [{}])[0]
+                if cand.get("finishReason") == "SAFETY":
+                    self.log_message(f"Ключ ...{key_tail} кандидаты заблокированы safety", "WARNING")
+                    return None
+                text = cand.get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                if not text:
+                    return None
+                if cand.get("finishReason") == "LENGTH":
+                    self.log_message(f"Ключ ...{key_tail} ответ обрезан по длине", "WARNING")
                 usage["used_today"] = usage.get("used_today", 0) + 1
                 usage["next_allowed_ts"] = 0.0
                 self.gemini_key_usage[api_key_used_for_call] = usage
@@ -1719,10 +1743,19 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.gemini_429_counts[api_key_used_for_call] = 0
                 if usage["used_today"] >= 250:
                     self._mark_gemini_key_exhausted(api_key_used_for_call)
+                next_time_str = "now"
+                if usage.get("next_allowed_ts", 0.0) > time.time():
+                    next_time_str = time.strftime("%H:%M:%S", time.localtime(usage["next_allowed_ts"]))
+                self.log_message(f"Ключ ...{key_tail} следующий вызов после {next_time_str}", "DEBUG")
                 backoff = 1.0
                 return text
             elif resp.status_code == 429:
                 retry_delay = 1.0
+                if resp.headers.get("Retry-After"):
+                    try:
+                        retry_delay = float(resp.headers["Retry-After"])
+                    except Exception:
+                        pass
                 try:
                     details = resp.json().get("error", {}).get("details", [])
                     for d in details:
@@ -1742,6 +1775,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                 usage["next_allowed_ts"] = time.time() + wait
                 self.gemini_key_usage[api_key_used_for_call] = usage
                 self._save_gemini_key_usage()
+                next_time_str = time.strftime("%H:%M:%S", time.localtime(usage["next_allowed_ts"]))
+                self.log_message(f"Ключ ...{key_tail} следующий вызов после {next_time_str}", "DEBUG")
                 backoff = min(backoff * 2, 60)
                 continue
             else:
@@ -2071,7 +2106,12 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "INFO")
             else:
                 h1_prompt_text = "\n".join([m["content"] for m in base_h1_prompt])
-                original_h1_text_raw = self.call_gemini_api(retrieved_api_key_str, h1_prompt_text)
+                original_h1_text_raw = self.call_gemini_api(
+                    retrieved_api_key_str,
+                    h1_prompt_text,
+                    GEMINI_H1_MODEL,
+                    max_output_tokens=64,
+                )
 
             if not original_h1_text_raw or self.stop_event.is_set():
                 self.log_message(
@@ -2109,7 +2149,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                     selected_lang, kw_for_prompt, keyword_phrase, original_h1_text
                 )
                 article_body_raw_from_api = self.call_gemini_api(
-                    retrieved_api_key_str, body_prompt_text)
+                    retrieved_api_key_str,
+                    body_prompt_text,
+                    GEMINI_BODY_MODEL,
+                    max_output_tokens=1200,
+                )
 
             if self.provider_var.get() == "OpenAI":
                 with self.api_key_statuses_lock:  # Проверка статуса ключа
