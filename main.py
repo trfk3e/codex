@@ -518,6 +518,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                     "WARNING")
 
     def log_message(self, message, level="INFO"):
+        if level == "DEBUG":
+            return
         if getattr(self, 'silent_stop', False) and self.stop_event.is_set():
             allowed = [
                 "Генерация остановлена",
@@ -754,8 +756,6 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._save_api_key_statuses()
 
     def _current_per_key_concurrency(self):
-        if self.provider_var.get() == PROVIDER_GEMINI:
-            return 1
         return PER_KEY_CONCURRENCY
 
     def _repopulate_available_api_key_queue(self):
@@ -774,8 +774,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         per_key = self._current_per_key_concurrency()
         if active_keys_for_queue:
             random.shuffle(active_keys_for_queue)
-            for key_str in active_keys_for_queue:
-                for _ in range(per_key):
+            for _ in range(per_key):
+                for key_str in active_keys_for_queue:
                     new_queue.put(key_str)
             self.log_message(
                 f"Очередь API ключей обновлена. Активных ключей: {len(active_keys_for_queue)}",
