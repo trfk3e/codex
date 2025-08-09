@@ -1706,15 +1706,29 @@ class TextGeneratorApp(ctk.CTkFrame):
                                     delay = detail.get("retryDelay", "0s")
                                     seconds = 0.0
                                     if delay.endswith("s"):
-                                        seconds = float(delay[:-1])
+                                        try:
+                                            seconds = float(delay[:-1])
+                                        except Exception:
+                                            seconds = 0.0
+                                    wait_for = seconds + 10.0
+                                    self.log_message(
+                                        f"[{context}] Превышен лимит Gemini для ключа {key_short}, ожидание {wait_for:.1f}с",
+                                        "WARNING",
+                                    )
                                     with GEMINI_USAGE_LOCK:
                                         info = self.gemini_usage.setdefault(
                                             api_key_used_for_call,
                                             {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
                                         )
-                                        info["next_allowed_ts"] = time.time() + seconds
+                                        info["next_allowed_ts"] = time.time() + wait_for
                                         info["window_count"] = 0
                                         self._save_gemini_usage()
+                                    if self.stop_event.wait(wait_for):
+                                        self.log_message(
+                                            f"[{context}] Ожидание после 429 прервано стоп-сигналом",
+                                            "DEBUG",
+                                        )
+                                        return None
                                     break
                         except Exception:
                             self.log_message(
