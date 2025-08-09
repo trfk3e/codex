@@ -515,6 +515,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                                          name=f"GeminiWorker-{i + 1}", daemon=True)
                     threads.append(t)
                     t.start()
+                    if i < len(keys) - 1:
+                        time.sleep(10)
             if self.stop_event.is_set():
                 self.log_message("Генерация остановлена во время запуска потоков.", "INFO")
             self._monitor_task_queue_and_threads(threads)
@@ -2501,39 +2503,45 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.log_message(f"Ключ ...{api_key[-5:]}:")
         try:
             while not self.stop_event.is_set() and api_key in self.api_keys_list:
-                task_payload = None
-                task_dequeued_this_iteration = False
-                try:
-                    task_payload = self.task_creation_queue.get(timeout=1)
-                    task_dequeued_this_iteration = True
+                batch = []
+                for _ in range(10):
                     if self.stop_event.is_set():
                         break
-                    task_id, keyword, num_for_kw, total_for_kw, global_num, total_global = task_payload
-                    self.generate_single_article_content(
-                        task_id,
-                        keyword,
-                        num_for_kw,
-                        total_for_kw,
-                        global_num,
-                        total_global,
-                        key_override=api_key,
-                    )
-                    if self.stop_event.is_set():
+                    try:
+                        payload = self.task_creation_queue.get(timeout=1)
+                        batch.append(payload)
+                    except Empty:
                         break
-                except Empty:
+                if not batch:
                     if self.stop_event.is_set() or self.task_creation_queue.unfinished_tasks == 0:
                         break
                     continue
-                except Exception as e_worker_critical:
-                    task_id_for_log = task_payload[0] if task_payload and isinstance(task_payload, tuple) and len(
-                        task_payload) > 0 else "UNKNOWN_TASK_ID"
-                    self.log_message(
-                        f"Критическая ошибка в потоке {threading.current_thread().name} при обработке задачи {task_id_for_log}:{type(e_worker_critical).__name__} - {e_worker_critical}",
-                        "CRITICAL")
-                    self.log_message(f"Traceback: {traceback.format_exc()}", "DEBUG")
-                finally:
-                    if task_dequeued_this_iteration:
+                for task_payload in batch:
+                    task_id, keyword, num_for_kw, total_for_kw, global_num, total_global = task_payload
+                    try:
+                        self.generate_single_article_content(
+                            task_id,
+                            keyword,
+                            num_for_kw,
+                            total_for_kw,
+                            global_num,
+                            total_global,
+                            key_override=api_key,
+                        )
+                    finally:
                         self.task_creation_queue.task_done()
+                    if self.stop_event.is_set():
+                        break
+                if self.stop_event.is_set():
+                    break
+                if len(batch) == 10:
+                    self.log_message(
+                        f"Ключ ...{api_key[-5:]}: ожидание 65 секунд после 10 генераций..."
+                    )
+                    for _ in range(65):
+                        if self.stop_event.is_set():
+                            break
+                        time.sleep(1)
         finally:
             GLOBAL_THREAD_SEMAPHORE.release()
 
