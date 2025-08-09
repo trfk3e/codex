@@ -25,6 +25,7 @@ import time
 import re
 from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
+from collections import deque
 
 import random
 import traceback
@@ -340,6 +341,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_keys_file = tk.StringVar()
         self.gemini_usage_file = os.path.join(os.path.dirname(self.config_file), "gemini_key_usage.json")
         self.gemini_key_usage = {}
+        self.gemini_recent_calls = {}
         self.generation_active = False
         self.waiting_for_project_slot = False
         self.stop_event = threading.Event()
@@ -512,6 +514,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                                          name=f"GeminiWorker-{i + 1}", daemon=True)
                     threads.append(t)
                     t.start()
+                    time.sleep(10)
             if self.stop_event.is_set():
                 self.log_message("Генерация остановлена во время запуска потоков.", "INFO")
             self._monitor_task_queue_and_threads(threads)
@@ -1619,9 +1622,22 @@ class TextGeneratorApp(ctk.CTkFrame):
         if usage.get("date") != today:
             usage = {"date": today, "used_today": 0, "next_allowed_ts": 0.0}
         self.gemini_key_usage[api_key_used_for_call] = usage
+        recent_calls = self.gemini_recent_calls.setdefault(api_key_used_for_call, deque())
         for attempt in range(retries):
             if self.stop_event.is_set():
                 return None
+            # Enforce 10 requests per 65 seconds per key
+            now = time.time()
+            while recent_calls and now - recent_calls[0] >= 65:
+                recent_calls.popleft()
+            if len(recent_calls) >= 10:
+                wait = 65 - (now - recent_calls[0])
+                usage["next_allowed_ts"] = recent_calls[0] + 65
+                self.gemini_key_usage[api_key_used_for_call] = usage
+                self._save_gemini_key_usage()
+                if wait > 0:
+                    time.sleep(wait)
+                continue
             if usage["used_today"] >= 250:
                 self.log_message(f"Ключ {api_key_used_for_call[:7]}... исчерпан сегодня.", "ERROR")
                 self._mark_gemini_key_exhausted(api_key_used_for_call)
@@ -1636,17 +1652,39 @@ class TextGeneratorApp(ctk.CTkFrame):
                     except Exception:
                         text = resp.text
                     usage["used_today"] = usage.get("used_today", 0) + 1
+                    recent_calls.append(time.time())
+                    if len(recent_calls) >= 10:
+                        usage["next_allowed_ts"] = recent_calls[0] + 65
+                    else:
+                        usage["next_allowed_ts"] = 0.0
                     self.gemini_key_usage[api_key_used_for_call] = usage
                     self._save_gemini_key_usage()
                     self.update_gemini_capacity_label()
                     if usage["used_today"] >= 250:
                         self._mark_gemini_key_exhausted(api_key_used_for_call)
                     return text
+                elif resp.status_code == 429:
+                    self.log_message(f"Gemini API error: {resp.text}", "ERROR")
+                    retry_delay = 60
+                    try:
+                        details = resp.json().get("error", {}).get("details", [])
+                        for d in details:
+                            if d.get("@type", "").endswith("RetryInfo") and "retryDelay" in d:
+                                rd = d["retryDelay"]
+                                if rd.endswith("s"):
+                                    retry_delay = float(rd[:-1])
+                    except Exception:
+                        pass
+                    usage["next_allowed_ts"] = time.time() + retry_delay
+                    self.gemini_key_usage[api_key_used_for_call] = usage
+                    self._save_gemini_key_usage()
+                    time.sleep(retry_delay)
                 else:
                     self.log_message(f"Gemini API error: {resp.text}", "ERROR")
+                    time.sleep(1)
             except Exception as e:
                 self.log_message(f"Gemini API exception: {e}", "ERROR")
-            time.sleep(1)
+                time.sleep(1)
         return None
 
     def build_openai_body_prompt(self, selected_lang, kw_for_prompt, keyword_phrase, original_h1_text):
@@ -2447,8 +2485,6 @@ class TextGeneratorApp(ctk.CTkFrame):
     def gemini_worker_thread(self, api_key):
         self.log_message(f"Ключ ...{api_key[-5:]}:")
         try:
-            articles_in_cycle = 0
-            cycle_start = time.time()
             while not self.stop_event.is_set() and api_key in self.api_keys_list:
                 task_payload = None
                 task_dequeued_this_iteration = False
@@ -2467,23 +2503,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                         total_global,
                         key_override=api_key,
                     )
-                    articles_in_cycle += 1
                     if self.stop_event.is_set():
                         break
-                    if articles_in_cycle >= 10:
-                        allowed_time = cycle_start + 65
-                        today = datetime.date.today().isoformat()
-                        usage = self.gemini_key_usage.get(api_key, {"date": today, "used_today": 0, "next_allowed_ts": 0.0})
-                        if usage.get("date") != today:
-                            usage = {"date": today, "used_today": usage.get("used_today", 0), "next_allowed_ts": 0.0}
-                        usage["next_allowed_ts"] = allowed_time
-                        self.gemini_key_usage[api_key] = usage
-                        self._save_gemini_key_usage()
-                        remaining = allowed_time - time.time()
-                        if remaining > 0:
-                            time.sleep(remaining)
-                        cycle_start = time.time()
-                        articles_in_cycle = 0
                 except Empty:
                     if self.task_creation_queue.empty():
                         break
