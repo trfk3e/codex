@@ -1523,7 +1523,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         return None
 
     def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5):
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": api_key_used_for_call}
         payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
         for attempt in range(retries):
@@ -1533,9 +1533,21 @@ class TextGeneratorApp(ctk.CTkFrame):
                 resp = requests.post(url, headers=headers, json=payload, timeout=30)
                 if resp.status_code == 200:
                     data = resp.json()
-                    return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            except Exception:
-                pass
+                    text = (
+                        data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                    )
+                    if text:
+                        return text
+                else:
+                    self.log_message(
+                        f"Gemini API error {resp.status_code}: {resp.text}",
+                        "ERROR",
+                    )
+            except Exception as e:
+                self.log_message(f"Gemini API request failed: {e}", "ERROR")
             if attempt + 1 < retries:
                 time.sleep(delay_seconds * (attempt + 1))
         return ""
