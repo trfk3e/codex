@@ -1982,6 +1982,18 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.log_message(f"{log_prefix} H1 (оригинал): '{original_h1_text}'")
             filepath_to_save = self.get_unique_filepath(original_h1_text)
 
+            # Pause to respect Gemini rate limits after plan (H1) generation
+            self.log_message(
+                f"{log_prefix} Ожидание 65 секунд после генерации плана перед созданием тела статьи...",
+                "DEBUG",
+            )
+            if self.stop_event.wait(65):
+                self.log_message(
+                    f"{log_prefix} Ожидание после плана прервано сигналом остановки.",
+                    "DEBUG",
+                )
+                return False
+
             def generate_random_body_prompt(current_selected_lang, current_keyword_phrase, current_original_h1_text):
                 # Рандомизация объема вступления
                 intro_word_count = random.randint(150, 300)  # Вступление может быть от 150 до 300 слов
