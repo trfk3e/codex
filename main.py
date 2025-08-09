@@ -38,7 +38,7 @@ import sys
 import atexit
 import signal
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
-from collections import deque
+from collections import deque, defaultdict
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -370,6 +370,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
         self.gemini_usage = {}
         self._load_gemini_usage()
+        self.gemini_key_locks = defaultdict(lambda: threading.Semaphore(1))
 
         self.article_toc_background_colors = [
             "#f9f9f9", "#fcf3f2", "#fcfcfe", "#fff5f3", "#f5f8ff", "#f8fcf3",
@@ -788,6 +789,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._save_api_key_statuses()
 
     def _current_per_key_concurrency(self):
+        if self.provider_var.get() == PROVIDER_GEMINI:
+            return 1
         return PER_KEY_CONCURRENCY
 
     def _repopulate_available_api_key_queue(self):
@@ -1419,7 +1422,7 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _begin_generation_after_slot(self):
         with self.api_key_queue.mutex:
             active_keys = set(self.api_key_queue.queue)
-        target_threads = 1
+        target_threads = min(self.num_threads_var.get(), len(active_keys)) or 1
         self.num_threads_var.set(target_threads)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
@@ -1648,113 +1651,119 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5, context=""):
         key_short = api_key_used_for_call[:7]
-        self.log_message(
-            f"[{context}] Подготовка запроса к Gemini для ключа {key_short}, длина промпта {len(prompt_text)}",
-            "DEBUG",
-        )
-        if not self._before_gemini_call(api_key_used_for_call):
+        lock = self.gemini_key_locks[api_key_used_for_call]
+        self.log_message(f"[{context}] Ожидание освобождения ключа {key_short}", "DEBUG")
+        while not self.stop_event.is_set():
+            if lock.acquire(timeout=1):
+                break
+        else:
+            return None
+        try:
             self.log_message(
-                f"[{context}] Ключ {key_short} не прошёл предварительную проверку Gemini",
+                f"[{context}] Подготовка запроса к Gemini для ключа {key_short}, длина промпта {len(prompt_text)}",
                 "DEBUG",
             )
-            return "GEMINI_KEY_EXHAUSTED"
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-        params = {"key": api_key_used_for_call}
-        headers = {"Content-Type": "application/json"}
-        payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
-        for attempt in range(retries):
-            if self.stop_event.is_set():
-                self.log_message(f"[{context}] Прекращено из-за стоп-сигнала", "DEBUG")
-                return None
-            try:
+            if not self._before_gemini_call(api_key_used_for_call):
                 self.log_message(
-                    f"[{context}] Попытка {attempt + 1}/{retries} отправки запроса Gemini ключом {key_short}",
+                    f"[{context}] Ключ {key_short} не прошёл предварительную проверку Gemini",
                     "DEBUG",
                 )
-                resp = requests.post(url, params=params, headers=headers, json=payload, timeout=(10, 30))
-                self.log_message(
-                    f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
-                    "DEBUG",
-                )
-                self.log_message(
-                    f"[{context}] Тело ответа Gemini (первые 200 символов): {resp.text[:200]}",
-                    "DEBUG",
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    text = (
-                        data.get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                    )
-                    if text:
-                        self._after_gemini_call(api_key_used_for_call)
-                        self.log_message(
-                            f"[{context}] Получен текст длиной {len(text)} символов от Gemini ключом {key_short}",
-                            "DEBUG",
-                        )
-                        self.log_message(f"[{context}] Ожидание 10с после запроса Gemini", "DEBUG")
-                        if self.stop_event.wait(10):
-                            self.log_message(f"[{context}] Ожидание после Gemini прервано", "DEBUG")
-                            return None
-                        return text
-                else:
+                return "GEMINI_KEY_EXHAUSTED"
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            params = {"key": api_key_used_for_call}
+            headers = {"Content-Type": "application/json"}
+            payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+            for attempt in range(retries):
+                if self.stop_event.is_set():
+                    self.log_message(f"[{context}] Прекращено из-за стоп-сигнала", "DEBUG")
+                    return None
+                try:
                     self.log_message(
-                        f"[{context}] Gemini API error {resp.status_code}: {resp.text}",
-                        "ERROR",
+                        f"[{context}] Попытка {attempt + 1}/{retries} отправки запроса Gemini ключом {key_short}",
+                        "DEBUG",
                     )
-                    if resp.status_code == 429:
-                        try:
-                            data = resp.json()
-                            for detail in data.get("error", {}).get("details", []):
-                                if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                                    delay = detail.get("retryDelay", "0s")
-                                    seconds = 0.0
-                                    if delay.endswith("s"):
-                                        try:
-                                            seconds = float(delay[:-1])
-                                        except Exception:
-                                            seconds = 0.0
-                                    wait_for = seconds + 10.0
-                                    self.log_message(
-                                        f"[{context}] Превышен лимит Gemini для ключа {key_short}, ожидание {wait_for:.1f}с",
-                                        "WARNING",
-                                    )
-                                    with GEMINI_USAGE_LOCK:
-                                        info = self.gemini_usage.setdefault(
-                                            api_key_used_for_call,
-                                            {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
-                                        )
-                                        info["next_allowed_ts"] = time.time() + wait_for
-                                        info["window_count"] = 0
-                                        self._save_gemini_usage()
-                                    if self.stop_event.wait(wait_for):
-                                        self.log_message(
-                                            f"[{context}] Ожидание после 429 прервано стоп-сигналом",
-                                            "DEBUG",
-                                        )
-                                        return None
-                                    break
-                        except Exception:
+                    resp = requests.post(url, params=params, headers=headers, json=payload, timeout=(10, 30))
+                    self.log_message(
+                        f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
+                        "DEBUG",
+                    )
+                    self.log_message(
+                        f"[{context}] Тело ответа Gemini (первые 200 символов): {resp.text[:200]}",
+                        "DEBUG",
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        text = (
+                            data.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [{}])[0]
+                            .get("text", "")
+                        )
+                        if text:
+                            self._after_gemini_call(api_key_used_for_call)
                             self.log_message(
-                                f"[{context}] Не удалось обработать RetryInfo для ключа {key_short}",
+                                f"[{context}] Получен текст длиной {len(text)} символов от Gemini ключом {key_short}",
                                 "DEBUG",
                             )
-            except Exception as e:
-                self.log_message(f"[{context}] Gemini API request failed: {e}", "ERROR")
-            self.log_message(f"[{context}] Ожидание 10с после запроса Gemini", "DEBUG")
-            if self.stop_event.wait(10):
-                self.log_message(f"[{context}] Ожидание после Gemini прервано", "DEBUG")
-                return None
-            if attempt + 1 < retries:
-                pause = delay_seconds * (attempt + 1)
-                self.log_message(
-                    f"[{context}] Повтор через {pause:.2f}с", "DEBUG",
-                )
-                time.sleep(pause)
-        self._after_gemini_call(api_key_used_for_call)
-        return ""
+                            return text
+                    else:
+                        self.log_message(
+                            f"[{context}] Gemini API error {resp.status_code}: {resp.text}",
+                            "ERROR",
+                        )
+                        if resp.status_code == 429:
+                            try:
+                                data = resp.json()
+                                for detail in data.get("error", {}).get("details", []):
+                                    if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
+                                        delay = detail.get("retryDelay", "0s")
+                                        seconds = 0.0
+                                        if delay.endswith("s"):
+                                            try:
+                                                seconds = float(delay[:-1])
+                                            except Exception:
+                                                seconds = 0.0
+                                        wait_for = seconds + 10.0
+                                        self.log_message(
+                                            f"[{context}] Превышен лимит Gemini для ключа {key_short}, ожидание {wait_for:.1f}с",
+                                            "WARNING",
+                                        )
+                                        with GEMINI_USAGE_LOCK:
+                                            info = self.gemini_usage.setdefault(
+                                                api_key_used_for_call,
+                                                {"date": datetime.date.today().isoformat(), "used_today": 0, "next_allowed_ts": 0.0, "window_count": 0},
+                                            )
+                                            info["next_allowed_ts"] = time.time() + wait_for
+                                            info["window_count"] = 0
+                                            self._save_gemini_usage()
+                                        if self.stop_event.wait(wait_for):
+                                            self.log_message(
+                                                f"[{context}] Ожидание после 429 прервано стоп-сигналом",
+                                                "DEBUG",
+                                            )
+                                            return None
+                                        break
+                            except Exception:
+                                self.log_message(
+                                    f"[{context}] Не удалось обработать RetryInfo для ключа {key_short}",
+                                    "DEBUG",
+                                )
+                except Exception as e:
+                    self.log_message(f"[{context}] Gemini API request failed: {e}", "ERROR")
+                if attempt + 1 < retries:
+                    pause = delay_seconds * (attempt + 1)
+                    self.log_message(
+                        f"[{context}] Повтор через {pause:.2f}с", "DEBUG",
+                    )
+                    if self.stop_event.wait(pause):
+                        return None
+            self._after_gemini_call(api_key_used_for_call)
+            return ""
+        finally:
+            def release():
+                lock.release()
+                self.log_message(f"[{context}] Ключ {key_short} доступен для следующего запроса", "DEBUG")
+            threading.Timer(10, release).start()
 
     # ================================================================================
     # НОВЫЙ МЕТОД ДЛЯ ОЧИСТКИ HTML (УБЕДИТЕСЬ, ЧТО ОН ВНУТРИ КЛАССА TextGeneratorApp)
@@ -2006,6 +2015,13 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.log_message(f"{log_prefix} H1 (оригинал): '{original_h1_text}'")
             filepath_to_save = self.get_unique_filepath(original_h1_text)
 
+            # Return key to queue while waiting before body generation
+            with self.api_key_statuses_lock:
+                status_after_h1 = self.api_key_statuses.get(retrieved_api_key_str, {}).get("status", "active")
+            if status_after_h1 == "active":
+                self.api_key_queue.put(retrieved_api_key_str)
+            retrieved_api_key_str = None
+
             # Pause to respect Gemini rate limits after plan (H1) generation
             self.log_message(
                 f"{log_prefix} Ожидание 65 секунд после генерации плана перед созданием тела статьи...",
@@ -2130,6 +2146,16 @@ class TextGeneratorApp(ctk.CTkFrame):
             body_prompt_user, body_prompt_system = generate_random_body_prompt(selected_lang, kw_for_prompt,
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
+
+            if retrieved_api_key_str is None:
+                try:
+                    retrieved_api_key_str = self.api_key_queue.get(block=True, timeout=20)
+                    with self.api_stats_lock:
+                        self.api_key_usage_stats[retrieved_api_key_str] = self.api_key_usage_stats.get(retrieved_api_key_str, 0) + 1
+                    key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(retrieved_api_key_str) > 5 else retrieved_api_key_str
+                except Empty:
+                    self.log_message(f"{log_prefix} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
+                    return False
 
             if self.provider_var.get() == PROVIDER_OPENAI:
                 article_body_raw_from_api = self.call_openai_api(openai_client,
