@@ -35,7 +35,7 @@ from dateutil.parser import parse as parse_datetime  # Для парсинга I
 from dateutil.relativedelta import relativedelta  # Для парсинга "1m", "60s"
 # Utilities for HTML parsing and shutdown handling
 from bs4 import BeautifulSoup, NavigableString, Tag
-from typing import TypedDict, Optional, Dict, Any
+from typing import TypedDict, Optional, Dict, Any, Set
 import sys
 import atexit
 import signal
@@ -86,8 +86,9 @@ GEMINI_DAILY_REQUEST_LIMITS = {
     "gemini-2.5-flash": 250,
     "gemini-2.5-flash-lite": 250,
 }
-GLOBAL_GEMINI_KEYS_USAGE: Dict[str, int] = {}
+GLOBAL_GEMINI_KEYS_USAGE: Set[str] = set()
 GLOBAL_GEMINI_RESERVED_REQUESTS = 0
+GLOBAL_GEMINI_CONSUMED_REQUESTS = 0
 GLOBAL_GEMINI_USAGE_LOCK = threading.Lock()
 # Limit the amount of lines kept in the GUI log to avoid slowdown
 MAX_LOG_LINES = 500
@@ -735,7 +736,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.api_key_queue = new_queue
         self.update_threads_label()
 
-    def _acquire_api_key_with_cooldown(self, required_interval: float, batch_limit: Optional[int] = None):
+    def _acquire_api_key_with_cooldown(self, required_interval: float, batch_limit: Optional[int] = None, requests_needed: int = 1):
         """Возвращает API ключ, учитывая минимальный интервал и лимит пакета запросов."""
         while True:
             wait_times: list[float] = []
@@ -754,15 +755,24 @@ class TextGeneratorApp(ctk.CTkFrame):
                         last_ts = api_key_last_call_time.get(key, 0.0)
                         elapsed = now - last_ts
                         if elapsed >= required_interval:
-                            api_key_last_call_time[key] = now
                             if batch_limit:
-                                count = api_key_batch_counts.get(key, 0) + 1
-                                if count >= batch_limit:
+                                count = api_key_batch_counts.get(key, 0)
+                                if count + requests_needed > batch_limit:
                                     api_key_batch_counts[key] = 0
                                     api_key_cooldown_until[key] = now + GEMINI_RATE_LIMIT_INTERVAL
+                                    wait_times.append(GEMINI_RATE_LIMIT_INTERVAL)
                                 else:
-                                    api_key_batch_counts[key] = count
-                            return key
+                                    api_key_last_call_time[key] = now
+                                    new_count = count + requests_needed
+                                    if new_count >= batch_limit:
+                                        api_key_batch_counts[key] = 0
+                                        api_key_cooldown_until[key] = now + GEMINI_RATE_LIMIT_INTERVAL
+                                    else:
+                                        api_key_batch_counts[key] = new_count
+                                    return key
+                            else:
+                                api_key_last_call_time[key] = now
+                                return key
                         else:
                             wait_times.append(required_interval - elapsed)
                 self.api_key_queue.put(key)
@@ -1074,9 +1084,11 @@ class TextGeneratorApp(ctk.CTkFrame):
         with self.api_key_queue.mutex:
             available_keys = set(self.api_key_queue.queue)
         with GLOBAL_GEMINI_USAGE_LOCK:
-            all_keys = available_keys.union(GLOBAL_GEMINI_KEYS_USAGE.keys())
+            all_keys = available_keys.union(GLOBAL_GEMINI_KEYS_USAGE)
             total_capacity = len(all_keys) * per_key_limit
-            available_requests = total_capacity - GLOBAL_GEMINI_RESERVED_REQUESTS
+            available_requests = total_capacity - (
+                GLOBAL_GEMINI_RESERVED_REQUESTS + GLOBAL_GEMINI_CONSUMED_REQUESTS
+            )
         available_texts = max(0, available_requests // 2)
         if hasattr(self, "gemini_quota_label") and self.gemini_quota_label.winfo_exists():
             self.gemini_quota_label.configure(text=f"Доступно текстов: {available_texts}")
@@ -1421,12 +1433,11 @@ class TextGeneratorApp(ctk.CTkFrame):
             gemini_model_name = self._get_selected_gemini_model()
             per_key_limit = GEMINI_DAILY_REQUEST_LIMITS.get(gemini_model_name, 0)
             with GLOBAL_GEMINI_USAGE_LOCK:
-                prospective_usage = GLOBAL_GEMINI_KEYS_USAGE.copy()
-                for k in active_keys_current:
-                    prospective_usage[k] = prospective_usage.get(k, 0) + 1
-                total_unique_keys = len(prospective_usage)
-                total_capacity = total_unique_keys * per_key_limit
-                available = total_capacity - GLOBAL_GEMINI_RESERVED_REQUESTS
+                all_keys = active_keys_current.union(GLOBAL_GEMINI_KEYS_USAGE)
+                total_capacity = len(all_keys) * per_key_limit
+                available = total_capacity - (
+                    GLOBAL_GEMINI_RESERVED_REQUESTS + GLOBAL_GEMINI_CONSUMED_REQUESTS
+                )
                 if required_requests > available:
                     self.log_message(
                         f"Недостаточно лимита Gemini: требуется {required_requests} запросов, доступно {available}.",
@@ -1438,8 +1449,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     ))
                     self.after(0, lambda: self.set_ui_for_generation(False))
                     return
-                for k in active_keys_current:
-                    GLOBAL_GEMINI_KEYS_USAGE[k] = GLOBAL_GEMINI_KEYS_USAGE.get(k, 0) + 1
+                GLOBAL_GEMINI_KEYS_USAGE.update(active_keys_current)
                 GLOBAL_GEMINI_RESERVED_REQUESTS += required_requests
                 self.reserved_gemini_requests = required_requests
                 self.reserved_gemini_keys = active_keys_current
@@ -1485,17 +1495,12 @@ class TextGeneratorApp(ctk.CTkFrame):
         threading.Thread(target=self.process_all_keywords, daemon=True).start()
 
     def _release_gemini_quota(self):
-        global GLOBAL_GEMINI_RESERVED_REQUESTS
+        global GLOBAL_GEMINI_RESERVED_REQUESTS, GLOBAL_GEMINI_CONSUMED_REQUESTS
         if self.reserved_gemini_requests <= 0 and not self.reserved_gemini_keys:
             return
         with GLOBAL_GEMINI_USAGE_LOCK:
             GLOBAL_GEMINI_RESERVED_REQUESTS -= self.reserved_gemini_requests
-            for k in self.reserved_gemini_keys:
-                cnt = GLOBAL_GEMINI_KEYS_USAGE.get(k, 0)
-                if cnt <= 1:
-                    GLOBAL_GEMINI_KEYS_USAGE.pop(k, None)
-                else:
-                    GLOBAL_GEMINI_KEYS_USAGE[k] = cnt - 1
+            GLOBAL_GEMINI_CONSUMED_REQUESTS += self.reserved_gemini_requests
         self.reserved_gemini_requests = 0
         self.reserved_gemini_keys = set()
         self._update_gemini_quota_display()
@@ -1910,7 +1915,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             if api_provider == "Gemini":
                 gemini_model_name = self._get_selected_gemini_model()
                 batch_limit = GEMINI_BATCH_LIMITS.get(gemini_model_name, 10)
-            retrieved_api_key_str = self._acquire_api_key_with_cooldown(cooldown_required, batch_limit)
+            requests_needed = 2 if api_provider == "Gemini" else 1
+            retrieved_api_key_str = self._acquire_api_key_with_cooldown(
+                cooldown_required, batch_limit, requests_needed=requests_needed
+            )
             if not retrieved_api_key_str:
                 raise Empty
             with self.api_stats_lock:
@@ -2112,10 +2120,26 @@ class TextGeneratorApp(ctk.CTkFrame):
 
                 return body_prompt_user_str, body_prompt_system_str
 
-                # Вызываем функцию и получаем строки промптов
+            def generate_gemini_body_prompt(current_selected_lang, current_keyword_phrase, current_original_h1_text):
+                user = (
+                    f"Напиши краткую SEO-статью на {current_selected_lang} языке по теме '{current_keyword_phrase}' "
+                    f"под заголовком '{current_original_h1_text}'. Объём не более 400 слов. Используй теги <p>, <h2>, <h3>, "
+                    "одну таблицу, один маркированный и один нумерованный список, встроенные в текст. Не добавляй H1 и не используй Markdown."
+                )
+                system = (
+                    f"Ты опытный SEO-копирайтер. Создавай лаконичный HTML-текст на {current_selected_lang} языке "
+                    "без внешних обёрток. Статья должна быть не длиннее 400 слов."
+                )
+                return user, system
 
-            body_prompt_user, body_prompt_system = generate_random_body_prompt(selected_lang, kw_for_prompt,
-                                                                               original_h1_text)
+            if api_provider == "Gemini":
+                body_prompt_user, body_prompt_system = generate_gemini_body_prompt(
+                    selected_lang, kw_for_prompt, original_h1_text
+                )
+            else:
+                body_prompt_user, body_prompt_system = generate_random_body_prompt(
+                    selected_lang, kw_for_prompt, original_h1_text
+                )
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
             if api_provider == "OpenAI":
