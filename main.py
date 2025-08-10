@@ -65,8 +65,13 @@ MAX_CONCURRENT_PROJECTS = 3
 # Global limit of concurrently running worker threads across all tabs
 GLOBAL_THREAD_SEMAPHORE = threading.Semaphore(MAX_THREADS)
 GLOBAL_PROJECT_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_PROJECTS)
-GEMINI_KEY_MAX_REQUESTS = 10  # allow up to 10 calls per key
-GEMINI_KEY_SLOT_SECONDS = 65  # slots replenish after 65 seconds
+# Gemini 2.5 Flash free tier roughly allows 10 requests per minute for the
+# entire project. To stay well under that quota we cap worker threads and use a
+# token bucket with fewer slots and a longer refill interval.
+GEMINI_PER_KEY_CONCURRENCY = 1  # allow only one concurrent call per key
+GEMINI_MAX_THREADS = 8  # total Gemini worker threads across all keys
+GEMINI_PROJECT_MAX_REQUESTS = 8  # total calls allowed across all keys
+GEMINI_PROJECT_SLOT_SECONDS = 80  # slots replenish after 80 seconds
 BAD_API_KEYS_FILE = "BAD_API.txt"
 # Limit the amount of lines kept in the GUI log to avoid slowdown
 MAX_LOG_LINES = 500
@@ -369,13 +374,16 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.provider_var = tk.StringVar(value=PROVIDER_OPENAI)
         self.openai_keys_file_var = tk.StringVar()
         self.gemini_keys_file_var = tk.StringVar()
+        self.proxy_file_var = tk.StringVar()
+        self.api_key_proxy_map = {}
+        self.proxy_countries = {}
 
         self.gemini_usage = {}
         self._load_gemini_usage()
         self.gemini_key_locks = defaultdict(threading.Lock)
-        # Квота 10 запросов на ключ с восстановлением слота через 65 секунд
-        self.gemini_key_quota = defaultdict(
-            lambda: threading.BoundedSemaphore(GEMINI_KEY_MAX_REQUESTS)
+        # Глобальная квота на 8 запросов с восстановлением слота через 80 секунд
+        self.gemini_project_quota = threading.BoundedSemaphore(
+            GEMINI_PROJECT_MAX_REQUESTS
         )
 
         self.article_toc_background_colors = [
@@ -630,12 +638,13 @@ class TextGeneratorApp(ctk.CTkFrame):
         except Exception:
             data = {}
         with GEMINI_USAGE_LOCK:
-            for key, info in data.items():
-                if info.get("date") != today:
-                    info = {"date": today, "used_today": 0}
-                else:
-                    info = {"date": today, "used_today": info.get("used_today", 0)}
-                self.gemini_usage[key] = info
+            if data.get("date") != today:
+                self.gemini_usage = {"date": today, "used_today": 0}
+            else:
+                self.gemini_usage = {
+                    "date": today,
+                    "used_today": data.get("used_today", 0),
+                }
 
     def _save_gemini_usage(self):
         with GEMINI_USAGE_LOCK:
@@ -647,10 +656,6 @@ class TextGeneratorApp(ctk.CTkFrame):
                 pass
 
     def _mark_gemini_key_exhausted(self, api_key):
-        with GEMINI_USAGE_LOCK:
-            info = self.gemini_usage.get(api_key)
-            if info:
-                info["used_today"] = 250
         with open(app_path(EXHAUSTED_GEMINI_KEYS_FILE), "a", encoding="utf-8") as f:
             f.write(api_key + "\n")
         self._remove_key_from_queue(api_key)
@@ -664,16 +669,16 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _before_gemini_call(self, api_key):
         today = datetime.date.today().isoformat()
         with GEMINI_USAGE_LOCK:
-            info = self.gemini_usage.setdefault(api_key, {"date": today, "used_today": 0})
+            info = self.gemini_usage
             if info.get("date") != today:
                 info.update({"date": today, "used_today": 0})
-            if info["used_today"] >= 250:
+            if info.get("used_today", 0) >= 250:
                 self.log_message(
-                    f"Ключ {api_key[:7]} исчерпал дневной лимит Gemini",
+                    "Проект исчерпал дневной лимит Gemini",
                     "INFO",
                 )
                 return False
-            info["used_today"] += 1
+            info["used_today"] = info.get("used_today", 0) + 1
             self._save_gemini_usage()
             self.log_message(
                 f"Предварительная проверка Gemini пройдена для ключа {api_key[:7]}",
@@ -683,11 +688,7 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def _after_gemini_call(self, api_key):
         with GEMINI_USAGE_LOCK:
-            info = self.gemini_usage.setdefault(
-                api_key,
-                {"date": datetime.date.today().isoformat(), "used_today": 0},
-            )
-            if info["used_today"] >= 250:
+            if self.gemini_usage.get("used_today", 0) >= 250:
                 self._mark_gemini_key_exhausted(api_key)
             else:
                 self._save_gemini_usage()
@@ -758,7 +759,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self._save_api_key_statuses()
 
     def _current_per_key_concurrency(self):
-        return GEMINI_KEY_MAX_REQUESTS
+        return GEMINI_PER_KEY_CONCURRENCY
 
     def _repopulate_available_api_key_queue(self):
         with self.api_key_management_lock:
@@ -909,6 +910,14 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.gemini_keys_browse = ctk.CTkButton(self.gemini_keys_frame, text="Выбрать...", command=self._browse_gemini_keys_file)
         self.gemini_keys_browse.pack(side="left")
+
+        self.proxy_frame = ctk.CTkFrame(main_frame)
+        self.proxy_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.proxy_frame, text="Файл с прокси (.txt):").pack(anchor="w")
+        self.proxy_entry = ctk.CTkEntry(self.proxy_frame, textvariable=self.proxy_file_var, width=350)
+        self.proxy_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.proxy_browse = ctk.CTkButton(self.proxy_frame, text="Выбрать...", command=self._browse_proxy_file)
+        self.proxy_browse.pack(side="left")
         folder_frame = ctk.CTkFrame(main_frame)
         folder_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(folder_frame, text="Папка для сохранения файлов:").pack(anchor="w")
@@ -983,16 +992,26 @@ class TextGeneratorApp(ctk.CTkFrame):
         if path:
             self.gemini_keys_file_var.set(path)
 
+    def _browse_proxy_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if path:
+            self.proxy_file_var.set(path)
+
     def _on_provider_change(self, *_):
         provider = self.provider_var.get()
         if provider == PROVIDER_OPENAI:
             self.gemini_keys_frame.pack_forget()
+            self.proxy_frame.pack_forget()
             self.openai_keys_frame.pack(pady=5, padx=10, fill="x")
             self.threads_frame.pack(pady=5, padx=10, fill="x")
         else:
             self.openai_keys_frame.pack_forget()
             self.gemini_keys_frame.pack(pady=5, padx=10, fill="x")
+            self.proxy_frame.pack(pady=5, padx=10, fill="x")
             self.threads_frame.pack_forget()
+            # Limit Gemini to a small, safe number of worker threads
+            self.num_threads_var.set(min(self.num_threads_var.get(), GEMINI_MAX_THREADS))
+            self.update_threads_label()
 
 
     def _load_api_keys_from_file(self, path):
@@ -1009,12 +1028,56 @@ class TextGeneratorApp(ctk.CTkFrame):
             messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с ключами")
         return keys
 
+    def _load_proxies_from_file(self, path):
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Ошибка", f"Файл с прокси не найден: {path}")
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                proxies = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл прокси: {e}")
+            return []
+        if not proxies:
+            messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с прокси")
+        return proxies
+
+    def _proxy_line_to_url(self, proxy_line):
+        try:
+            host, port, user, password = proxy_line.split(":")
+            return f"http://{user}:{password}@{host}:{port}"
+        except ValueError:
+            return None
+
+    def _get_proxy_country(self, proxy_line):
+        proxy_url = self._proxy_line_to_url(proxy_line)
+        if not proxy_url:
+            return "Unknown"
+        proxies = {"http": proxy_url, "https": proxy_url}
+        try:
+            resp = requests.get("http://ip-api.com/json", proxies=proxies, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("country", "Unknown")
+        except Exception:
+            pass
+        return "Unknown"
+
     def _prepare_api_keys(self):
         provider=self.provider_var.get()
         if provider==PROVIDER_OPENAI:
             keys=self._load_api_keys_from_file(self.openai_keys_file_var.get())
+            self.api_key_proxy_map = {}
         else:
             keys=self._load_api_keys_from_file(self.gemini_keys_file_var.get())
+            proxies=self._load_proxies_from_file(self.proxy_file_var.get())
+            if len(proxies)<len(keys):
+                msg = f"В папке .txt - {len(keys)} АПИ, в папке с прокси - {len(proxies)} ПРОКСИ"
+                messagebox.showerror("Ошибка", msg)
+                self.log_message(msg, "ERROR")
+                return False
+            with self.api_key_management_lock:
+                self.api_key_proxy_map=dict(zip(keys,proxies))
         if not keys:
             return False
         with self.api_key_management_lock:
@@ -1030,6 +1093,9 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def update_threads_label(self, *args):
         current_var_val = self.num_threads_var.get()
+        if self.provider_var.get() == PROVIDER_GEMINI and current_var_val > GEMINI_MAX_THREADS:
+            current_var_val = GEMINI_MAX_THREADS
+            self.num_threads_var.set(current_var_val)
         if hasattr(self, 'threads_label') and self.threads_label.winfo_exists():
             self.threads_label.configure(text=str(current_var_val))
         if hasattr(self, 'threads_slider') and self.threads_slider.winfo_exists():
@@ -1040,6 +1106,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                 s_max_logical_limit = max(1, current_var_val)
             else:
                 s_max_logical_limit = min(MAX_THREADS, num_active_keys * per_key)
+            if self.provider_var.get() == PROVIDER_GEMINI:
+                s_max_logical_limit = min(s_max_logical_limit, GEMINI_MAX_THREADS)
             s_max_logical_limit = max(1, s_max_logical_limit)
             slider_from_value = 1
             slider_actual_to = slider_from_value + 1 if s_max_logical_limit == slider_from_value else s_max_logical_limit
@@ -1052,6 +1120,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                     final_var_val = s_max_logical_limit
                 if final_var_val < slider_from_value:
                     final_var_val = slider_from_value
+            if self.provider_var.get() == PROVIDER_GEMINI and final_var_val > GEMINI_MAX_THREADS:
+                final_var_val = GEMINI_MAX_THREADS
             if self.num_threads_var.get() != final_var_val:
                 self.num_threads_var.set(final_var_val)
             if hasattr(self, 'threads_label') and self.threads_label.winfo_exists():
@@ -1158,6 +1228,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.provider_var.set(s.get("Provider", PROVIDER_OPENAI))
                     self.openai_keys_file_var.set(s.get("OpenAIKeysFile", ""))
                     self.gemini_keys_file_var.set(s.get("GeminiKeysFile", ""))
+                    self.proxy_file_var.set(s.get("ProxyFile", ""))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
@@ -1178,6 +1249,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             "Provider": self.provider_var.get(),
             "OpenAIKeysFile": self.openai_keys_file_var.get(),
             "GeminiKeysFile": self.gemini_keys_file_var.get(),
+            "ProxyFile": self.proxy_file_var.get(),
             "NumThreads": str(self.num_threads_var.get()),
             "GenerationLanguage": self.generation_language_var.get(),
             "TargetLink": self.target_link_var.get(),
@@ -1395,6 +1467,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         # но не больше глобального лимита потоков.
         target_threads = max(self.num_threads_var.get(), active_key_count) or 1
         target_threads = min(target_threads, MAX_THREADS)
+        if self.provider_var.get() == PROVIDER_GEMINI:
+            target_threads = min(target_threads, GEMINI_MAX_THREADS)
         self.num_threads_var.set(target_threads)
         self.update_threads_label()
         self.output_file_counter = self._ensure_output_file_count(force=True)
@@ -1623,27 +1697,16 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def call_gemini_api(self, api_key_used_for_call, prompt_text, retries=3, delay_seconds=0.5, context=""):
         key_short = api_key_used_for_call[:7]
-        token_delay = GEMINI_KEY_SLOT_SECONDS
+        token_delay = GEMINI_PROJECT_SLOT_SECONDS
         lock = self.gemini_key_locks[api_key_used_for_call]
-        bucket = self.gemini_key_quota[api_key_used_for_call]
+        bucket = self.gemini_project_quota
         self.log_message(f"[{context}] Ожидание ключа {key_short}", "DEBUG")
         while not self.stop_event.is_set():
             if lock.acquire(timeout=1):
                 break
         else:
             return None
-        with api_key_last_call_time_lock:
-            last = api_key_last_call_time.get(api_key_used_for_call, 0.0)
-        wait_needed = last + 10.0 - time.time()
-        if wait_needed > 0:
-            self.log_message(
-                f"[{context}] Пауза {wait_needed:.2f}с перед запросом Gemini ключом {key_short}",
-                "DEBUG",
-            )
-            if self.stop_event.wait(wait_needed):
-                lock.release()
-                return None
-        self.log_message(f"[{context}] Ожидание квоты ключа {key_short}", "DEBUG")
+        self.log_message(f"[{context}] Ожидание глобальной квоты Gemini", "DEBUG")
         while not self.stop_event.is_set():
             if bucket.acquire(timeout=1):
                 break
@@ -1665,6 +1728,21 @@ class TextGeneratorApp(ctk.CTkFrame):
             params = {"key": api_key_used_for_call}
             headers = {"Content-Type": "application/json"}
             payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+            proxy_line = self.api_key_proxy_map.get(api_key_used_for_call)
+            proxies = None
+            if proxy_line:
+                proxy_url = self._proxy_line_to_url(proxy_line)
+                if proxy_url:
+                    proxies = {"http": proxy_url, "https": proxy_url}
+                    country = self.proxy_countries.get(proxy_line)
+                    if not country:
+                        country = self._get_proxy_country(proxy_line)
+                        self.proxy_countries[proxy_line] = country
+                    host, port, *_ = proxy_line.split(":")
+                    self.log_message(
+                        f"[{context}] Используется прокси {host}:{port} ({country})",
+                        "INFO",
+                    )
             for attempt in range(retries):
                 if self.stop_event.is_set():
                     self.log_message(f"[{context}] Прекращено из-за стоп-сигнала", "DEBUG")
@@ -1674,14 +1752,13 @@ class TextGeneratorApp(ctk.CTkFrame):
                         f"[{context}] Попытка {attempt + 1}/{retries} отправки запроса Gemini ключом {key_short}",
                         "DEBUG",
                     )
-                    with api_key_last_call_time_lock:
-                        api_key_last_call_time[api_key_used_for_call] = time.time()
                     resp = requests.post(
                         url,
                         params=params,
                         headers=headers,
                         json=payload,
                         timeout=(10, 120),
+                        proxies=proxies,
                     )
                     self.log_message(
                         f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
@@ -1765,7 +1842,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             def restore():
                 bucket.release()
                 self.log_message(
-                    f"[{context}] Квота для ключа {key_short} восстановлена",
+                    f"[{context}] Глобальная квота восстановлена",
                     "DEBUG",
                 )
 
@@ -2030,10 +2107,10 @@ class TextGeneratorApp(ctk.CTkFrame):
 
             # Pause to respect Gemini rate limits after plan (H1) generation
             self.log_message(
-                f"{log_prefix} Ожидание 65 секунд после генерации плана перед созданием тела статьи...",
+                f"{log_prefix} Ожидание {GEMINI_PROJECT_SLOT_SECONDS} секунд после генерации плана перед созданием тела статьи...",
                 "DEBUG",
             )
-            if self.stop_event.wait(65):
+            if self.stop_event.wait(GEMINI_PROJECT_SLOT_SECONDS):
                 self.log_message(
                     f"{log_prefix} Ожидание после плана прервано сигналом остановки.",
                     "DEBUG",
