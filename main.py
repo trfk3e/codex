@@ -25,6 +25,7 @@ import time
 import re
 from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
+import httpx
 
 import random
 import traceback
@@ -369,6 +370,10 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.provider_var = tk.StringVar(value=PROVIDER_OPENAI)
         self.openai_keys_file_var = tk.StringVar()
         self.gemini_keys_file_var = tk.StringVar()
+        self.proxy_file_var = tk.StringVar()
+        self.proxy_list = []
+        self.api_proxy_map = {}
+        self.proxy_countries = {}
 
         self.gemini_usage = {}
         self._load_gemini_usage()
@@ -902,6 +907,14 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.openai_keys_browse = ctk.CTkButton(self.openai_keys_frame, text="Выбрать...", command=self._browse_openai_keys_file)
         self.openai_keys_browse.pack(side="left")
 
+        self.proxy_frame = ctk.CTkFrame(main_frame)
+        self.proxy_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.proxy_frame, text="Файл с прокси (.txt):").pack(anchor="w")
+        self.proxy_entry = ctk.CTkEntry(self.proxy_frame, textvariable=self.proxy_file_var, width=350)
+        self.proxy_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.proxy_browse = ctk.CTkButton(self.proxy_frame, text="Выбрать...", command=self._browse_proxy_file)
+        self.proxy_browse.pack(side="left")
+
         self.gemini_keys_frame = ctk.CTkFrame(main_frame)
         self.gemini_keys_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(self.gemini_keys_frame, text="Файл с ключами Gemini (.txt):").pack(anchor="w")
@@ -983,14 +996,21 @@ class TextGeneratorApp(ctk.CTkFrame):
         if path:
             self.gemini_keys_file_var.set(path)
 
+    def _browse_proxy_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if path:
+            self.proxy_file_var.set(path)
+
     def _on_provider_change(self, *_):
         provider = self.provider_var.get()
         if provider == PROVIDER_OPENAI:
             self.gemini_keys_frame.pack_forget()
             self.openai_keys_frame.pack(pady=5, padx=10, fill="x")
+            self.proxy_frame.pack(pady=5, padx=10, fill="x")
             self.threads_frame.pack(pady=5, padx=10, fill="x")
         else:
             self.openai_keys_frame.pack_forget()
+            self.proxy_frame.pack_forget()
             self.gemini_keys_frame.pack(pady=5, padx=10, fill="x")
             self.threads_frame.pack_forget()
 
@@ -1009,16 +1029,62 @@ class TextGeneratorApp(ctk.CTkFrame):
             messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с ключами")
         return keys
 
+    def _load_proxies_from_file(self, path):
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Ошибка", f"Файл с прокси не найден: {path}")
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                proxies = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл прокси: {e}")
+            return []
+        if not proxies:
+            messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с прокси")
+        return proxies
+
+    def _format_proxy_url(self, proxy_line):
+        parts = proxy_line.split(':')
+        if len(parts) != 4:
+            return None
+        ip, port, user, password = parts
+        return f"http://{user}:{password}@{ip}:{port}"
+
+    def _get_proxy_country(self, ip):
+        try:
+            resp = requests.get(f"http://ip-api.com/json/{ip}", timeout=10)
+            data = resp.json()
+            return data.get("country", "Unknown")
+        except Exception:
+            return "Unknown"
+
     def _prepare_api_keys(self):
-        provider=self.provider_var.get()
-        if provider==PROVIDER_OPENAI:
-            keys=self._load_api_keys_from_file(self.openai_keys_file_var.get())
+        provider = self.provider_var.get()
+        if provider == PROVIDER_OPENAI:
+            keys = self._load_api_keys_from_file(self.openai_keys_file_var.get())
+            proxies = self._load_proxies_from_file(self.proxy_file_var.get())
+            if not keys or not proxies:
+                return False
+            if len(proxies) < len(keys):
+                msg = f"В папке .txt - {len(keys)} АПИ, в папке с прокси - {len(proxies)} ПРОКСИ"
+                self.log_message(msg, "ERROR")
+                messagebox.showerror("Ошибка", msg)
+                return False
+            self.proxy_list = proxies
+            self.api_proxy_map = {k: proxies[i] for i, k in enumerate(keys)}
+            self.proxy_countries = {}
+            for p in proxies:
+                ip = p.split(':')[0]
+                self.proxy_countries[p] = self._get_proxy_country(ip)
         else:
-            keys=self._load_api_keys_from_file(self.gemini_keys_file_var.get())
+            keys = self._load_api_keys_from_file(self.gemini_keys_file_var.get())
+            self.proxy_list = []
+            self.api_proxy_map = {}
+            self.proxy_countries = {}
         if not keys:
             return False
         with self.api_key_management_lock:
-            self.api_keys_list=keys
+            self.api_keys_list = keys
         self._repopulate_available_api_key_queue()
         return True
 
@@ -1158,6 +1224,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.provider_var.set(s.get("Provider", PROVIDER_OPENAI))
                     self.openai_keys_file_var.set(s.get("OpenAIKeysFile", ""))
                     self.gemini_keys_file_var.set(s.get("GeminiKeysFile", ""))
+                    self.proxy_file_var.set(s.get("ProxyFile", ""))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
@@ -1178,6 +1245,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             "Provider": self.provider_var.get(),
             "OpenAIKeysFile": self.openai_keys_file_var.get(),
             "GeminiKeysFile": self.gemini_keys_file_var.get(),
+            "ProxyFile": self.proxy_file_var.get(),
             "NumThreads": str(self.num_threads_var.get()),
             "GenerationLanguage": self.generation_language_var.get(),
             "TargetLink": self.target_link_var.get(),
@@ -1921,8 +1989,20 @@ class TextGeneratorApp(ctk.CTkFrame):
                 retrieved_api_key_str) > 5 else retrieved_api_key_str
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
             if self.provider_var.get() == PROVIDER_OPENAI:
-                openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-                if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
+                proxy_line = self.api_proxy_map.get(retrieved_api_key_str)
+                http_client = None
+                if proxy_line:
+                    proxy_url = self._format_proxy_url(proxy_line)
+                    try:
+                        http_client = httpx.Client(proxies=proxy_url)
+                        country = self.proxy_countries.get(proxy_line, "Unknown")
+                        self.log_message(f"{log_prefix} Подключение к прокси {proxy_line.split(':')[0]}:{proxy_line.split(':')[1]} ({country})")
+                    except Exception as e:
+                        self.log_message(f"{log_prefix} Ошибка инициализации прокси {proxy_line}: {e}. Использование без прокси.", "WARNING")
+                        http_client = None
+                openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0, http_client=http_client)
+                if openai_client is None:
+                    raise ValueError("Клиент OpenAI не был инициализирован.")
             else:
                 openai_client = None
         except Empty:
