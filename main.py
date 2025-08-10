@@ -65,7 +65,10 @@ MAX_CONCURRENT_PROJECTS = 3
 # Global limit of concurrently running worker threads across all tabs
 GLOBAL_THREAD_SEMAPHORE = threading.Semaphore(MAX_THREADS)
 GLOBAL_PROJECT_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_PROJECTS)
-GEMINI_KEY_MAX_REQUESTS = 10  # allow up to 10 calls per key
+# Gemini API enforces roughly a one request per minute limit per key.
+# Using a token bucket with capacity 1 and a 65 second refill keeps us within
+# that quota and avoids 429 "Resource has been exhausted" errors.
+GEMINI_KEY_MAX_REQUESTS = 1  # allow only one call per key at a time
 GEMINI_KEY_SLOT_SECONDS = 65  # slots replenish after 65 seconds
 BAD_API_KEYS_FILE = "BAD_API.txt"
 # Limit the amount of lines kept in the GUI log to avoid slowdown
@@ -1698,7 +1701,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             return None
         with api_key_last_call_time_lock:
             last = api_key_last_call_time.get(api_key_used_for_call, 0.0)
-        wait_needed = last + 10.0 - time.time()
+        wait_needed = last + GEMINI_KEY_SLOT_SECONDS - time.time()
         if wait_needed > 0:
             self.log_message(
                 f"[{context}] Пауза {wait_needed:.2f}с перед запросом Gemini ключом {key_short}",
