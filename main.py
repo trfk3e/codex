@@ -369,6 +369,9 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.provider_var = tk.StringVar(value=PROVIDER_OPENAI)
         self.openai_keys_file_var = tk.StringVar()
         self.gemini_keys_file_var = tk.StringVar()
+        self.proxy_file_var = tk.StringVar()
+        self.api_key_proxy_map = {}
+        self.proxy_countries = {}
 
         self.gemini_usage = {}
         self._load_gemini_usage()
@@ -909,6 +912,14 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.gemini_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.gemini_keys_browse = ctk.CTkButton(self.gemini_keys_frame, text="Выбрать...", command=self._browse_gemini_keys_file)
         self.gemini_keys_browse.pack(side="left")
+
+        self.proxy_frame = ctk.CTkFrame(main_frame)
+        self.proxy_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.proxy_frame, text="Файл с прокси (.txt):").pack(anchor="w")
+        self.proxy_entry = ctk.CTkEntry(self.proxy_frame, textvariable=self.proxy_file_var, width=350)
+        self.proxy_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.proxy_browse = ctk.CTkButton(self.proxy_frame, text="Выбрать...", command=self._browse_proxy_file)
+        self.proxy_browse.pack(side="left")
         folder_frame = ctk.CTkFrame(main_frame)
         folder_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(folder_frame, text="Папка для сохранения файлов:").pack(anchor="w")
@@ -983,15 +994,22 @@ class TextGeneratorApp(ctk.CTkFrame):
         if path:
             self.gemini_keys_file_var.set(path)
 
+    def _browse_proxy_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if path:
+            self.proxy_file_var.set(path)
+
     def _on_provider_change(self, *_):
         provider = self.provider_var.get()
         if provider == PROVIDER_OPENAI:
             self.gemini_keys_frame.pack_forget()
+            self.proxy_frame.pack_forget()
             self.openai_keys_frame.pack(pady=5, padx=10, fill="x")
             self.threads_frame.pack(pady=5, padx=10, fill="x")
         else:
             self.openai_keys_frame.pack_forget()
             self.gemini_keys_frame.pack(pady=5, padx=10, fill="x")
+            self.proxy_frame.pack(pady=5, padx=10, fill="x")
             self.threads_frame.pack_forget()
 
 
@@ -1009,12 +1027,56 @@ class TextGeneratorApp(ctk.CTkFrame):
             messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с ключами")
         return keys
 
+    def _load_proxies_from_file(self, path):
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Ошибка", f"Файл с прокси не найден: {path}")
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                proxies = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл прокси: {e}")
+            return []
+        if not proxies:
+            messagebox.showerror("Ошибка", f"В файле {path} нет валидных строк с прокси")
+        return proxies
+
+    def _proxy_line_to_url(self, proxy_line):
+        try:
+            host, port, user, password = proxy_line.split(":")
+            return f"http://{user}:{password}@{host}:{port}"
+        except ValueError:
+            return None
+
+    def _get_proxy_country(self, proxy_line):
+        proxy_url = self._proxy_line_to_url(proxy_line)
+        if not proxy_url:
+            return "Unknown"
+        proxies = {"http": proxy_url, "https": proxy_url}
+        try:
+            resp = requests.get("http://ip-api.com/json", proxies=proxies, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("country", "Unknown")
+        except Exception:
+            pass
+        return "Unknown"
+
     def _prepare_api_keys(self):
         provider=self.provider_var.get()
         if provider==PROVIDER_OPENAI:
             keys=self._load_api_keys_from_file(self.openai_keys_file_var.get())
+            self.api_key_proxy_map = {}
         else:
             keys=self._load_api_keys_from_file(self.gemini_keys_file_var.get())
+            proxies=self._load_proxies_from_file(self.proxy_file_var.get())
+            if len(proxies)<len(keys):
+                msg = f"В папке .txt - {len(keys)} АПИ, в папке с прокси - {len(proxies)} ПРОКСИ"
+                messagebox.showerror("Ошибка", msg)
+                self.log_message(msg, "ERROR")
+                return False
+            with self.api_key_management_lock:
+                self.api_key_proxy_map=dict(zip(keys,proxies))
         if not keys:
             return False
         with self.api_key_management_lock:
@@ -1158,6 +1220,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.provider_var.set(s.get("Provider", PROVIDER_OPENAI))
                     self.openai_keys_file_var.set(s.get("OpenAIKeysFile", ""))
                     self.gemini_keys_file_var.set(s.get("GeminiKeysFile", ""))
+                    self.proxy_file_var.set(s.get("ProxyFile", ""))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
@@ -1178,6 +1241,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             "Provider": self.provider_var.get(),
             "OpenAIKeysFile": self.openai_keys_file_var.get(),
             "GeminiKeysFile": self.gemini_keys_file_var.get(),
+            "ProxyFile": self.proxy_file_var.get(),
             "NumThreads": str(self.num_threads_var.get()),
             "GenerationLanguage": self.generation_language_var.get(),
             "TargetLink": self.target_link_var.get(),
@@ -1665,6 +1729,21 @@ class TextGeneratorApp(ctk.CTkFrame):
             params = {"key": api_key_used_for_call}
             headers = {"Content-Type": "application/json"}
             payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+            proxy_line = self.api_key_proxy_map.get(api_key_used_for_call)
+            proxies = None
+            if proxy_line:
+                proxy_url = self._proxy_line_to_url(proxy_line)
+                if proxy_url:
+                    proxies = {"http": proxy_url, "https": proxy_url}
+                    country = self.proxy_countries.get(proxy_line)
+                    if not country:
+                        country = self._get_proxy_country(proxy_line)
+                        self.proxy_countries[proxy_line] = country
+                    host, port, *_ = proxy_line.split(":")
+                    self.log_message(
+                        f"[{context}] Используется прокси {host}:{port} ({country})",
+                        "INFO",
+                    )
             for attempt in range(retries):
                 if self.stop_event.is_set():
                     self.log_message(f"[{context}] Прекращено из-за стоп-сигнала", "DEBUG")
@@ -1682,6 +1761,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         headers=headers,
                         json=payload,
                         timeout=(10, 120),
+                        proxies=proxies,
                     )
                     self.log_message(
                         f"[{context}] Ответ Gemini {resp.status_code} за {getattr(resp, 'elapsed', datetime.timedelta(0)).total_seconds():.2f}с",
