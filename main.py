@@ -23,7 +23,7 @@ import asyncio
 from dataclasses import dataclass
 import pathlib
 import time
-from typing import Iterable, List, Mapping, Sequence
+from typing import List, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 #  OpenAI SDK compatibility layer
@@ -49,7 +49,7 @@ except ImportError:  # fallback для старого клиента 0.x
         def create(self, **kwargs):  # noqa: ANN001 - совместимость API
             return openai.ChatCompletion.create(api_key=self.api_key, **kwargs)
 
-    def OpenAI(api_key: str):  # type: ignore  # noqa: N802
+    def OpenAI(api_key: str, max_retries: int = 0):  # type: ignore  # noqa: N802
         return _LegacyClient(api_key)
 
     AsyncOpenAI = None  # в 0.x асинхронный клиент отсутствует
@@ -63,7 +63,7 @@ LOG_FILE = "log.txt"
 MODEL = "o3-mini"      # какую модель пингуем
 TIMEOUT = 20           # секунд на запрос
 PAUSE = 1              # пауза между запросами (для старых версий)
-CONCURRENCY = 5        # одновременных запросов при поддержке async
+CONCURRENCY = 3        # одновременных запросов при поддержке async
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,7 @@ class KeyResult:
     tokens: int | None = None
     request_id: str | None = None
     rate_limit_remaining: str | None = None
+    retry_after: str | None = None
     elapsed: float = 0.0
 
 
@@ -97,22 +98,23 @@ def load_keys(path: pathlib.Path) -> List[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _parse_headers(headers: Mapping[str, str] | None) -> tuple[str | None, str | None]:
-    """Возвращает ``(request_id, remaining)`` из HTTP‑заголовков."""
+def _parse_headers(headers: Mapping[str, str] | None) -> tuple[str | None, str | None, str | None]:
+    """Возвращает ``(request_id, remaining, retry_after)`` из заголовков."""
 
     if not headers:
-        return None, None
+        return None, None, None
 
     request_id = headers.get("x-request-id")
     remaining = headers.get("x-ratelimit-remaining-requests") or headers.get("x-ratelimit-remaining")
-    return request_id, remaining
+    retry_after = headers.get("retry-after")
+    return request_id, remaining, retry_after
 
 
 # ---------------------------------------------------------------------------
 #  Проверка ключа (sync)
 # ---------------------------------------------------------------------------
 def _check_key_sync(key: str) -> KeyResult:
-    client = OpenAI(api_key=key)
+    client = OpenAI(api_key=key, max_retries=0)
     start = time.perf_counter()
     try:
         resp = client.chat.completions.create(
@@ -123,7 +125,7 @@ def _check_key_sync(key: str) -> KeyResult:
         elapsed = time.perf_counter() - start
         headers = getattr(resp, "response", None)
         headers = getattr(headers, "headers", None)
-        request_id, remaining = _parse_headers(headers)
+        request_id, remaining, retry_after = _parse_headers(headers)
         usage = getattr(resp, "usage", None)
         tokens = getattr(usage, "total_tokens", None)
         model = getattr(resp, "model", None)
@@ -135,13 +137,14 @@ def _check_key_sync(key: str) -> KeyResult:
             tokens=tokens,
             request_id=request_id,
             rate_limit_remaining=remaining,
+            retry_after=retry_after,
             elapsed=elapsed,
         )
     except OpenAIError as exc:  # ошибки SDK
         elapsed = time.perf_counter() - start
         response = getattr(exc, "response", None)
         headers = getattr(response, "headers", None)
-        request_id, remaining = _parse_headers(headers)
+        request_id, remaining, retry_after = _parse_headers(headers)
         status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
         return KeyResult(
             key=key,
@@ -151,6 +154,7 @@ def _check_key_sync(key: str) -> KeyResult:
             error_message=str(exc),
             request_id=request_id,
             rate_limit_remaining=remaining,
+            retry_after=retry_after,
             elapsed=elapsed,
         )
     except Exception as exc:  # прочие сбои (сеть и пр.)
@@ -169,7 +173,7 @@ def _check_key_sync(key: str) -> KeyResult:
 # ---------------------------------------------------------------------------
 async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
     async with sem:
-        client = AsyncOpenAI(api_key=key)  # type: ignore[arg-type]
+        client = AsyncOpenAI(api_key=key, max_retries=0)  # type: ignore[arg-type]
         start = time.perf_counter()
         try:
             resp = await client.chat.completions.create(
@@ -180,7 +184,7 @@ async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
             elapsed = time.perf_counter() - start
             headers = getattr(resp, "response", None)
             headers = getattr(headers, "headers", None)
-            request_id, remaining = _parse_headers(headers)
+            request_id, remaining, retry_after = _parse_headers(headers)
             usage = getattr(resp, "usage", None)
             tokens = getattr(usage, "total_tokens", None)
             model = getattr(resp, "model", None)
@@ -192,13 +196,14 @@ async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
                 tokens=tokens,
                 request_id=request_id,
                 rate_limit_remaining=remaining,
+                retry_after=retry_after,
                 elapsed=elapsed,
             )
         except OpenAIError as exc:  # ошибки SDK
             elapsed = time.perf_counter() - start
             response = getattr(exc, "response", None)
             headers = getattr(response, "headers", None)
-            request_id, remaining = _parse_headers(headers)
+            request_id, remaining, retry_after = _parse_headers(headers)
             status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
             return KeyResult(
                 key=key,
@@ -208,6 +213,7 @@ async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
                 error_message=str(exc),
                 request_id=request_id,
                 rate_limit_remaining=remaining,
+                retry_after=retry_after,
                 elapsed=elapsed,
             )
         except Exception as exc:  # прочие сбои
@@ -226,8 +232,15 @@ async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
 # ---------------------------------------------------------------------------
 async def _check_all_async(keys: Sequence[str]) -> List[KeyResult]:
     sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = [_check_key_async(k, sem) for k in keys]
-    return list(await asyncio.gather(*tasks))
+    tasks = [asyncio.create_task(_check_key_async(k, sem)) for k in keys]
+    results: List[KeyResult] = []
+    total = len(tasks)
+    for idx, task in enumerate(asyncio.as_completed(tasks), 1):
+        res = await task
+        results.append(res)
+        status = "✅" if res.ok else "❌"
+        print(f"[{idx}/{total}] {status} {res.error_type or 'OK'}")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +254,7 @@ def _format_log(res: KeyResult) -> str:
         )
     return (
         f"{res.key}: {res.error_type} (status {res.status_code}) "
-        f"{res.error_message}"
+        f"{res.error_message} retry_after={res.retry_after}"
     )
 
 
@@ -270,11 +283,6 @@ def main() -> None:  # pragma: no cover - CLI точка входа
             status = "✅" if res.ok else "❌"
             print(f"[{idx}/{total}] {status} {res.error_type or 'OK'}")
             time.sleep(PAUSE)
-
-    if AsyncOpenAI is not None:  # вывод в асинхронном режиме после gather
-        for idx, res in enumerate(results, 1):
-            status = "✅" if res.ok else "❌"
-            print(f"[{idx}/{total}] {status} {res.error_type or 'OK'}")
 
     _write_outputs(results)
 
