@@ -52,6 +52,7 @@ except ImportError:
 # --- Константы ---
 CONFIG_FILE = os.path.join(application_path, "settings.json")
 LOG_FILE = os.path.join(application_path, "log.txt")
+MAX_PROMPT_TOTAL_LENGTH = 1500  # Максимальная длина финального промпта
 
 # Обновленный PROMPT для Llama
 PROMPT = (
@@ -664,6 +665,18 @@ def worker(task_id, task_data):
 
             # Шаг 4: Формирование финального промпта
             selected_prefix = random.choice(DEFAULT_PREFIXES)
+            allowed_len = MAX_PROMPT_TOTAL_LENGTH - len(selected_prefix) - len(SHARP_PROMPT_SUFFIX)
+            if allowed_len < 0:
+                log_message(
+                    f"{log_prefix} Префикс и суффикс превышают лимит {MAX_PROMPT_TOTAL_LENGTH} символов.",
+                    level=logging.WARNING)
+                allowed_len = 0
+            if len(together_prompt_content) > allowed_len:
+                log_message(
+                    f"{log_prefix} Промпт от Together.ai обрезан с {len(together_prompt_content)} до {allowed_len} символов.",
+                    level=logging.WARNING)
+                together_prompt_content = together_prompt_content[:allowed_len]
+
             final_prompt_for_image = (
                 selected_prefix + together_prompt_content + SHARP_PROMPT_SUFFIX
             )
