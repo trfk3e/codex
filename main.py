@@ -232,15 +232,19 @@ async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
 # ---------------------------------------------------------------------------
 async def _check_all_async(keys: Sequence[str]) -> List[KeyResult]:
     sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = [asyncio.create_task(_check_key_async(k, sem)) for k in keys]
-    results: List[KeyResult] = []
+
+    async def runner(idx: int, key: str) -> tuple[int, KeyResult]:
+        return idx, await _check_key_async(key, sem)
+
+    tasks = [asyncio.create_task(runner(i, k)) for i, k in enumerate(keys)]
     total = len(tasks)
-    for idx, task in enumerate(asyncio.as_completed(tasks), 1):
-        res = await task
-        results.append(res)
+    results: list[KeyResult | None] = [None] * total
+    for done, fut in enumerate(asyncio.as_completed(tasks), 1):
+        idx, res = await fut
+        results[idx] = res
         status = "✅" if res.ok else "❌"
-        print(f"[{idx}/{total}] {status} {res.error_type or 'OK'}")
-    return results
+        print(f"[{done}/{total}] {status} {res.error_type or 'OK'}")
+    return [r for r in results if r is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -249,20 +253,20 @@ async def _check_all_async(keys: Sequence[str]) -> List[KeyResult]:
 def _format_log(res: KeyResult) -> str:
     if res.ok:
         return (
-            f"{res.key}: OK model={res.model} tokens={res.tokens} "
+            f"{res.key} = OK model={res.model} tokens={res.tokens} "
             f"request_id={res.request_id} remaining={res.rate_limit_remaining}"
         )
     return (
-        f"{res.key}: {res.error_type} (status {res.status_code}) "
+        f"{res.key} = {res.error_type} (status {res.status_code}) "
         f"{res.error_message} retry_after={res.retry_after}"
     )
 
 
 def _write_outputs(results: Sequence[KeyResult]) -> None:
     bad_keys = [r.key for r in results if not r.ok]
-    logs = [ _format_log(r) for r in results ]
+    logs = [_format_log(r) for r in results]
     pathlib.Path(BAD_KEYS_FILE).write_text("\n".join(bad_keys), encoding="utf-8")
-    pathlib.Path(LOG_FILE).write_text("\n\n".join(logs), encoding="utf-8")
+    pathlib.Path(LOG_FILE).write_text("\n".join(logs), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
