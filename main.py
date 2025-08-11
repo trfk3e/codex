@@ -222,6 +222,15 @@ async def _check_key_async(key: str, sem: asyncio.Semaphore) -> KeyResult:
 
 
 # ---------------------------------------------------------------------------
+#  Массовая проверка (async)
+# ---------------------------------------------------------------------------
+async def _check_all_async(keys: Sequence[str]) -> List[KeyResult]:
+    sem = asyncio.Semaphore(CONCURRENCY)
+    tasks = [_check_key_async(k, sem) for k in keys]
+    return list(await asyncio.gather(*tasks))
+
+
+# ---------------------------------------------------------------------------
 #  Сводка и вывод
 # ---------------------------------------------------------------------------
 def _format_log(res: KeyResult) -> str:
@@ -252,8 +261,7 @@ def main() -> None:  # pragma: no cover - CLI точка входа
     print(f"Найдено {total} ключей. Проверяем…\n")
 
     if AsyncOpenAI is not None:  # асинхронная проверка
-        sem = asyncio.Semaphore(CONCURRENCY)
-        results = asyncio.run(asyncio.gather(*[_check_key_async(k, sem) for k in keys]))
+        results = asyncio.run(_check_all_async(keys))
     else:  # синхронная проверка (старый SDK)
         results = []
         for idx, key in enumerate(keys, 1):
