@@ -2130,6 +2130,17 @@ class TextGeneratorApp(ctk.CTkFrame):
             final_body_content_parts = [toc_div, generated_h1_html, article_body_html_processed]
             final_body_content = "\n".join(final_body_content_parts)
 
+            # Проверка на повтор слов более трёх раз подряд
+            plain_text_for_repetition = BeautifulSoup(final_body_content, 'html.parser').get_text(separator=' ')
+            repeat_match = re.search(r'\b(\w+)\b(?:\s+\1\b){2,}', plain_text_for_repetition, flags=re.IGNORECASE)
+            if repeat_match:
+                repeated_word = repeat_match.group(1)
+                self.log_message(
+                    f"{log_prefix} Обнаружено повторение слова '{repeated_word}' более трёх раз подряд. Статья будет пересоздана.",
+                    "WARNING",
+                )
+                return False
+
             # filepath_to_save was determined during H1 generation
             output_format = self.output_format_var.get()
 
