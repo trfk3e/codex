@@ -1,0 +1,194 @@
+{
+  "name": "booking-agent",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "label": "inbox",
+        "triggerOn": "newMessage",
+        "includeRawEmail": false,
+        "simple": false
+      }
+    },
+    {
+      "id": "2",
+      "name": "Get Memory",
+      "type": "n8n-nodes-base.dataStore",
+      "typeVersion": 1,
+      "position": [
+        350,
+        200
+      ],
+      "parameters": {
+        "operation": "get",
+        "dataStore": "booking-memory",
+        "key": "={{$json['threadId']}}"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Decide Questions",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        550,
+        200
+      ],
+      "parameters": {
+        "functionCode": "const ctx = items[0].json;\nconst memory = $item(0).$node['Get Memory'].json.value || {};\nconst fields = {\n  date: memory.date || null,\n  destination: memory.destination || null,\n  insurance: memory.insurance || null,\n  passengers: memory.passengers || null\n};\nconst body = ctx.body;\nif (!fields.date) {\n  const m = body.match(/(\\d{4}-\\d{2}-\\d{2})/);\n  if (m) fields.date = m[1];\n}\nif (!fields.destination) {\n  const m = body.match(/to ([A-Za-z\\s]+)/i);\n  if (m) fields.destination = m[1].trim();\n}\nif (!fields.insurance) {\n  const m = body.match(/insurance (yes|no)/i);\n  if (m) fields.insurance = m[1].toLowerCase();\n}\nif (!fields.passengers) {\n  const m = body.match(/(\\d+) passengers?/i);\n  if (m) fields.passengers = parseInt(m[1], 10);\n}\nconst missing = Object.keys(fields).filter(k => !fields[k]);\nlet prompt = '';\nif (missing.length === 0) {\n  prompt = 'Summarize booking request with date ' + fields.date + ', destination ' + fields.destination + ', insurance ' + fields.insurance + ', passengers ' + fields.passengers + ' and ask for confirmation.';\n} else {\n  const q = {\n    date: 'When do you want to fly?',\n    destination: 'Where are you flying to?',\n    insurance: 'Do you need travel insurance?',\n    passengers: 'How many people are traveling?'\n  };\n  prompt = missing.map(k => q[k]).join(' ');\n}\nreturn [{ json: { prompt, fields, threadId: ctx.threadId, from: ctx.from } }];"
+      }
+    },
+    {
+      "id": "4",
+      "name": "OpenAI",
+      "type": "n8n-nodes-base.openai",
+      "typeVersion": 1,
+      "position": [
+        750,
+        200
+      ],
+      "parameters": {
+        "resource": "completion",
+        "model": "gpt-4o-mini",
+        "prompt": "={{$json.prompt}}",
+        "temperature": 0.2,
+        "maxTokens": 200
+      },
+      "credentials": {
+        "openAIApi": "openai_api"
+      }
+    },
+    {
+      "id": "5",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 1,
+      "position": [
+        950,
+        200
+      ],
+      "parameters": {
+        "operation": "reply",
+        "threadId": "={{$json.threadId}}",
+        "to": "={{$json.from}}",
+        "subject": "Flight booking",
+        "text": "={{$json.data}}"
+      }
+    },
+    {
+      "id": "6",
+      "name": "Update Memory",
+      "type": "n8n-nodes-base.dataStore",
+      "typeVersion": 1,
+      "position": [
+        1150,
+        200
+      ],
+      "parameters": {
+        "operation": "upsert",
+        "dataStore": "booking-memory",
+        "key": "={{$json.threadId}}",
+        "value": "={{$json.fields}}"
+      }
+    },
+    {
+      "id": "7",
+      "name": "Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        1350,
+        200
+      ],
+      "parameters": {
+        "operation": "append",
+        "sheetId": "booking-logs",
+        "range": "Sheet1!A:F",
+        "options": {},
+        "valueInputMode": "RAW",
+        "dataProperty": "={{$json}}"
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": "google_sheets"
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Memory": {
+      "main": [
+        [
+          {
+            "node": "Decide Questions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Questions": {
+      "main": [
+        [
+          {
+            "node": "OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply": {
+      "main": [
+        [
+          {
+            "node": "Update Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Memory": {
+      "main": [
+        [
+          {
+            "node": "Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "id": "booking-agent"
+}
