@@ -49,6 +49,7 @@ def app_path(name: str) -> str:
 
 DEFAULT_CONFIG_FILE = "settings.ini"
 DEFAULT_MODEL = "gpt-4o-mini"
+DEEPSEEK_MODEL = "deepseek-chat"
 MAX_FILENAME_LENGTH = 100
 MAX_RETRY_PASSES = 3
 # Количество попыток генерации для одного ключевого слова
@@ -1579,14 +1580,16 @@ class TextGeneratorApp(ctk.CTkFrame):
                 time.sleep(to_wait)
             try:
                 headers = {"Authorization": f"Bearer {api_key}"}
-                payload = {"model": DEFAULT_MODEL, "messages": messages}
-                response = requests.post(url, json=payload, auth=(login, password), headers=headers, timeout=300)
+                payload = {"model": DEEPSEEK_MODEL, "messages": messages}
+                response = requests.post(url, json=payload, headers=headers, timeout=300)
                 if response.status_code == 200:
                     data = response.json()
                     with api_key_last_call_time_lock:
                         api_key_last_call_time[full_key] = time.time()
                     return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                elif response.status_code == 401:
+                elif response.status_code in (401, 403) or (
+                    response.status_code == 429 and "Authentication Fails" in response.text
+                ):
                     return "INVALID_API_KEY_ERROR"
                 else:
                     log_level = "ERROR" if attempt + 1 == retries else "WARNING"
