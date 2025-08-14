@@ -328,9 +328,11 @@ def normalize_html(html):
 
     cleaned = re.sub(r"<h([1-6])>(.*?)</h\1>", split_header, cleaned, flags=re.DOTALL)
 
-    # Remove any lines containing `html to strip code fences from the output
+    # Remove any lines containing `html or ``` to strip code fences from the output
     cleaned = "\n".join(
-        line for line in cleaned.splitlines() if "`html" not in line
+        line
+        for line in cleaned.splitlines()
+        if "`html" not in line and "```" not in line
     )
 
     cleaned = cleaned.strip()
