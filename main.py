@@ -330,6 +330,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.keywords_file_path = tk.StringVar()
         self.openai_keys_file_path = tk.StringVar()
         self.deepseek_keys_file_path = tk.StringVar()
+        self.api_provider_var = tk.StringVar(value="OpenAI")
         self.num_threads_var = tk.IntVar(value=5)
         self.generation_active = False
         self.waiting_for_project_slot = False
@@ -872,8 +873,15 @@ class TextGeneratorApp(ctk.CTkFrame):
         controls_frame = ctk.CTkFrame(content_frame)
         controls_frame.pack(side="left", fill="both", expand=True)
 
+        provider_frame = ctk.CTkFrame(controls_frame)
+        provider_frame.pack(pady=(10, 5), padx=10, fill="x")
+        ctk.CTkLabel(provider_frame, text="API провайдер:").pack(side="left", padx=(0, 10))
+        self.api_provider_combobox = ctk.CTkComboBox(provider_frame, values=["OpenAI", "DeepSeek"], variable=self.api_provider_var)
+        self.api_provider_combobox.pack(side="left", fill="x", expand=True)
+        self.api_provider_var.trace_add("write", self.on_api_provider_changed)
+
         api_frame = ctk.CTkFrame(controls_frame)
-        api_frame.pack(pady=(10, 5), padx=10, fill="x")
+        api_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(api_frame, text="Файл с OpenAI ключами:").pack(anchor="w")
         self.openai_keys_entry = ctk.CTkEntry(api_frame, textvariable=self.openai_keys_file_path, width=350)
         self.openai_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
@@ -1008,6 +1016,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             self._load_keys_from_selected_files()
             self.save_settings()
 
+    def on_api_provider_changed(self, *args):
+        self._load_keys_from_selected_files()
+        self.save_settings()
+
     def browse_folder(self):
         fld = filedialog.askdirectory()
         if fld: self.output_folder.set(fld); self.log_message(f"Папка для сохранения: {fld}")
@@ -1096,6 +1108,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.output_folder.set(s.get("OutputFolder", ""))
                     self.openai_keys_file_path.set(s.get("OpenAIKeysFile", ""))
                     self.deepseek_keys_file_path.set(s.get("DeepSeekKeysFile", ""))
+                    self.api_provider_var.set(s.get("APIProvider", "OpenAI"))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
@@ -1112,16 +1125,21 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def _load_keys_from_selected_files(self):
         combined = []
-        for path in [self.openai_keys_file_path.get().strip(), self.deepseek_keys_file_path.get().strip()]:
-            if path:
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                combined.append(line)
-                except Exception as e:
-                    self.log_message(f"Не удалось загрузить ключи из {path}: {e}", "ERROR")
+        provider = self.api_provider_var.get()
+        path = ""
+        if provider == "OpenAI":
+            path = self.openai_keys_file_path.get().strip()
+        elif provider == "DeepSeek":
+            path = self.deepseek_keys_file_path.get().strip()
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            combined.append(line)
+            except Exception as e:
+                self.log_message(f"Не удалось загрузить ключи из {path}: {e}", "ERROR")
         with self.api_key_management_lock:
             self.api_keys_list = combined
         self._initial_check_and_revive_keys()
@@ -1134,6 +1152,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             "OutputFolder": self.output_folder.get(),
             "OpenAIKeysFile": self.openai_keys_file_path.get(),
             "DeepSeekKeysFile": self.deepseek_keys_file_path.get(),
+            "APIProvider": self.api_provider_var.get(),
             "NumThreads": str(self.num_threads_var.get()),
             "GenerationLanguage": self.generation_language_var.get(),
             "TargetLink": self.target_link_var.get(),
