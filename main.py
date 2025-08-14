@@ -327,6 +327,8 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.api_keys_list = []
         self.output_folder = tk.StringVar()
         self.keywords_file_path = tk.StringVar()
+        self.openai_keys_file_path = tk.StringVar()
+        self.deepseek_keys_file_path = tk.StringVar()
         self.num_threads_var = tk.IntVar(value=5)
         self.generation_active = False
         self.waiting_for_project_slot = False
@@ -395,7 +397,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.load_settings()
         self.load_progress_data()
         self._initial_check_and_revive_keys()
-        self.create_widgets()
+        self.create_widgets_new()
         self.update_threads_label()
 
         self.telegram_bot_token = None
@@ -853,6 +855,95 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.after(100, self._repopulate_available_api_key_queue)
         self.after(LOG_FLUSH_INTERVAL_MS, self.flush_log_queue)
 
+    def create_widgets_new(self):
+        main_frame = ctk.CTkFrame(self)
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        content_frame = ctk.CTkFrame(main_frame)
+        content_frame.pack(fill="both", expand=True)
+
+        log_frame = ctk.CTkFrame(content_frame)
+        log_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        ctk.CTkLabel(log_frame, text="Лог выполнения:").pack(anchor="w")
+        self.log_textbox = ctk.CTkTextbox(log_frame, state="disabled", wrap="word")
+        self.log_textbox.pack(fill="both", expand=True)
+
+        controls_frame = ctk.CTkFrame(content_frame)
+        controls_frame.pack(side="left", fill="both", expand=True)
+
+        api_frame = ctk.CTkFrame(controls_frame)
+        api_frame.pack(pady=(10, 5), padx=10, fill="x")
+        ctk.CTkLabel(api_frame, text="Файл с OpenAI ключами:").pack(anchor="w")
+        self.openai_keys_entry = ctk.CTkEntry(api_frame, textvariable=self.openai_keys_file_path, width=350)
+        self.openai_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.openai_keys_browse_button = ctk.CTkButton(api_frame, text="Выбрать...", command=self.browse_openai_keys_file)
+        self.openai_keys_browse_button.pack(side="left")
+
+        deepseek_frame = ctk.CTkFrame(controls_frame)
+        deepseek_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(deepseek_frame, text="Файл с ключами DeepSeek:").pack(anchor="w")
+        self.deepseek_keys_entry = ctk.CTkEntry(deepseek_frame, textvariable=self.deepseek_keys_file_path, width=350)
+        self.deepseek_keys_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.deepseek_keys_browse_button = ctk.CTkButton(deepseek_frame, text="Выбрать...", command=self.browse_deepseek_keys_file)
+        self.deepseek_keys_browse_button.pack(side="left")
+
+        folder_frame = ctk.CTkFrame(controls_frame)
+        folder_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(folder_frame, text="Папка для сохранения файлов:").pack(anchor="w")
+        self.folder_entry = ctk.CTkEntry(folder_frame, textvariable=self.output_folder, width=350)
+        self.folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.browse_button = ctk.CTkButton(folder_frame, text="Выбрать...", command=self.browse_folder)
+        self.browse_button.pack(side="left")
+
+        keywords_frame = ctk.CTkFrame(controls_frame)
+        keywords_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(keywords_frame, text="Файл с ключевыми словами (.txt, формат: 'ключ\tколичество'):").pack(anchor="w")
+        self.keywords_entry = ctk.CTkEntry(keywords_frame, textvariable=self.keywords_file_path, width=350)
+        self.keywords_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.browse_keywords_button = ctk.CTkButton(keywords_frame, text="Выбрать...", command=self.browse_keywords_file)
+        self.browse_keywords_button.pack(side="left")
+
+        lang_frame = ctk.CTkFrame(controls_frame)
+        lang_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(lang_frame, text="Язык генерации текстов:").pack(side="left", padx=(0, 10))
+        self.language_combobox = ctk.CTkComboBox(lang_frame, values=self.supported_languages, variable=self.generation_language_var)
+        self.language_combobox.pack(side="left", fill="x", expand=True)
+
+        link_frame = ctk.CTkFrame(controls_frame)
+        link_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(link_frame, text="Ссылка для ключевого слова (URL):").pack(side="left", padx=(0, 10))
+        self.target_link_entry = ctk.CTkEntry(link_frame, textvariable=self.target_link_var)
+        self.target_link_entry.pack(side="left", fill="x", expand=True)
+
+        format_frame = ctk.CTkFrame(controls_frame)
+        format_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(format_frame, text="Формат выходного файла:").pack(side="left", padx=(0, 10))
+        self.format_segmented_button = ctk.CTkSegmentedButton(format_frame, values=["TXT", "HTML"], variable=self.output_format_var)
+        self.format_segmented_button.pack(side="left", fill="x", expand=True)
+
+        threads_frame = ctk.CTkFrame(controls_frame)
+        threads_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(threads_frame, text="Количество потоков:").pack(side="left", padx=(0, 10))
+        self.threads_slider = ctk.CTkSlider(threads_frame, from_=1, to=MAX_THREADS, variable=self.num_threads_var, number_of_steps=MAX_THREADS - 1)
+        self.threads_slider.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.threads_label = ctk.CTkLabel(threads_frame, text=str(self.num_threads_var.get()))
+        self.threads_label.pack(side="left")
+        self.num_threads_var.trace_add("write", self.update_threads_label)
+
+        action_frame = ctk.CTkFrame(controls_frame)
+        action_frame.pack(pady=(10, 5), padx=10, fill="x")
+        self.start_button = ctk.CTkButton(action_frame, text="Начать генерацию", command=self.start_generation_thread)
+        self.start_button.pack(side="left", padx=5)
+        self.stop_button = ctk.CTkButton(action_frame, text="Остановить", command=self.stop_generation, state="disabled")
+        self.stop_button.pack(side="left", padx=5)
+        self.api_status_button = ctk.CTkButton(action_frame, text="Статусы API Ключей", command=self._open_api_key_status_window)
+        self.api_status_button.pack(side="left", padx=10)
+        self.help_button = ctk.CTkButton(action_frame, text="!", width=30, command=self._open_help_window)
+        self.help_button.pack(side="left")
+
+        self.after(100, self._repopulate_available_api_key_queue)
+        self.after(LOG_FLUSH_INTERVAL_MS, self.flush_log_queue)
+
     def handle_api_keys_textbox_change(self, event=None):
         self.update_api_keys_from_textbox()
         self._initial_check_and_revive_keys()
@@ -897,6 +988,24 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def send_telegram_notification(self, text):
         send_telegram_message(self.telegram_bot_token, self.telegram_chat_id, text, self.log_message)
+
+    def browse_openai_keys_file(self):
+        f_path = filedialog.askopenfilename(title="Выберите файл с OpenAI ключами",
+                                            filetypes=(("Text files", "*.txt"), ("All files", "*.*")))
+        if f_path:
+            self.openai_keys_file_path.set(f_path)
+            self.log_message(f"Файл с OpenAI ключами: {f_path}")
+            self._load_keys_from_selected_files()
+            self.save_settings()
+
+    def browse_deepseek_keys_file(self):
+        f_path = filedialog.askopenfilename(title="Выберите файл с ключами DeepSeek",
+                                            filetypes=(("Text files", "*.txt"), ("All files", "*.*")))
+        if f_path:
+            self.deepseek_keys_file_path.set(f_path)
+            self.log_message(f"Файл с ключами DeepSeek: {f_path}")
+            self._load_keys_from_selected_files()
+            self.save_settings()
 
     def browse_folder(self):
         fld = filedialog.askdirectory()
@@ -978,30 +1087,19 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def load_settings(self):
         cfg = configparser.ConfigParser()
-        initial_keys_loaded = []
         if os.path.exists(self.config_file):
             try:
                 cfg.read(self.config_file, encoding='utf-8')
                 if "Settings" in cfg:
                     s = cfg["Settings"]
                     self.output_folder.set(s.get("OutputFolder", ""))
-                    api_keys_raw = s.get("ApiKeys", "")
-                    if api_keys_raw:
-                        initial_keys_loaded = [k.strip() for k in api_keys_raw.splitlines() if k.strip()]
-                    else:
-                        initial_keys_loaded = load_shared_keys()
-                    with self.api_key_management_lock:
-                        bad_keys_loaded = load_bad_api_keys(self.log_message)
-                        if bad_keys_loaded:
-                            initial_keys_loaded = [k for k in initial_keys_loaded if k not in bad_keys_loaded]
-                        self.api_keys_list = initial_keys_loaded
-                    if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                        self.api_keys_textbox.delete("1.0", tk.END)
-                        if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
+                    self.openai_keys_file_path.set(s.get("OpenAIKeysFile", ""))
+                    self.deepseek_keys_file_path.set(s.get("DeepSeekKeysFile", ""))
                     self.num_threads_var.set(s.getint("NumThreads", 5))
                     self.generation_language_var.set(s.get("GenerationLanguage", "Русский"))
                     self.target_link_var.set(s.get("TargetLink", ""))
                     self.output_format_var.set(s.get("OutputFormat", "TXT"))
+                    self._load_keys_from_selected_files()
                     self.log_message("Настройки загружены.")
                 else:
                     self.log_message("Секция 'Settings' не найдена в файле конфигурации.", "WARNING")
@@ -1009,23 +1107,37 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ошибка загрузки настроек: {e}", "ERROR")
         else:
             self.log_message("Файл настроек не найден. Будут использованы значения по умолчанию.", "INFO")
-            with self.api_key_management_lock:
-                self.api_keys_list = load_shared_keys()
-            if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                self.api_keys_textbox.delete("1.0", tk.END)
-                if self.api_keys_list:
-                    self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
+            self._load_keys_from_selected_files()
+
+    def _load_keys_from_selected_files(self):
+        combined = []
+        for path in [self.openai_keys_file_path.get().strip(), self.deepseek_keys_file_path.get().strip()]:
+            if path:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                combined.append(line)
+                except Exception as e:
+                    self.log_message(f"Не удалось загрузить ключи из {path}: {e}", "ERROR")
+        with self.api_key_management_lock:
+            self.api_keys_list = combined
+        self._initial_check_and_revive_keys()
+        self._repopulate_available_api_key_queue()
 
     def save_settings(self):
         self._save_api_key_statuses()
         cfg = configparser.ConfigParser()
-        with self.api_key_management_lock:
-            keys_to_save = "\n".join(self.api_keys_list)
-            save_shared_keys(self.api_keys_list)
-        cfg["Settings"] = {"OutputFolder": self.output_folder.get(), "ApiKeys": keys_to_save,
-                           "NumThreads": str(self.num_threads_var.get()),
-                           "GenerationLanguage": self.generation_language_var.get(),
-                           "TargetLink": self.target_link_var.get(), "OutputFormat": self.output_format_var.get()}
+        cfg["Settings"] = {
+            "OutputFolder": self.output_folder.get(),
+            "OpenAIKeysFile": self.openai_keys_file_path.get(),
+            "DeepSeekKeysFile": self.deepseek_keys_file_path.get(),
+            "NumThreads": str(self.num_threads_var.get()),
+            "GenerationLanguage": self.generation_language_var.get(),
+            "TargetLink": self.target_link_var.get(),
+            "OutputFormat": self.output_format_var.get(),
+        }
         try:
             with open(self.config_file, "w", encoding="utf-8") as cf:
                 cfg.write(cf)
@@ -1105,9 +1217,6 @@ class TextGeneratorApp(ctk.CTkFrame):
                             BAD_API_KEYS_CACHE.add(bad_key)
             except Exception as e:
                 self.log_message(f"Не удалось записать плохой ключ {bad_key[:7]}... в файл: {e}", "ERROR")
-            if hasattr(self, 'api_keys_textbox') and self.api_keys_textbox.winfo_exists():
-                self.api_keys_textbox.delete("1.0", tk.END)
-                if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
             self._repopulate_available_api_key_queue()
             self._save_api_key_statuses()
 
@@ -1149,7 +1258,9 @@ class TextGeneratorApp(ctk.CTkFrame):
 
     def set_ui_for_generation(self, active):
         self.generation_active = active
-        widgets_to_disable = [self.api_keys_textbox, self.folder_entry, self.browse_button, self.keywords_entry,
+        widgets_to_disable = [self.openai_keys_entry, self.openai_keys_browse_button,
+                              self.deepseek_keys_entry, self.deepseek_keys_browse_button,
+                              self.folder_entry, self.browse_button, self.keywords_entry,
                               self.browse_keywords_button, self.threads_slider, self.language_combobox,
                               self.target_link_entry, self.format_segmented_button]
         button_state_if_active = "disabled"
@@ -1455,6 +1566,47 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
         return None
 
+    def call_deepseek_api(self, login, password, api_key, messages, full_key, retries=3, delay_seconds=0.5):
+        url = "https://api.deepseek.com/v1/chat/completions"
+        for attempt in range(retries):
+            if self.stop_event.is_set():
+                self.log_message("API вызов прерван сигналом остановки.", "WARNING")
+                return None
+            with api_key_last_call_time_lock:
+                last_ts = api_key_last_call_time.get(full_key, 0.0)
+            to_wait = PER_KEY_CALL_INTERVAL - (time.time() - last_ts)
+            if to_wait > 0:
+                time.sleep(to_wait)
+            try:
+                headers = {"Authorization": f"Bearer {api_key}"}
+                payload = {"model": DEFAULT_MODEL, "messages": messages}
+                response = requests.post(url, json=payload, auth=(login, password), headers=headers, timeout=300)
+                if response.status_code == 200:
+                    data = response.json()
+                    with api_key_last_call_time_lock:
+                        api_key_last_call_time[full_key] = time.time()
+                    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                elif response.status_code == 401:
+                    return "INVALID_API_KEY_ERROR"
+                else:
+                    log_level = "ERROR" if attempt + 1 == retries else "WARNING"
+                    self.log_message(f"DeepSeek API error {response.status_code}: {response.text}", log_level)
+            except requests.RequestException as e:
+                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
+                self.log_message(f"DeepSeek API connection error: {e}", log_level)
+            current_delay = delay_seconds * (attempt + 1)
+            if attempt + 1 < retries:
+                time.sleep(current_delay)
+        return None
+
+    def call_model_api(self, api_key_str, messages, retries=3, delay_seconds=0.5):
+        if api_key_str.count(":") >= 2:
+            login, password, ds_key = api_key_str.split(":", 2)
+            return self.call_deepseek_api(login, password, ds_key, messages, api_key_str, retries, delay_seconds)
+        else:
+            client = OpenAI(api_key=api_key_str, timeout=30.0, max_retries=0)
+            return self.call_openai_api(client, messages, api_key_str, retries, delay_seconds)
+
     # ================================================================================
     # НОВЫЙ МЕТОД ДЛЯ ОЧИСТКИ HTML (УБЕДИТЕСЬ, ЧТО ОН ВНУТРИ КЛАССА TextGeneratorApp)
     # ================================================================================
@@ -1582,7 +1734,6 @@ class TextGeneratorApp(ctk.CTkFrame):
         if self.stop_event.is_set(): return False
 
         retrieved_api_key_str = None
-        openai_client = None
         key_marked_as_bad_in_this_task = False
         key_went_to_cooldown_in_this_task = False
 
@@ -1599,30 +1750,13 @@ class TextGeneratorApp(ctk.CTkFrame):
         try:
             retrieved_api_key_str = self.api_key_queue.get(block=True, timeout=20)
             with self.api_stats_lock:
-                self.api_key_usage_stats[retrieved_api_key_str] = self.api_key_usage_stats.get(retrieved_api_key_str,
-                                                                                               0) + 1
-            key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(
-                retrieved_api_key_str) > 5 else retrieved_api_key_str
+                self.api_key_usage_stats[retrieved_api_key_str] = self.api_key_usage_stats.get(retrieved_api_key_str, 0) + 1
+            display_part = retrieved_api_key_str.split(":")[-1]
+            key_short_display = f"...{display_part[-5:]}" if len(display_part) > 5 else display_part
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
-            openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-            if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
         except Empty:
             self.log_message(f"{log_prefix_base} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
             self._initial_check_and_revive_keys()
-            return False
-        except Exception as e_init:
-            self.log_message(
-                f"{log_prefix_base} Ошибка инициализации клиента OpenAI ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
-                "ERROR")
-            if retrieved_api_key_str:
-                with self.api_key_statuses_lock:
-                    status_data = self.api_key_statuses.get(retrieved_api_key_str, self._get_default_api_key_status())
-                if status_data.get("status") == "active":
-                    self.api_key_queue.put(retrieved_api_key_str)
-                else:
-                    self.log_message(
-                        f"Ключ {key_short_display} не возвращен в очередь, статус: {status_data.get('status')}.",
-                        "DEBUG")
             return False
 
         try:
@@ -1651,7 +1785,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "content": f"Сделай так, чтобы главный первый заголовок не был похож вообще на этот, проработай тщательно начало и конец, чтобы не было повторений: \"{self.previous_h1_text}\". ОБЗЯТАТЕЛЬНО НАЧАЛО НЕ ДОЛЖНО СОВПАДАТЬ!!!"
                     })
 
-            original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            original_h1_text_raw = self.call_model_api(retrieved_api_key_str, base_h1_prompt)
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -1797,12 +1931,11 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
-            article_body_raw_from_api = self.call_openai_api(openai_client,
-                                                             [{"role": "system", "content": body_prompt_system},
-                                                              # Теперь body_prompt_system определена
-                                                              {"role": "user", "content": body_prompt_user}],
-                                                             # Теперь body_prompt_user определена
-                                                             retrieved_api_key_str)
+            article_body_raw_from_api = self.call_model_api(
+                retrieved_api_key_str,
+                [{"role": "system", "content": body_prompt_system},
+                 {"role": "user", "content": body_prompt_user}]
+            )
 
             # ... (остальной код вашего метода)
 
