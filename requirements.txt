@@ -3,3 +3,4 @@ ecdsa
 base58
 pycryptodome
 requests
+pytest
