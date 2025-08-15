@@ -3,11 +3,43 @@ import time
 import threading
 import queue
 import csv
+import json
+import io
+
 import customtkinter as ctk
 import hashlib
 from ecdsa import SECP256k1, SigningKey
 import base58
 from Crypto.Hash import keccak
+from mnemonic import Mnemonic
+import bip32utils
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+CONFIG_PATH = "config.json"
+try:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        CONFIG = json.load(f)
+except FileNotFoundError:
+    CONFIG = {"encryption_password": "password"}
+
+
+def _derive_key(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000
+    )
+    return kdf.derive(password.encode())
+
+
+def encrypt_data(password: str, data: bytes) -> bytes:
+    salt = os.urandom(16)
+    key = _derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, data, None)
+    return salt + nonce + ciphertext
 
 
 def keccak_256(data: bytes):
@@ -74,11 +106,34 @@ NETWORK_GENERATORS = {
     "Лайткоин": _generate_litecoin,
 }
 
+NETWORK_COIN_TYPE = {
+    "Биткоин": 0,
+    "Эфириум": 60,
+    "Трон": 195,
+    "Догикоин": 3,
+    "Лайткоин": 2,
+}
+
 # --- Рабочий поток --------------------------------------------------------------
 
-def generate_address(network: str):
-    priv_key = SigningKey.from_string(os.urandom(32), curve=SECP256k1)
-    return NETWORK_GENERATORS[network](priv_key)
+def generate_wallet(network: str):
+    mnemo = Mnemonic("english")
+    words = mnemo.generate()
+    seed = mnemo.to_seed(words)
+    root = bip32utils.BIP32Key.fromEntropy(seed)
+    coin = NETWORK_COIN_TYPE[network]
+    key = (
+        root.ChildKey(44 + bip32utils.BIP32_HARDEN)
+        .ChildKey(coin + bip32utils.BIP32_HARDEN)
+        .ChildKey(0 + bip32utils.BIP32_HARDEN)
+        .ChildKey(0)
+        .ChildKey(0)
+    )
+    priv_bytes = key.PrivateKey()
+    signing_key = SigningKey.from_string(priv_bytes, curve=SECP256k1)
+    address, priv = NETWORK_GENERATORS[network](signing_key)
+    path = f"m/44'/{coin}'/0'/0/0"
+    return address, priv, words, path
 
 
 def worker(network, prefix, suffix, case_sensitive, result_queue, counter, target, stop_event):
@@ -86,7 +141,7 @@ def worker(network, prefix, suffix, case_sensitive, result_queue, counter, targe
     suffix_cmp = suffix if case_sensitive else suffix.lower()
 
     while not stop_event.is_set():
-        addr, key = generate_address(network)
+        addr, key, seed, path = generate_wallet(network)
         addr_cmp = addr if case_sensitive else addr.lower()
 
         with counter["lock"]:
@@ -95,7 +150,7 @@ def worker(network, prefix, suffix, case_sensitive, result_queue, counter, targe
         if (not prefix_cmp or addr_cmp.startswith(prefix_cmp)) and (
             not suffix_cmp or addr_cmp.endswith(suffix_cmp)
         ):
-            result_queue.put((addr, key))
+            result_queue.put((addr, key, seed, path))
             with counter["lock"]:
                 counter["found"] += 1
                 if counter["found"] >= target:
@@ -128,7 +183,8 @@ class VanityApp(ctk.CTk):
         self.stop_event = threading.Event()
         self.threads = []
         self.start_time = None
-        self.output_file = "vanity_results.csv"
+        self.output_file = "vanity_results.enc"
+        self.results: list[tuple[str, str, str, str, str]] = []
 
     # Размещение элементов
     def _build_ui(self):
@@ -204,6 +260,7 @@ class VanityApp(ctk.CTk):
         self.stop_event = threading.Event()
         self.threads = []
         self.start_time = time.perf_counter()
+        self.results = []
 
         for _ in range(threads):
             t = threading.Thread(
@@ -228,11 +285,10 @@ class VanityApp(ctk.CTk):
 
     def _update_gui(self):
         while not self.result_queue.empty():
-            addr, key = self.result_queue.get()
+            addr, key, seed, path = self.result_queue.get()
             line = f"{self.network_var.get()},{addr},{key}\n"
             self.textbox.insert("end", line)
-            with open(self.output_file, "a", newline="") as f:
-                f.write(line)
+            self.results.append((self.network_var.get(), addr, key, seed, path))
 
         elapsed = max(time.perf_counter() - self.start_time, 1e-6)
         with self.counter["lock"]:
@@ -250,10 +306,30 @@ class VanityApp(ctk.CTk):
                 self.start_btn.configure(state="normal")
                 self.stop_btn.configure(state="disabled")
                 self.status_label.configure(text="Остановлено")
+                self._save_results()
             else:
                 self.after(500, self._update_gui)
         else:
             self.after(500, self._update_gui)
+
+    def _save_results(self):
+        if not self.results:
+            return
+        with io.StringIO() as sio:
+            writer = csv.writer(sio)
+            writer.writerow([
+                "network",
+                "address",
+                "private_key",
+                "seed_phrase",
+                "derivation_path",
+            ])
+            for row in self.results:
+                writer.writerow(row)
+            plaintext = sio.getvalue().encode()
+        ciphertext = encrypt_data(CONFIG.get("encryption_password", "password"), plaintext)
+        with open(self.output_file, "wb") as f:
+            f.write(ciphertext)
 
 
 if __name__ == "__main__":
