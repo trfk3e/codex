@@ -7,7 +7,11 @@ import customtkinter as ctk
 import hashlib
 from ecdsa import SECP256k1, SigningKey
 import base58
-from sha3 import keccak_256
+from Crypto.Hash import keccak
+
+
+def keccak_256(data: bytes):
+    return keccak.new(digest_bits=256, data=data)
 
 # --- Network specific generators -------------------------------------------------
 

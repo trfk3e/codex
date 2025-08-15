@@ -1,5 +1,5 @@
 customtkinter
 ecdsa
 base58
-pysha3
+pycryptodome
 requests
