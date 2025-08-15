@@ -117,8 +117,9 @@ class VanityApp(ctk.CTk):
         self.prefix_var = ctk.StringVar()
         self.suffix_var = ctk.StringVar()
         self.case_var = ctk.BooleanVar(value=False)
-        self.threads_var = ctk.IntVar(value=1)
-        self.target_var = ctk.IntVar(value=1)
+        # use StringVar so empty input doesn't raise TclError in IntVar/DoubleVar callbacks
+        self.threads_var = ctk.StringVar(value="1")
+        self.target_var = ctk.StringVar(value="1")
 
         self._build_ui()
 
@@ -188,8 +189,14 @@ class VanityApp(ctk.CTk):
         prefix = self.prefix_var.get()
         suffix = self.suffix_var.get()
         case_sensitive = self.case_var.get()
-        threads = max(1, self.threads_var.get())
-        target = max(1, self.target_var.get())
+        try:
+            threads = max(1, int(self.threads_var.get()))
+        except (TypeError, ValueError):
+            threads = 1
+        try:
+            target = max(1, int(self.target_var.get()))
+        except (TypeError, ValueError):
+            target = 1
 
         self.result_queue = queue.Queue()
         self.counter = {"total": 0, "found": 0, "lock": threading.Lock()}
