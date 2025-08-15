@@ -1,0 +1,2 @@
+customtkinter
+bip-utils
