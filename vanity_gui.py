@@ -198,9 +198,10 @@ class VanityApp(ctk.CTk):
         except (TypeError, ValueError):
             target = 1
 
+        # запуск новой сессии поиска
         self.result_queue = queue.Queue()
         self.counter = {"total": 0, "found": 0, "lock": threading.Lock()}
-        self.stop_event.clear()
+        self.stop_event = threading.Event()
         self.threads = []
         self.start_time = time.perf_counter()
 
@@ -219,13 +220,11 @@ class VanityApp(ctk.CTk):
         self.after(500, self._update_gui)
 
     def stop(self):
+        # не блокируем главный поток ожиданием завершения рабочих потоков
         self.stop_event.set()
-        for t in self.threads:
-            t.join()
-        self.threads = []
-        self.start_btn.configure(state="normal")
+        self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="disabled")
-        self.status_label.configure(text="Остановлено")
+        self.status_label.configure(text="Остановка...")
 
     def _update_gui(self):
         while not self.result_queue.empty():
@@ -245,7 +244,14 @@ class VanityApp(ctk.CTk):
         )
 
         if self.stop_event.is_set():
-            self.stop()
+            # проверяем, все ли потоки завершены
+            if not any(t.is_alive() for t in self.threads):
+                self.threads = []
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                self.status_label.configure(text="Остановлено")
+            else:
+                self.after(500, self._update_gui)
         else:
             self.after(500, self._update_gui)
 
