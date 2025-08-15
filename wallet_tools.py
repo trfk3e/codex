@@ -1,26 +1,26 @@
 import requests
 
-# --- Transaction sum fetchers ----------------------------------------------------
+# --- Получение сумм транзакций --------------------------------------------------
 
-# Each function returns total received amount in standard units (BTC, ETH, BNB, TRX)
+# Каждая функция возвращает общую полученную сумму в стандартных единицах (BTC, ETH, BNB, TRX)
 
 
 def _btc_total_received(address: str) -> float:
-    """Return total BTC received by address using BlockCypher."""
+    """Возвращает общий объём BTC, полученный адресом через BlockCypher."""
     url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}"
     data = requests.get(url, timeout=10).json()
     return data.get("total_received", 0) / 1e8
 
 
 def _eth_total_received(address: str) -> float:
-    """Return total ETH received by address using BlockCypher."""
+    """Возвращает общий объём ETH, полученный адресом через BlockCypher."""
     url = f"https://api.blockcypher.com/v1/eth/main/addrs/{address}"
     data = requests.get(url, timeout=10).json()
     return data.get("total_received", 0) / 1e18
 
 
 def _bsc_total_received(address: str, api_key: str | None = None) -> float:
-    """Return total BNB received using BscScan."""
+    """Возвращает общий объём BNB, полученный через BscScan."""
     url = (
         "https://api.bscscan.com/api"
         "?module=account&action=txlist&startblock=0&endblock=99999999&sort=asc"
@@ -36,7 +36,7 @@ def _bsc_total_received(address: str, api_key: str | None = None) -> float:
 
 
 def _trx_total_received(address: str) -> float:
-    """Return total TRX received by address using TronScan."""
+    """Возвращает общий объём TRX, полученный адресом через TronScan."""
     url = f"https://apilist.tronscan.org/api/transaction?address={address}"
     data = requests.get(url, timeout=10).json()
     total = 0
@@ -57,7 +57,7 @@ NETWORK_TOTAL_RECEIVED = {
 
 
 def filter_addresses_by_minimum(network: str, addresses: list[str], minimum: float, api_key: str | None = None):
-    """Return addresses having total received amount >= minimum."""
+    """Возвращает адреса, получившие сумму не менее указанного минимума."""
     func = NETWORK_TOTAL_RECEIVED[network]
     result: list[tuple[str, float]] = []
     for addr in addresses:
@@ -70,13 +70,13 @@ def filter_addresses_by_minimum(network: str, addresses: list[str], minimum: flo
     return result
 
 
-# --- Transaction sender skeleton -------------------------------------------------
+# --- Заготовка для отправки транзакций -----------------------------------------
 
 
 def send_transaction(network: str, from_priv_key: str, to_address: str, amount: float):
-    """Placeholder for sending a transaction.
+    """Заглушка для отправки транзакции.
 
-    A production implementation would require network-specific signing and
-    broadcasting logic. This function is intentionally left unimplemented.
+    Полноценная реализация потребует сетевых методов подписи и отправки.
+    Функция намеренно не реализована.
     """
-    raise NotImplementedError("Sending transactions is not implemented.")
+    raise NotImplementedError("Отправка транзакций не реализована.")

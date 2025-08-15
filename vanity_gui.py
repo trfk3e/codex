@@ -13,7 +13,7 @@ from Crypto.Hash import keccak
 def keccak_256(data: bytes):
     return keccak.new(digest_bits=256, data=data)
 
-# --- Network specific generators -------------------------------------------------
+# --- Генераторы для сетей -------------------------------------------------------
 
 
 def _compress_pubkey(vk):
@@ -67,14 +67,14 @@ def _generate_tron(priv_key):
 
 
 NETWORK_GENERATORS = {
-    "Bitcoin": _generate_bitcoin,
-    "Ethereum": _generate_ethereum,
-    "Tron": _generate_tron,
-    "Dogecoin": _generate_dogecoin,
-    "Litecoin": _generate_litecoin,
+    "Биткоин": _generate_bitcoin,
+    "Эфириум": _generate_ethereum,
+    "Трон": _generate_tron,
+    "Догикоин": _generate_dogecoin,
+    "Лайткоин": _generate_litecoin,
 }
 
-# --- Worker ---------------------------------------------------------------------
+# --- Рабочий поток --------------------------------------------------------------
 
 def generate_address(network: str):
     priv_key = SigningKey.from_string(os.urandom(32), curve=SECP256k1)
@@ -103,21 +103,21 @@ def worker(network, prefix, suffix, case_sensitive, result_queue, counter, targe
                     return
 
 
-# --- GUI -----------------------------------------------------------------------
+# --- Графический интерфейс ------------------------------------------------------
 
 class VanityApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Vanity Address Generator")
+        self.title("Генератор ванити-адресов")
         self.geometry("700x500")
 
         ctk.set_default_color_theme("blue")
 
-        self.network_var = ctk.StringVar(value="Bitcoin")
+        self.network_var = ctk.StringVar(value="Биткоин")
         self.prefix_var = ctk.StringVar()
         self.suffix_var = ctk.StringVar()
         self.case_var = ctk.BooleanVar(value=False)
-        # use StringVar so empty input doesn't raise TclError in IntVar/DoubleVar callbacks
+        # используем StringVar, чтобы пустой ввод не вызывал TclError в IntVar/DoubleVar
         self.threads_var = ctk.StringVar(value="1")
         self.target_var = ctk.StringVar(value="1")
 
@@ -130,38 +130,38 @@ class VanityApp(ctk.CTk):
         self.start_time = None
         self.output_file = "vanity_results.csv"
 
-    # UI layout
+    # Размещение элементов
     def _build_ui(self):
         options_frame = ctk.CTkFrame(self)
         options_frame.pack(padx=10, pady=10, fill="x")
 
-        ctk.CTkLabel(options_frame, text="Network").grid(row=0, column=0, padx=5, pady=5)
+        ctk.CTkLabel(options_frame, text="Сеть").grid(row=0, column=0, padx=5, pady=5)
         ctk.CTkOptionMenu(
             options_frame,
             values=list(NETWORK_GENERATORS.keys()),
             variable=self.network_var,
         ).grid(row=0, column=1, padx=5, pady=5)
 
-        ctk.CTkLabel(options_frame, text="Prefix").grid(row=1, column=0, padx=5, pady=5)
+        ctk.CTkLabel(options_frame, text="Префикс").grid(row=1, column=0, padx=5, pady=5)
         ctk.CTkEntry(options_frame, textvariable=self.prefix_var).grid(
             row=1, column=1, padx=5, pady=5
         )
 
-        ctk.CTkLabel(options_frame, text="Suffix").grid(row=2, column=0, padx=5, pady=5)
+        ctk.CTkLabel(options_frame, text="Суффикс").grid(row=2, column=0, padx=5, pady=5)
         ctk.CTkEntry(options_frame, textvariable=self.suffix_var).grid(
             row=2, column=1, padx=5, pady=5
         )
 
-        ctk.CTkCheckBox(options_frame, text="Case sensitive", variable=self.case_var).grid(
+        ctk.CTkCheckBox(options_frame, text="Учитывать регистр", variable=self.case_var).grid(
             row=3, column=0, columnspan=2, pady=5
         )
 
-        ctk.CTkLabel(options_frame, text="Threads").grid(row=4, column=0, padx=5, pady=5)
+        ctk.CTkLabel(options_frame, text="Потоки").grid(row=4, column=0, padx=5, pady=5)
         ctk.CTkEntry(options_frame, textvariable=self.threads_var).grid(
             row=4, column=1, padx=5, pady=5
         )
 
-        ctk.CTkLabel(options_frame, text="Targets").grid(row=5, column=0, padx=5, pady=5)
+        ctk.CTkLabel(options_frame, text="Количество адресов").grid(row=5, column=0, padx=5, pady=5)
         ctk.CTkEntry(options_frame, textvariable=self.target_var).grid(
             row=5, column=1, padx=5, pady=5
         )
@@ -169,13 +169,13 @@ class VanityApp(ctk.CTk):
         control_frame = ctk.CTkFrame(self)
         control_frame.pack(padx=10, fill="x")
 
-        self.start_btn = ctk.CTkButton(control_frame, text="Start", command=self.start)
+        self.start_btn = ctk.CTkButton(control_frame, text="Старт", command=self.start)
         self.start_btn.pack(side="left", padx=5, pady=5)
 
-        self.stop_btn = ctk.CTkButton(control_frame, text="Stop", command=self.stop, state="disabled")
+        self.stop_btn = ctk.CTkButton(control_frame, text="Стоп", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=5, pady=5)
 
-        self.status_label = ctk.CTkLabel(control_frame, text="Idle")
+        self.status_label = ctk.CTkLabel(control_frame, text="Ожидание")
         self.status_label.pack(side="left", padx=10)
 
         self.textbox = ctk.CTkTextbox(self, height=250)
@@ -215,7 +215,7 @@ class VanityApp(ctk.CTk):
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_label.configure(text="Running...")
+        self.status_label.configure(text="Выполняется...")
         self.after(500, self._update_gui)
 
     def stop(self):
@@ -225,7 +225,7 @@ class VanityApp(ctk.CTk):
         self.threads = []
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.status_label.configure(text="Stopped")
+        self.status_label.configure(text="Остановлено")
 
     def _update_gui(self):
         while not self.result_queue.empty():
@@ -241,7 +241,7 @@ class VanityApp(ctk.CTk):
             found = self.counter["found"]
         rate = total / elapsed
         self.status_label.configure(
-            text=f"{total} generated, {found} found, {rate:.2f} addr/s"
+            text=f"Сгенерировано {total}, найдено {found}, {rate:.2f} адресов/с"
         )
 
         if self.stop_event.is_set():
