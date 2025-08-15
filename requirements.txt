@@ -1,0 +1,9 @@
+customtkinter
+ecdsa
+base58
+pycryptodome
+cryptography
+mnemonic
+bip32utils
+requests
+pytest
