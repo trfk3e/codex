@@ -4,61 +4,62 @@ import threading
 import queue
 import csv
 import customtkinter as ctk
-from bip_utils import (
-    Secp256k1PrivateKey,
-    P2PKHAddrEncoder,
-    WifEncoder,
-    CoinsConf,
-    EthAddr,
-    TrxAddr,
-)
+import hashlib
+from ecdsa import SECP256k1, SigningKey
+import base58
+from sha3 import keccak_256
 
 # --- Network specific generators -------------------------------------------------
 
-def _generate_bitcoin(priv_key):
-    address = P2PKHAddrEncoder.EncodeKey(
-        priv_key.PublicKey(),
-        net_ver=CoinsConf.BitcoinMainNet.ParamByKey("p2pkh_net_ver"),
-    )
-    wif = WifEncoder.Encode(
-        priv_key.Raw().ToBytes(),
-        net_ver=CoinsConf.BitcoinMainNet.ParamByKey("wif_net_ver"),
-    )
+
+def _compress_pubkey(vk):
+    pk_bytes = vk.to_string()
+    prefix = b"\x02" if pk_bytes[63] % 2 == 0 else b"\x03"
+    return prefix + pk_bytes[:32]
+
+
+def _generate_btc_like(priv_key, p2pkh_prefix, wif_prefix):
+    vk = priv_key.get_verifying_key()
+    pubkey = _compress_pubkey(vk)
+    sha = hashlib.sha256(pubkey).digest()
+    ripe = hashlib.new("ripemd160", sha).digest()
+    vh160 = p2pkh_prefix + ripe
+    checksum = hashlib.sha256(hashlib.sha256(vh160).digest()).digest()[:4]
+    address = base58.b58encode(vh160 + checksum).decode()
+
+    wif_payload = wif_prefix + priv_key.to_string() + b"\x01"
+    wif_check = hashlib.sha256(hashlib.sha256(wif_payload).digest()).digest()[:4]
+    wif = base58.b58encode(wif_payload + wif_check).decode()
     return address, wif
+
+
+def _generate_bitcoin(priv_key):
+    return _generate_btc_like(priv_key, b"\x00", b"\x80")
 
 
 def _generate_dogecoin(priv_key):
-    address = P2PKHAddrEncoder.EncodeKey(
-        priv_key.PublicKey(),
-        net_ver=CoinsConf.DogecoinMainNet.ParamByKey("p2pkh_net_ver"),
-    )
-    wif = WifEncoder.Encode(
-        priv_key.Raw().ToBytes(),
-        net_ver=CoinsConf.DogecoinMainNet.ParamByKey("wif_net_ver"),
-    )
-    return address, wif
+    return _generate_btc_like(priv_key, b"\x1e", b"\x9e")
 
 
 def _generate_litecoin(priv_key):
-    address = P2PKHAddrEncoder.EncodeKey(
-        priv_key.PublicKey(),
-        net_ver=CoinsConf.LitecoinMainNet.ParamByKey("p2pkh_net_ver"),
-    )
-    wif = WifEncoder.Encode(
-        priv_key.Raw().ToBytes(),
-        net_ver=CoinsConf.LitecoinMainNet.ParamByKey("wif_net_ver"),
-    )
-    return address, wif
+    return _generate_btc_like(priv_key, b"\x30", b"\xb0")
 
 
 def _generate_ethereum(priv_key):
-    address = EthAddr.EncodeKey(priv_key.PublicKey())
-    return address, priv_key.Raw().ToHex()
+    vk = priv_key.get_verifying_key()
+    pubkey = vk.to_string()
+    address = "0x" + keccak_256(pubkey).hexdigest()[-40:]
+    return address, priv_key.to_string().hex()
 
 
 def _generate_tron(priv_key):
-    address = TrxAddr.EncodeKey(priv_key.PublicKey())
-    return address, priv_key.Raw().ToHex()
+    vk = priv_key.get_verifying_key()
+    pubkey = vk.to_string()
+    eth_address_bytes = keccak_256(pubkey).digest()[-20:]
+    addr_payload = b"\x41" + eth_address_bytes
+    checksum = hashlib.sha256(hashlib.sha256(addr_payload).digest()).digest()[:4]
+    address = base58.b58encode(addr_payload + checksum).decode()
+    return address, priv_key.to_string().hex()
 
 
 NETWORK_GENERATORS = {
@@ -72,7 +73,7 @@ NETWORK_GENERATORS = {
 # --- Worker ---------------------------------------------------------------------
 
 def generate_address(network: str):
-    priv_key = Secp256k1PrivateKey.FromBytes(os.urandom(32))
+    priv_key = SigningKey.from_string(os.urandom(32), curve=SECP256k1)
     return NETWORK_GENERATORS[network](priv_key)
 
 

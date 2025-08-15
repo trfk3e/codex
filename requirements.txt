@@ -1,2 +1,4 @@
 customtkinter
-bip-utils
+ecdsa
+base58
+pysha3
