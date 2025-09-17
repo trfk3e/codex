@@ -1609,13 +1609,18 @@ def build_slug_consistency_prompt(
     return "\n".join(body)
 
 def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
-    blocks = [
-        _format_heading_text_block("MT", mt, None),
-        _format_heading_text_block("MD", md, None),
-        _format_heading_text_block("MK", mk, None),
-        _format_heading_text_block("H1", h1, None),
+    def _fmt(label: str, value: str) -> str:
+        clean = strip_invisible(value or "").strip()
+        return f"{label}: {clean or '—'}"
+
+    lines = [
+        "Заголовки:",
+        _fmt("MT", mt),
+        _fmt("MD", md),
+        _fmt("MK", mk),
+        _fmt("H1", h1),
     ]
-    return "\n\n".join(blocks)
+    return "\n".join(lines)
 
 
 def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
@@ -1680,7 +1685,9 @@ def _promo_sections_from_article(article_sections: Sequence[Dict[str, Any]]) -> 
             continue
         lvl = sec.get("level")
         label = f"H{lvl}" if isinstance(lvl, int) and 1 <= lvl <= 6 else "H?"
-        heading = strip_invisible(sec.get("heading") or "")
+        heading = strip_invisible(sec.get("heading") or "").strip()
+        if not _is_meaningful_heading(heading):
+            continue
         sections.append((label, heading, body_lines))
     return sections
 
