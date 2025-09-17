@@ -39,6 +39,7 @@ PROMO_MAX_CHARS        = int(os.environ.get("PROMO_MAX_CHARS", "12000"))
 EEAT_PROMPT_MAX_CHARS  = int(os.environ.get("EEAT_PROMPT_MAX_CHARS", "6000"))
 ART_PROMPT_MAX_CHARS   = int(os.environ.get("ART_PROMPT_MAX_CHARS", "6000"))
 VALIDATOR_CONCURRENCY  = int(os.environ.get("VALIDATOR_CONCURRENCY", "8"))
+OPENAI_REASONING_MIN_OUTPUT_TOKENS = int(os.environ.get("OPENAI_REASONING_MIN_OUTPUT_TOKENS", "64"))
 
 # --- Новые параметры (Zoho OAuth: кеш и задержки) ---
 ZOHO_OAUTH_MAX_RETRIES       = int(os.environ.get("ZOHO_OAUTH_MAX_RETRIES", "3"))
@@ -576,6 +577,38 @@ def _should_retry_without_temperature(temperature: Optional[float], exc: Excepti
     triggers = ("unsupported", "does not support", "default", "allowed", "unexpected", "invalid")
     return any(token in lowered for token in triggers)
 
+
+def _normalize_max_output_tokens_for_model(max_tokens: int) -> int:
+    try:
+        limit = int(max_tokens)
+    except (TypeError, ValueError):
+        return max_tokens
+
+    if limit <= 0:
+        return limit
+
+    if OPENAI_REASONING_MIN_OUTPUT_TOKENS <= 0:
+        return limit
+
+    model_name = (OPENAI_MODEL or "").lower()
+    if not model_name:
+        return limit
+
+    reasoning_markers = (
+        "gpt-5",
+        "o4",
+        "o3",
+        "o1",
+        "reason",
+        "thinking",
+        "deepseek-r1",
+    )
+    if any(marker in model_name for marker in reasoning_markers) and limit < OPENAI_REASONING_MIN_OUTPUT_TOKENS:
+        return OPENAI_REASONING_MIN_OUTPUT_TOKENS
+
+    return limit
+
+
 def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> Tuple[str, str]:
     last_exc: Optional[Exception] = None
     responses_api = getattr(client, "responses", None)
@@ -692,6 +725,17 @@ def _call_openai_with_keys(messages: List[Dict],
     prompt_preview = _messages_preview(messages, limit=500)
     if prompt_preview:
         admin_debug_log(f"LLM[{label}] Prompt: {prompt_preview}")
+
+    adjusted_max_tokens = _normalize_max_output_tokens_for_model(max_tokens)
+    if adjusted_max_tokens != max_tokens:
+        admin_debug_log(
+            "LLM[{}] Модель {} требует запас вывода: max_tokens {}→{}".format(
+                label,
+                OPENAI_MODEL,
+                max_tokens,
+                adjusted_max_tokens,
+            )
+        )
     keys = db_list_keys()
     env_sk = os.environ.get("OPENAI_API_KEY")
     if env_sk and env_sk not in keys:
@@ -713,7 +757,7 @@ def _call_openai_with_keys(messages: List[Dict],
                         admin_debug_log(
                             f"LLM[{label}] Ключ {key_masked}: попытка {attempt + 1} (раунд {round_idx})"
                         )
-                        answer, method = _invoke_openai(client, messages, max_tokens, temperature)
+                        answer, method = _invoke_openai(client, messages, adjusted_max_tokens, temperature)
                         if isinstance(answer, str) and answer.strip():
                             text = answer.strip()
                             admin_debug_log(
