@@ -362,58 +362,109 @@ def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
                     return combined
     return None
 
+
+def _should_retry_without_temperature(temperature: Optional[float], exc: Exception) -> bool:
+    if temperature is None:
+        return False
+    try:
+        if float(temperature) == 1.0:
+            return False
+    except Exception:
+        pass
+
+    parts: List[str] = []
+    for attr in ("message", "detail", "text"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, str):
+            parts.append(val)
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str):
+                parts.append(msg)
+
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, str):
+            parts.append(arg)
+
+    message = " ".join(p for p in parts if p) or str(exc)
+    lowered = message.lower()
+    if "temperature" not in lowered:
+        return False
+    triggers = ("unsupported", "does not support", "default", "allowed", "unexpected", "invalid")
+    return any(token in lowered for token in triggers)
+
 def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> Tuple[str, str]:
     last_exc: Optional[Exception] = None
     responses_api = getattr(client, "responses", None)
     if responses_api is not None:
-        try:
-            resp = responses_api.create(
-                model=OPENAI_MODEL,
-                input=_responses_input_from_messages(messages),
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-            )
-            text = _extract_text_from_openai_response(resp)
-            if text:
-                return text, "responses"
-            raise RuntimeError("Пустой ответ от Responses API")
-        except Exception as ex:
-            last_exc = ex
+        include_temperature = temperature is not None
+        while True:
+            try:
+                kwargs = dict(
+                    model=OPENAI_MODEL,
+                    input=_responses_input_from_messages(messages),
+                    max_output_tokens=max_tokens,
+                )
+                if include_temperature:
+                    kwargs["temperature"] = temperature
+                resp = responses_api.create(**kwargs)
+                text = _extract_text_from_openai_response(resp)
+                if text:
+                    return text, "responses"
+                raise RuntimeError("Пустой ответ от Responses API")
+            except Exception as ex:
+                last_exc = ex
+                if include_temperature and _should_retry_without_temperature(temperature, ex):
+                    include_temperature = False
+                    continue
+                break
 
     chat_api = getattr(client, "chat", None)
     completions_api = getattr(chat_api, "completions", None) if chat_api else None
     if completions_api is not None:
-        common_kwargs = dict(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=temperature,
-        )
         resp = None
         last_error: Optional[Exception] = None
+        use_temperature = temperature is not None
 
         for param_name in ("max_completion_tokens", "max_tokens"):
-            try:
-                resp = completions_api.create(
-                    **common_kwargs,
-                    **{param_name: max_tokens},
-                )
+            while True:
+                try:
+                    kwargs = dict(
+                        model=OPENAI_MODEL,
+                        messages=messages,
+                        **({"temperature": temperature} if use_temperature else {}),
+                    )
+                    kwargs[param_name] = max_tokens
+                    resp = completions_api.create(**kwargs)
+                    break
+                except TypeError as ex:
+                    last_error = ex
+                    text = " ".join(str(a) for a in ex.args)
+                    if use_temperature and _should_retry_without_temperature(temperature, ex):
+                        use_temperature = False
+                        continue
+                    if param_name == "max_completion_tokens" and (
+                        "unexpected" in text.lower() and param_name in text
+                    ):
+                        break
+                    raise
+                except Exception as ex:
+                    last_error = ex
+                    if use_temperature and _should_retry_without_temperature(temperature, ex):
+                        use_temperature = False
+                        continue
+                    text = str(getattr(ex, "message", "")) or str(ex)
+                    if param_name == "max_completion_tokens" and (
+                        "unsupported" in text.lower() and param_name in text
+                    ):
+                        break
+                    raise
+            if resp is not None:
                 break
-            except TypeError as ex:
-                last_error = ex
-                text = " ".join(str(a) for a in ex.args)
-                if param_name == "max_completion_tokens" and (
-                    "unexpected" in text.lower() and param_name in text
-                ):
-                    continue
-                raise
-            except Exception as ex:
-                last_error = ex
-                text = str(getattr(ex, "message", "")) or str(ex)
-                if param_name == "max_completion_tokens" and (
-                    "unsupported" in text.lower() and param_name in text
-                ):
-                    continue
-                raise
 
         if resp is None:
             if last_error is not None:
