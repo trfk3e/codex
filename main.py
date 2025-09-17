@@ -327,9 +327,17 @@ def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
             return
         if isinstance(obj, dict):
             typ = obj.get("type")
-            if isinstance(typ, str) and typ.lower() in {"output_text", "text"} and isinstance(obj.get("text"), str):
-                texts.append(obj["text"])
-            for key in ("content", "contents", "items", "data", "output"):
+            text_val = obj.get("text")
+            if isinstance(typ, str) and typ.lower() in {"output_text", "text"} and isinstance(text_val, str):
+                texts.append(text_val)
+            elif text_val is not None:
+                _gather(text_val)
+            value_val = obj.get("value")
+            if isinstance(value_val, str):
+                texts.append(value_val)
+            elif value_val is not None:
+                _gather(value_val)
+            for key in ("content", "contents", "items", "data", "output", "outputs", "values"):
                 if key in obj:
                     _gather(obj[key])
             return
@@ -338,6 +346,8 @@ def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
                 val = getattr(obj, attr_name)
                 if isinstance(val, str):
                     texts.append(val)
+                elif val is not None:
+                    _gather(val)
         for attr_name in ("content", "contents"):
             if hasattr(obj, attr_name):
                 _gather(getattr(obj, attr_name))
@@ -349,17 +359,13 @@ def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
         if combined:
             return combined
 
-    for attr in ("model_dump", "dict", "to_dict"):
-        if hasattr(resp, attr):
-            try:
-                data = getattr(resp, attr)()
-            except Exception:
-                continue
-            _gather(data)
-            if texts:
-                combined = "".join(texts).strip()
-                if combined:
-                    return combined
+    dumped = _object_to_builtins(resp)
+    if dumped is not None:
+        _gather(dumped)
+        if texts:
+            combined = "".join(texts).strip()
+            if combined:
+                return combined
     return None
 
 
@@ -392,11 +398,15 @@ def _content_to_text(content: Any) -> Optional[str]:
                     stripped = text_val.strip()
                     if stripped:
                         texts.append(stripped)
+            elif text_val is not None:
+                _gather(text_val)
             value_val = obj.get("value")
             if isinstance(value_val, str):
                 stripped = value_val.strip()
                 if stripped:
                     texts.append(stripped)
+            elif value_val is not None:
+                _gather(value_val)
             for key in (
                 "content",
                 "contents",
@@ -412,6 +422,7 @@ def _content_to_text(content: Any) -> Optional[str]:
                 "result",
                 "response",
                 "segments",
+                "tool_calls",
             ):
                 if key in obj:
                     _gather(obj[key])
@@ -429,6 +440,7 @@ def _content_to_text(content: Any) -> Optional[str]:
             "outputs",
             "result",
             "response",
+            "tool_calls",
         ):
             if hasattr(obj, attr):
                 try:
@@ -441,6 +453,48 @@ def _content_to_text(content: Any) -> Optional[str]:
         return None
     combined = "".join(texts).strip()
     return combined or None
+
+
+def _object_to_builtins(obj: Any) -> Optional[Any]:
+    if obj is None:
+        return None
+    model_dump = getattr(obj, "model_dump", None)
+    if callable(model_dump):
+        for kwargs in ({}, {"exclude_none": True}):
+            try:
+                return model_dump(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                break
+    for name in ("model_dump_json", "dict", "to_dict"):
+        method = getattr(obj, name, None)
+        if not callable(method):
+            continue
+        if name == "dict" and callable(model_dump):
+            continue
+        try:
+            data = method()
+            if name == "model_dump_json" and isinstance(data, str):
+                try:
+                    return json.loads(data)
+                except Exception:
+                    continue
+            return data
+        except TypeError:
+            try:
+                data = method(exclude_none=True)
+            except Exception:
+                continue
+            if name == "model_dump_json" and isinstance(data, str):
+                try:
+                    return json.loads(data)
+                except Exception:
+                    continue
+            return data
+        except Exception:
+            continue
+    return None
 
 
 def _extract_text_from_chat_choice(choice: Any) -> Optional[str]:
@@ -606,15 +660,24 @@ def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: i
         if fallback:
             return fallback, "chat.completions"
 
-        for attr in ("model_dump", "dict", "to_dict"):
-            if hasattr(resp, attr):
-                try:
-                    data = getattr(resp, attr)()
-                except Exception:
-                    continue
-                fallback = _content_to_text(data)
-                if fallback:
-                    return fallback, "chat.completions"
+        dumped = _object_to_builtins(resp)
+        if dumped is not None:
+            fallback = _content_to_text(dumped)
+            if fallback:
+                return fallback, "chat.completions"
+
+        debug_payload = dumped if dumped is not None else resp
+        try:
+            if isinstance(debug_payload, (dict, list)):
+                serialized = json.dumps(debug_payload, ensure_ascii=False)
+            else:
+                serialized = str(debug_payload)
+        except Exception:
+            serialized = repr(debug_payload)
+        admin_debug_log(
+            "LLM[chat.completions] Не удалось извлечь текст. Сырой ответ: "
+            f"{trim(serialized, 800)}"
+        )
         raise RuntimeError("Пустой ответ от chat.completions")
 
     if last_exc is not None:
