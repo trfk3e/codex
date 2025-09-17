@@ -9,6 +9,7 @@ DOCX Validator Telegram Bot — Articles & EEAT (Zoho Writer API)
 # ===============  НАСТРОЙКА (ОБЯЗАТЕЛЬНО)  ===============
 # =========================================================
 import os  # <— важно: os должен быть раньше использования
+import copy
 
 # 1) Токен телеграм‑бота
 BOT_TOKEN = "7506878864:AAEsjLOa0yT-WfB-4AKhrhFA3xopuJzaHPY"
@@ -358,6 +359,71 @@ def _messages_preview(messages: List[Dict[str, Any]], limit: int = 600) -> str:
     joined = " | ".join(parts)
     return clip(joined, limit)
 
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, list):
+        texts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                txt = str(part.get("text") or "")
+            else:
+                txt = str(part)
+            if txt:
+                texts.append(txt.strip())
+        text = " ".join(texts)
+    else:
+        text = str(content or "")
+    return clip(text.strip(), 600)
+
+
+def _format_messages_for_log(messages: List[Dict[str, Any]], max_len: int = 1600) -> str:
+    lines: List[str] = []
+    total = 0
+    for msg in messages or []:
+        role = str(msg.get("role") or "?")
+        text = _message_content_to_text(msg.get("content"))
+        if not text:
+            text = "(пусто)"
+        line = f"{role}: {text}"
+        lines.append(line)
+        total += len(line) + 1
+        if total > max_len:
+            lines.append("…(обрезано)")
+            break
+    return "\n".join(lines)
+
+
+def _format_exception(ex: BaseException) -> str:
+    name = type(ex).__name__
+    return f"{name}: {ex}"
+
+
+def _log_llm_chat(label: str,
+                  key_masked: str,
+                  round_idx: int,
+                  attempt_idx: int,
+                  messages: List[Dict[str, Any]],
+                  response_text: Optional[str] = None,
+                  error: Optional[BaseException] = None,
+                  method: Optional[str] = None) -> None:
+    header = [f"LLM[{label}] (ключ {key_masked}, попытка {attempt_idx}, раунд {round_idx}"]
+    if method:
+        header.append(f", метод {method}")
+    header.append(")")
+    prompt_text = _format_messages_for_log(messages)
+    if error is None:
+        resp = trim(response_text or "", 600)
+        if not resp:
+            resp = "(пустой ответ)"
+        admin_debug_log(
+            "".join(header) + f"\nЗапрос:\n{prompt_text}\nОтвет:\n{resp}"
+        )
+    else:
+        err_txt = trim(_format_exception(error), 400)
+        admin_debug_log(
+            "".join(header) + f"\nЗапрос:\n{prompt_text}\nОтвет:\nОшибка: {err_txt}\nПочему так?"
+        )
+
 def _responses_input_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     formatted: List[Dict[str, Any]] = []
     for msg in messages or []:
@@ -682,9 +748,6 @@ def _call_openai_with_keys(messages: List[Dict],
                            temperature: float = 0.0,
                            purpose: str = "") -> str:
     label = purpose or "general"
-    prompt_preview = _messages_preview(messages, limit=500)
-    if prompt_preview:
-        admin_debug_log(f"LLM[{label}] Prompt: {prompt_preview}")
 
     keys = db_list_keys()
     env_sk = os.environ.get("OPENAI_API_KEY")
@@ -692,41 +755,59 @@ def _call_openai_with_keys(messages: List[Dict],
         keys.append(env_sk)
 
     if not keys:
-        admin_debug_log(f"LLM[{label}] Нет доступных ключей.")
+        admin_debug_log(
+            f"LLM[{label}] (без ключей)\nЗапрос:\n(нет доступных ключей)\n"
+            "Ответ:\nОшибка: Нет ни одного OpenAI API Key\nПочему так?"
+        )
         raise KeysExhaustedError("Нет ни одного OpenAI API Key")
 
     last_exc = None
     for round_idx in (1, 2):
         for sk in keys:
+            key_masked = mask_secret(sk, 8, 6)
             try:
                 client = _openai_client_for_key(sk)
-                local_exc = None
-                key_masked = mask_secret(sk, 8, 6)
-                for attempt in range(LLM_MAX_RETRIES_LOCAL + 1):
-                    try:
-                        admin_debug_log(
-                            f"LLM[{label}] Ключ {key_masked}: попытка {attempt + 1} (раунд {round_idx})"
-                        )
-                        answer, method = _invoke_openai(client, messages, max_tokens, temperature)
-                        if isinstance(answer, str) and answer.strip():
-                            text = answer.strip()
-                            admin_debug_log(
-                                f"LLM[{label}] Ключ {key_masked}: успех через {method}, ответ: {trim(text, 500)}"
-                            )
-                            return text
-                        raise RuntimeError("Пустой ответ модели OpenAI")
-                    except Exception as ex:
-                        local_exc = ex
-                        admin_debug_log(
-                            f"LLM[{label}] Ключ {key_masked}: ошибка попытки {attempt + 1}: {ex}"
-                        )
-                        time.sleep(0.2 * (attempt + 1))
-                last_exc = local_exc
             except Exception as ex:
                 last_exc = ex
-                admin_debug_log(f"LLM[{label}] Ошибка при использовании ключа {key_masked}: {ex}")
+                admin_debug_log(f"LLM[{label}] Ошибка при инициализации ключа {key_masked}: {ex}")
                 continue
-    admin_debug_log(f"LLM[{label}] Ключи исчерпаны: {last_exc}")
+
+            local_exc: Optional[Exception] = None
+            for attempt in range(LLM_MAX_RETRIES_LOCAL + 1):
+                payload = copy.deepcopy(messages or [])
+                try:
+                    answer, method = _invoke_openai(client, payload, max_tokens, temperature)
+                    if isinstance(answer, str) and answer.strip():
+                        text = answer.strip()
+                        _log_llm_chat(
+                            label=label,
+                            key_masked=key_masked,
+                            round_idx=round_idx,
+                            attempt_idx=attempt + 1,
+                            messages=payload,
+                            response_text=text,
+                            method=method,
+                        )
+                        return text
+                    raise RuntimeError("Пустой ответ модели OpenAI")
+                except Exception as ex:
+                    local_exc = ex
+                    _log_llm_chat(
+                        label=label,
+                        key_masked=key_masked,
+                        round_idx=round_idx,
+                        attempt_idx=attempt + 1,
+                        messages=payload,
+                        error=ex,
+                    )
+                    time.sleep(0.2 * (attempt + 1))
+
+            last_exc = local_exc
+    err_text = trim(_format_exception(last_exc) if last_exc else "Неизвестная ошибка", 400)
+    admin_debug_log(
+        f"LLM[{label}] (исчерпаны ключи)\nЗапрос:\n(повторяющийся запрос)\n"
+        f"Ответ:\nОшибка: {err_text}\nПочему так?"
+    )
     raise KeysExhaustedError(f"Не удалось получить ответ от модели: {last_exc}")
 
 def _normalize_yesno(s: str) -> Optional[str]:
@@ -742,19 +823,54 @@ def _normalize_yesno(s: str) -> Optional[str]:
     if t.startswith("нет"): return "Нет"
     return None
 
+
+def _split_yesno_details(text: str) -> Tuple[Optional[str], str]:
+    if text is None:
+        return None, ""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, ""
+    m = re.match(r'^(да|нет)\b', stripped, flags=re.I)
+    if not m:
+        return None, stripped
+    answer = "Да" if m.group(1).lower().startswith("да") else "Нет"
+    remainder = stripped[m.end():]
+    remainder = re.sub(r'^[\s\.:;,\-–—]+', '', remainder)
+    return answer, remainder.strip()
+
+
+def _parse_yesno_list(raw: str) -> Tuple[Optional[str], List[str]]:
+    answer, remainder = _split_yesno_details(raw)
+    if answer == "Нет":
+        return answer, []
+    text = remainder if remainder else ((raw or "").strip())
+    if not text:
+        return answer, []
+    tokens = [t.strip() for t in re.split(r"[|,\n]+", text) if t and t.strip()]
+    cleaned: List[str] = []
+    seen: set = set()
+    for token in tokens:
+        if token not in seen:
+            cleaned.append(token)
+            seen.add(token)
+    return answer, cleaned
+
+
 def llm_yesno(question: str, purpose: str) -> str:
-    messages = [
+    base_messages = [
         {"role": "system",
          "content": "Ты аккуратный русскоязычный ассистент контроля качества. "
                     "Отвечай ТОЛЬКО одним словом: «Да» или «Нет». Никаких комментариев."},
         {"role": "user", "content": question}
     ]
-    raw = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0, purpose=purpose)
+    raw = _call_openai_with_keys(messages=base_messages, max_tokens=4, temperature=0.0, purpose=purpose)
     yn = _normalize_yesno(raw)
     if yn in ("Да", "Нет"):
         return yn
-    messages.append({"role": "user", "content": "Напомню: нужно одно слово — «Да» или «Нет»."})
-    raw2 = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0, purpose=f"{purpose} (retry)")
+    reminder_messages = base_messages + [
+        {"role": "user", "content": "Напомню: нужно одно слово — «Да» или «Нет»."}
+    ]
+    raw2 = _call_openai_with_keys(messages=reminder_messages, max_tokens=4, temperature=0.0, purpose=f"{purpose} (retry)")
     yn2 = _normalize_yesno(raw2)
     if yn2 in ("Да", "Нет"):
         return yn2
@@ -1247,8 +1363,9 @@ def build_article_list_problem_headings_prompt(headings: List[str], body: str) -
         "Сравни каждый заголовок из <HEADINGS> с языком <TEXT>. "
         "Если заголовок совпадает по языку — пропусти. "
         "Если нет — укажи точную проблему.\n"
-        "Строгий формат для каждой строки: 'проблемный заголовок' - краткое пояснение что не так и конкретно нужно определить язык <TEXT>. "
-        "Если ошибок нет — выведи «—». Главное не ошибайся, думай столько сколько нужно.\n"
+        "Начни ответ с «Да», если найдены ошибки, иначе ответь ровно «Нет».\n"
+        "Если ответ «Да», на следующих строках перечисли проблемные заголовки.\n"
+        "Каждый оформляй так: 'проблемный заголовок' — краткое пояснение.\n"
         f"\n<HEADINGS>\n{htxt or '—'}\n</HEADINGS>"
         f"\n\n<TEXT>\n{body}\n</TEXT>"
     )
@@ -1306,8 +1423,8 @@ def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, conte
     content_block = clip((content or "").strip() or "—", EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
-        "Если найдёшь несоответствие языков, перечисли ТОЛЬКО ярлыки из набора MT | MD | MK | H1, разделяя их через « | ». "
-        "Если всё совпадает — выведи «—». Никаких пояснений.\n"
+        "Если найдёшь несоответствие языков — ответь «Да», иначе ответь ровно «Нет».\n"
+        "Если ответ «Да», перечисли ТОЛЬКО ярлыки из набора MT | MD | MK | H1, разделяя их через « | ». Никаких пояснений.\n"
         "Анализируй исключительно данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык этих инструкций."
         "\nПомни: бренды, домены и одиночные заимствованные слова не считаются сменой языка; оценивай основную часть текста.\n"
         f"\n<META>\n{meta_block}\n</META>"
@@ -1328,19 +1445,24 @@ def build_promo_extract_prompt(full_text: str) -> str:
     return (
         "Выпиши из текста только настоящие ПРОМОКОДЫ (заглавные буквенно-цифровые шаблоны). "
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы "
-        "измерения («MB», «GB», «TB» и т.п.). Каждый код пиши отдельно, через « | » в "
-        "одной строке. Если промокодов нет — выведи «—».\n\n" + full_text
+        "измерения («MB», «GB», «TB» и т.п.). Если промокоды найдены, начни ответ с «Да» и на той же строке "
+        "после двоеточия перечисли их через « | ». Если промокодов нет — ответь ровно «Нет».\n\n" + full_text
     )
 
 def filter_promo_codes(raw: str) -> List[str]:
     if not raw:
         return []
-    parts = re.split(r"[|,\n]+", raw)
+    answer, tokens = _parse_yesno_list(raw)
+    if answer == "Нет":
+        return []
+    parts = tokens
+    if not parts:
+        return []
     cleaned: List[str] = []
     seen: set = set()
     for part in parts:
         token = part.strip()
-        if not token or token in ("—", "-"):
+        if not token:
             continue
         norm = re.sub(r"[^0-9A-Z]", "", token.upper())
         if not norm:
@@ -1578,15 +1700,17 @@ def validate_text_article(doc: Document) -> List[str]:
             yn = llm_yesno(prompt, purpose="Headings vs Text language (article)")
             if yn == "Нет" or script_mismatch_found:
                 prompt2 = build_article_list_problem_headings_prompt(heading_texts, body_join)
-                bad = llm_text(prompt2, purpose="List problem headings", max_tokens=256)
-                bad = re.sub(r'\s*\|\s*', ' | ', bad.strip())
-                if bad in ("—", "-", ""):
+                bad_raw = llm_text(prompt2, purpose="List problem headings", max_tokens=256)
+                bad_raw = bad_raw.strip()
+                yn_bad, bad_details = _split_yesno_details(bad_raw)
+                bad_details = re.sub(r'\s*\|\s*', ' | ', (bad_details or "").strip())
+                if yn_bad == "Нет" or not bad_details:
                     if not script_mismatch_found:
                         errors.append("Язык: заголовки не совпадают с языком основного текста.")
                 else:
                     errors.append(
                         "Язык: заголовки не совпадают с языком основного текста. "
-                        f"(Проблемные заголовки: {bad}.)"
+                        f"(Проблемные заголовки: {bad_details}.)"
                     )
     except KeysExhaustedError:
         raise
@@ -1724,15 +1848,15 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
             yn = llm_yesno(prompt, purpose=f"EEAT section language match #{idx}")
             if yn == "Нет":
                 prompt2 = build_section_lang_list_bad_prompt(mt, md, mk, h1, content_texts)
-                bad = llm_text(prompt2, purpose="EEAT list bad items", max_tokens=64).strip()
-                bad = re.sub(r'\s*\|\s*', ' | ', bad)
-                tokens = [t.strip() for t in bad.split('|') if t.strip()]
-                tokens = [t for t in tokens if t not in ("—", "-")]
-                tokens = [t for t in tokens if t.upper() not in EEAT_LANGUAGE_IGNORE_CODES]
-                if tokens:
+                bad_raw = llm_text(prompt2, purpose="EEAT list bad items", max_tokens=64).strip()
+                ans_bad, tokens = _parse_yesno_list(bad_raw)
+                filtered = [t for t in tokens if t.upper() not in EEAT_LANGUAGE_IGNORE_CODES]
+                if ans_bad == "Да" and not filtered:
+                    se.append("Язык заголовков/меты не совпадает с языком текста секции.")
+                elif filtered:
                     se.append(
                         "Язык заголовков/меты не совпадает с языком текста секции. "
-                        f"(Проблемные элементы: {' | '.join(tokens)}.)"
+                        f"(Проблемные элементы: {' | '.join(filtered)}.)"
                     )
         except KeysExhaustedError:
             raise
