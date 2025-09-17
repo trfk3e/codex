@@ -10,6 +10,7 @@ DOCX Validator Telegram Bot — Articles & EEAT (Zoho Writer API)
 # =========================================================
 import os  # <— важно: os должен быть раньше использования
 import copy
+import signal
 
 # 1) Токен телеграм‑бота
 BOT_TOKEN = "7506878864:AAEsjLOa0yT-WfB-4AKhrhFA3xopuJzaHPY"
@@ -2993,9 +2994,71 @@ async def main():
 
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TELEGRAM_BOT_TOKEN":
         raise RuntimeError("Не задан BOT_TOKEN (см. начало файла).")
-    bot = Bot(BOT_TOKEN, parse_mode=None)
-    await setup_menu_commands(bot)
-    await dp.start_polling(bot)
+
+    bot: Optional[Bot] = None
+    try:
+        bot = Bot(BOT_TOKEN, parse_mode=None)
+        await setup_menu_commands(bot)
+
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+        shutdown_reason: Optional[str] = None
+
+        def _request_shutdown(sig: signal.Signals) -> None:
+            nonlocal shutdown_reason
+            if shutdown_reason:
+                return
+            shutdown_reason = sig.name
+            print(f"[{now_str()}] Получен сигнал {sig.name}, завершаем работу…", flush=True)
+            loop.call_soon_threadsafe(stop_event.set)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _request_shutdown, sig)
+            except NotImplementedError:
+                signal.signal(sig, lambda *_: _request_shutdown(sig))
+
+        async def _polling_wrapper() -> None:
+            try:
+                await dp.start_polling(bot)
+            finally:
+                if not stop_event.is_set():
+                    stop_event.set()
+
+        polling_task = asyncio.create_task(_polling_wrapper())
+        try:
+            await stop_event.wait()
+        finally:
+            if not polling_task.done():
+                with contextlib.suppress(Exception):
+                    stopper = getattr(dp, "stop_polling", None)
+                    if callable(stopper):
+                        result = stopper()
+                        if asyncio.iscoroutine(result):
+                            await result
+            if not polling_task.done():
+                polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                pass
+    finally:
+        with contextlib.suppress(Exception):
+            storage = getattr(dp, "storage", None)
+            if storage:
+                closer = getattr(storage, "close", None)
+                if callable(closer):
+                    result = closer()
+                    if asyncio.iscoroutine(result):
+                        await result
+                waiter = getattr(storage, "wait_closed", None)
+                if callable(waiter):
+                    result = waiter()
+                    if asyncio.iscoroutine(result):
+                        await result
+        if bot is not None:
+            with contextlib.suppress(Exception):
+                await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
