@@ -198,6 +198,54 @@ def db_clear_keys() -> int:
         conn.commit()
         return cur.rowcount
 
+def db_get_kv(key: str) -> Optional[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT v FROM kv WHERE k=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+def db_set_kv(key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("REPLACE INTO kv(k, v) VALUES(?, ?)", (key, value))
+        conn.commit()
+
+_ADMIN_DEBUG_LOCK = threading.Lock()
+_ADMIN_DEBUG_ENABLED: Optional[bool] = None
+_ADMIN_DEBUG_LOGS: List[str] = []
+
+def admin_debug_enabled() -> bool:
+    global _ADMIN_DEBUG_ENABLED
+    with _ADMIN_DEBUG_LOCK:
+        if _ADMIN_DEBUG_ENABLED is None:
+            db_init()
+            val = db_get_kv("admin_debug_log_enabled")
+            _ADMIN_DEBUG_ENABLED = (val == "1")
+        return bool(_ADMIN_DEBUG_ENABLED)
+
+def admin_debug_set(enabled: bool) -> None:
+    global _ADMIN_DEBUG_ENABLED
+    db_init()
+    with _ADMIN_DEBUG_LOCK:
+        _ADMIN_DEBUG_ENABLED = bool(enabled)
+        if not enabled:
+            _ADMIN_DEBUG_LOGS.clear()
+    db_set_kv("admin_debug_log_enabled", "1" if enabled else "0")
+
+def admin_debug_log(message: str) -> None:
+    if not admin_debug_enabled():
+        return
+    line = f"[{now_str()}] {message}"
+    with _ADMIN_DEBUG_LOCK:
+        _ADMIN_DEBUG_LOGS.append(line)
+        if len(_ADMIN_DEBUG_LOGS) > 200:
+            del _ADMIN_DEBUG_LOGS[:-200]
+
+def admin_debug_drain() -> List[str]:
+    with _ADMIN_DEBUG_LOCK:
+        logs = list(_ADMIN_DEBUG_LOGS)
+        _ADMIN_DEBUG_LOGS.clear()
+    return logs
+
 # =========================================================
 # ==============  OPENAI (карусель ключей)  ===============
 # =========================================================
@@ -215,6 +263,27 @@ def _httpx_client():
 
 def _openai_client_for_key(sk: str) -> OpenAI:
     return OpenAI(api_key=sk, http_client=_httpx_client())
+
+def _messages_preview(messages: List[Dict[str, Any]], limit: int = 600) -> str:
+    parts: List[str] = []
+    for msg in messages or []:
+        role = str(msg.get("role") or "?")
+        content = msg.get("content")
+        if isinstance(content, list):
+            texts: List[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    txt = str(part.get("text") or "")
+                else:
+                    txt = str(part)
+                if txt:
+                    texts.append(txt.strip())
+            text = " ".join(texts)
+        else:
+            text = str(content or "")
+        parts.append(f"{role}: {text.strip()}")
+    joined = " | ".join(parts)
+    return clip(joined, limit)
 
 def _responses_input_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     formatted: List[Dict[str, Any]] = []
@@ -293,7 +362,7 @@ def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
                     return combined
     return None
 
-def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> str:
+def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> Tuple[str, str]:
     last_exc: Optional[Exception] = None
     responses_api = getattr(client, "responses", None)
     if responses_api is not None:
@@ -306,7 +375,7 @@ def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: i
             )
             text = _extract_text_from_openai_response(resp)
             if text:
-                return text
+                return text, "responses"
             raise RuntimeError("Пустой ответ от Responses API")
         except Exception as ex:
             last_exc = ex
@@ -333,20 +402,28 @@ def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: i
                 if content is None:
                     content = getattr(msg0, "text", None)
             if isinstance(content, str) and content.strip():
-                return content.strip()
+                return content.strip(), "chat.completions"
         raise RuntimeError("Пустой ответ от chat.completions")
 
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("У клиента OpenAI нет поддерживаемых методов Responses/chat")
 
-def _call_openai_with_keys(messages: List[Dict], max_tokens: int = 64, temperature: float = 0.0) -> str:
+def _call_openai_with_keys(messages: List[Dict],
+                           max_tokens: int = 64,
+                           temperature: float = 0.0,
+                           purpose: str = "") -> str:
+    label = purpose or "general"
+    prompt_preview = _messages_preview(messages, limit=500)
+    if prompt_preview:
+        admin_debug_log(f"LLM[{label}] Prompt: {prompt_preview}")
     keys = db_list_keys()
     env_sk = os.environ.get("OPENAI_API_KEY")
     if env_sk and env_sk not in keys:
         keys.append(env_sk)
 
     if not keys:
+        admin_debug_log(f"LLM[{label}] Нет доступных ключей.")
         raise KeysExhaustedError("Нет ни одного OpenAI API Key")
 
     last_exc = None
@@ -355,19 +432,32 @@ def _call_openai_with_keys(messages: List[Dict], max_tokens: int = 64, temperatu
             try:
                 client = _openai_client_for_key(sk)
                 local_exc = None
+                key_masked = mask_secret(sk, 8, 6)
                 for attempt in range(LLM_MAX_RETRIES_LOCAL + 1):
                     try:
-                        answer = _invoke_openai(client, messages, max_tokens, temperature)
+                        admin_debug_log(
+                            f"LLM[{label}] Ключ {key_masked}: попытка {attempt + 1} (раунд {round_idx})"
+                        )
+                        answer, method = _invoke_openai(client, messages, max_tokens, temperature)
                         if isinstance(answer, str) and answer.strip():
-                            return answer.strip()
+                            text = answer.strip()
+                            admin_debug_log(
+                                f"LLM[{label}] Ключ {key_masked}: успех через {method}, ответ: {trim(text, 500)}"
+                            )
+                            return text
                         raise RuntimeError("Пустой ответ модели OpenAI")
                     except Exception as ex:
                         local_exc = ex
+                        admin_debug_log(
+                            f"LLM[{label}] Ключ {key_masked}: ошибка попытки {attempt + 1}: {ex}"
+                        )
                         time.sleep(0.2 * (attempt + 1))
                 last_exc = local_exc
             except Exception as ex:
                 last_exc = ex
+                admin_debug_log(f"LLM[{label}] Ошибка при использовании ключа {key_masked}: {ex}")
                 continue
+    admin_debug_log(f"LLM[{label}] Ключи исчерпаны: {last_exc}")
     raise KeysExhaustedError(f"Не удалось получить ответ от модели: {last_exc}")
 
 def _normalize_yesno(s: str) -> Optional[str]:
@@ -390,12 +480,12 @@ def llm_yesno(question: str, purpose: str) -> str:
                     "Отвечай ТОЛЬКО одним словом: «Да» или «Нет». Никаких комментариев."},
         {"role": "user", "content": question}
     ]
-    raw = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0)
+    raw = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0, purpose=purpose)
     yn = _normalize_yesno(raw)
     if yn in ("Да", "Нет"):
         return yn
     messages.append({"role": "user", "content": "Напомню: нужно одно слово — «Да» или «Нет»."})
-    raw2 = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0)
+    raw2 = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0, purpose=f"{purpose} (retry)")
     yn2 = _normalize_yesno(raw2)
     if yn2 in ("Да", "Нет"):
         return yn2
@@ -407,7 +497,7 @@ def llm_text(question: str, purpose: str, max_tokens: int = 256) -> str:
          "content": "Ты краткий русскоязычный ассистент. Пиши только то, что просят, без лишних слов."},
         {"role": "user", "content": question}
     ]
-    return _call_openai_with_keys(messages=messages, max_tokens=max_tokens, temperature=0.0)
+    return _call_openai_with_keys(messages=messages, max_tokens=max_tokens, temperature=0.0, purpose=purpose)
 
 # =========================================================
 # ================= DOCX без KeyError (patch) =============
@@ -1819,6 +1909,29 @@ _PENDING_KEYS: Dict[int, bool] = {}
 def is_admin(uid: Optional[int]) -> bool:
     return int(uid or 0) == int(ADMIN_TG_ID)
 
+async def maybe_send_admin_debug_logs(message: Message, heading: str = "🛠 Лог LLM") -> None:
+    if not is_admin(getattr(message.from_user, "id", None)):
+        return
+    if not admin_debug_enabled():
+        return
+    logs = admin_debug_drain()
+    if not logs:
+        return
+    max_len = 3500
+    chunk: List[str] = []
+    current_len = 0
+    title = heading
+    for line in logs:
+        if current_len + len(line) + 1 > max_len and chunk:
+            await message.answer(f"{title}:\n" + "\n".join(chunk))
+            chunk = []
+            current_len = 0
+            title = "🛠 Лог LLM (продолжение)"
+        chunk.append(line)
+        current_len += len(line) + 1
+    if chunk:
+        await message.answer(f"{title}:\n" + "\n".join(chunk))
+
 async def setup_menu_commands(bot: Bot, chat_id: Optional[int] = None):
     await bot.set_my_commands(
         commands=[
@@ -1836,6 +1949,7 @@ async def setup_menu_commands(bot: Bot, chat_id: Optional[int] = None):
                     BotCommand(command="keys_add", description="Добавить OpenAI ключи"),
                     BotCommand(command="keys_list", description="Список ключей"),
                     BotCommand(command="keys_clear", description="Удалить все ключи"),
+                    BotCommand(command="logs_toggle", description="Вкл/выкл лог LLM"),
                 ],
                 scope=BotCommandScopeChat(chat_id=ADMIN_TG_ID)
             )
@@ -1952,56 +2066,79 @@ async def on_keys_clear(message: Message):
     n = db_clear_keys()
     await message.answer(f"Удалено ключей: {n}")
 
+@dp.message(Command("logs_toggle"))
+async def on_logs_toggle(message: Message):
+    if not is_admin(getattr(message.from_user, "id", None)):
+        await message.answer("⛔️ Недостаточно прав.")
+        return
+    db_init()
+    current = admin_debug_enabled()
+    admin_debug_set(not current)
+    if current:
+        await message.answer(
+            "Лог LLM выключен. Новые ответы OpenAI не будут отправляться до повторного включения."
+        )
+    else:
+        await message.answer(
+            "Лог LLM включен. После каждой проверки будут приходить ответы и ошибки OpenAI."
+        )
+
 @dp.message(F.text)
 async def on_text(message: Message):
     db_init()
-
-    if _PENDING_KEYS.get(message.chat.id) and is_admin(getattr(message.from_user, "id", None)):
-        added = db_add_keys_bulk(message.text or "")
-        _PENDING_KEYS.pop(message.chat.id, None)
-        await message.answer(f"✅ Добавлено ключей: {added}.")
-        return
-
-    raw = message.text or ""
-    articles, eeat_link, parse_errors = parse_lines_to_pairs(raw)
-    if parse_errors and not articles and not eeat_link:
-        await message.answer("Не удалось распознать ни одной строки:\n• " + "\n• ".join(parse_errors))
-        return
-
-    keys = db_list_keys()
-    if not keys and not os.environ.get("OPENAI_API_KEY"):
-        if is_admin(getattr(message.from_user, "id", None)):
-            await message.answer("Бот не настроен: нет ключей OpenAI. Добавьте через /keys_add.")
-        else:
-            await message.answer("Бот временно не настроен. Сообщите администратору.")
-        return
+    admin_user = is_admin(getattr(message.from_user, "id", None))
 
     try:
-        overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
-            "Project", articles, eeat_link
-        )
-        final_msg = build_single_message("Project", per_item_logs, overall_ok)
+        if _PENDING_KEYS.get(message.chat.id) and admin_user:
+            added = db_add_keys_bulk(message.text or "")
+            _PENDING_KEYS.pop(message.chat.id, None)
+            await message.answer(f"✅ Добавлено ключей: {added}.")
+            return
 
-        if overall_ok and zip_path and os.path.exists(zip_path):
-            try:
-                await message.bot.send_document(
-                    chat_id=message.chat.id,
-                    document=FSInputFile(zip_path, filename="docs.zip"),
-                    caption=final_msg
-                )
-            finally:
-                with contextlib.suppress(Exception):
-                    os.remove(zip_path)
-        else:
-            await message.bot.send_message(
-                chat_id=message.chat.id,
-                text=final_msg,
-                disable_web_page_preview=True
+        raw = message.text or ""
+        articles, eeat_link, parse_errors = parse_lines_to_pairs(raw)
+        if parse_errors and not articles and not eeat_link:
+            await message.answer("Не удалось распознать ни одной строки:\n• " + "\n• ".join(parse_errors))
+            return
+
+        keys = db_list_keys()
+        if not keys and not os.environ.get("OPENAI_API_KEY"):
+            if admin_user:
+                await message.answer("Бот не настроен: нет ключей OpenAI. Добавьте через /keys_add.")
+            else:
+                await message.answer("Бот временно не настроен. Сообщите администратору.")
+            return
+
+        try:
+            overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
+                "Project", articles, eeat_link
             )
-    except KeysExhaustedError:
-        await message.answer("Закончились ключи, пишите @locosd")
-    except Exception as ex:
-        await message.answer(f"🛑 Внутренняя ошибка: {ex}")
+            final_msg = build_single_message("Project", per_item_logs, overall_ok)
+
+            if overall_ok and zip_path and os.path.exists(zip_path):
+                try:
+                    await message.bot.send_document(
+                        chat_id=message.chat.id,
+                        document=FSInputFile(zip_path, filename="docs.zip"),
+                        caption=final_msg
+                    )
+                finally:
+                    with contextlib.suppress(Exception):
+                        os.remove(zip_path)
+            else:
+                await message.bot.send_message(
+                    chat_id=message.chat.id,
+                    text=final_msg,
+                    disable_web_page_preview=True
+                )
+        except KeysExhaustedError as ex:
+            await message.answer("Закончились ключи, пишите @locosd")
+            if admin_user:
+                await message.answer(f"🛠 Детали: {ex}")
+        except Exception as ex:
+            await message.answer(f"🛑 Внутренняя ошибка: {ex}")
+    finally:
+        await maybe_send_admin_debug_logs(message)
 
 async def main():
     try:
