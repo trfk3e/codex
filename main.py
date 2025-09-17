@@ -1874,12 +1874,15 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
     try:
         sections_for_prompt: List[Tuple[Optional[int], str, List[str]]] = []
         for sec in article_sections:
-            heading_text = sec.get("heading") or ""
+            heading_raw = sec.get("heading") or ""
+            heading_clean = strip_invisible(heading_raw).strip()
             level = sec.get("level")
             body_lines = [ln for ln in (sec.get("body") or []) if (ln or "").strip()]
-            if not heading_text and not body_lines:
+            if not heading_clean and not body_lines:
                 continue
-            sections_for_prompt.append((level, heading_text, body_lines))
+            if not heading_clean:
+                continue
+            sections_for_prompt.append((level, heading_raw, body_lines))
         heading_pairs = [(lvl, txt) for (lvl, txt) in headings if (txt or "").strip()]
         body_blocks = [t for t in body_texts if (t or "").strip()]
         body_sample_lines = _prepare_text_lines_for_prompt(body_blocks)
