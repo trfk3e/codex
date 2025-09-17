@@ -44,6 +44,7 @@ PROMO_IGNORE_CODES = {
     "MT", "MD", "MK", "MB", "H1", "H2", "H3", "H4",
     "CTA", "FAQ", "SEO", "URL", "WWW", "HTTP", "HTTPS",
 }
+EEAT_LANGUAGE_IGNORE_CODES = {"MK", "MT"}
 VALIDATOR_CONCURRENCY  = int(os.environ.get("VALIDATOR_CONCURRENCY", "8"))
 
 # --- Новые параметры (Zoho OAuth: кеш и задержки) ---
@@ -1212,46 +1213,42 @@ def build_slug_consistency_prompt(slug: str, mt: str, md: str, mk: str, h1: str,
         body.append(content)
     return "\n".join(body)
 
+def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
+    lines = ["MT: " + ((mt or "").strip() or "—"),
+             "MD: " + ((md or "").strip() or "—"),
+             "MK: " + ((mk or "").strip() or "—"),
+             "H1: " + ((h1 or "").strip() or "—")]
+    return "\n".join(lines)
+
+
 def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: str) -> str:
-    content = clip((content or ""), EEAT_PROMPT_MAX_CHARS)
-    msg = []
-    msg.append(
-        "Ты — строгий валидатор совпадения языка (диактритику не учитываем)."
-        "Есть четыре элемента (MT, MD, MK, H1) и основной текст секции. "
-        "Сначала мысленно определи ДОМИНИРУЮЩИЙ ЯЗЫК секции по грамматике/морфологии и частотной лексике. "
-        "ОЧЕНЬ ВАЖНО: полностью игнорируй диакритику (например, á=а, ó=о, ü=u и т.д.), "
-        "то есть при проверке языка все символы считаются без акцентов. "
-        "Также игнорируй бренды, имена собственные, домены/URL, аббревиатуры, числа/валюты и отдельные заимствованные слова."
-        "\nПравила:\n"
-        "• Считай язык секции определённым по грамматике/служебным словам.\n"
-        "• Элемент совпадает, если он на том же языке (без учёта диакритики).\n"
-        "• Отвечай «Нет» только если элемент явно на другом языке.\n"
-        "• В сомнительных случаях отвечай «Да».\n"
-        "Ответ строго одним словом: «Да» или «Нет»."
+    content_block = clip((content or "").strip() or "—", EEAT_PROMPT_MAX_CHARS)
+    meta_block = _format_meta_block(mt, md, mk, h1)
+    return (
+        "Ты — строгий валидатор совпадения языка между мета-полями и текстом секции. "
+        "Проанализируй ТОЛЬКО данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык инструкций.\n"
+        "\nПоследовательность:"
+        "\n1) Определи доминирующий язык секции по грамматике, служебным словам и фразам."
+        "\n2) Полностью игнорируй диакритику (á=а, ü=u и т.д.), бренды, домены/URL, числа, валюты и одиночные заимствованные слова."
+        "\n3) MT, MD и MK могут содержать бренды и короткие вставки на другом языке — считай их совпадающими, если основная часть соответствует языку текста."
+        "\n4) Ответь строго одним словом: «Да» (языки совпадают) или «Нет» (есть явное несоответствие)."
+        "\n5) В спорных ситуациях выбирай «Да».\n"
+        f"\n<META>\n{meta_block}\n</META>"
+        f"\n\n<CONTENT>\n{content_block}\n</CONTENT>"
     )
-    msg.append("")
-    if mt: msg.append(f"MT: {mt}")
-    if md: msg.append(f"MD: {md}")
-    if mk: msg.append(f"MK: {mk}")
-    if h1: msg.append(f"H1: {h1}")
-    msg.append("")
-    msg.append("Текст секции:")
-    msg.append(content)
-    return "\n".join(msg)
+
 
 def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, content: str) -> str:
-    content = clip((content or ""), EEAT_PROMPT_MAX_CHARS)
-    msg = []
-    msg.append("Если языки НЕ совпадают, выпиши какие элементы не совпадают, строго из набора: MT | MD | MK | H1.")
-    msg.append("Выведи только эти ярлыки через « | » в ОДНУ строку. Если всё ок — напиши «—».")
-    if mt: msg.append(f"MT: {mt}")
-    if md: msg.append(f"MD: {md}")
-    if mk: msg.append(f"MK: {mk}")
-    if h1: msg.append(f"H1: {h1}")
-    msg.append("")
-    msg.append("Текст секции:")
-    msg.append(content)
-    return "\n".join(msg)
+    content_block = clip((content or "").strip() or "—", EEAT_PROMPT_MAX_CHARS)
+    meta_block = _format_meta_block(mt, md, mk, h1)
+    return (
+        "Если найдёшь несоответствие языков, перечисли ТОЛЬКО ярлыки из набора MT | MD | MK | H1, разделяя их через « | ». "
+        "Если всё совпадает — выведи «—». Никаких пояснений.\n"
+        "Анализируй исключительно данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык этих инструкций."
+        "\nПомни: бренды, домены и одиночные заимствованные слова не считаются сменой языка; оценивай основную часть текста.\n"
+        f"\n<META>\n{meta_block}\n</META>"
+        f"\n\n<CONTENT>\n{content_block}\n</CONTENT>"
+    )
 
 def build_promo_scan_prompt(full_text: str) -> str:
     full_text = clip(clean_for_prompt(full_text), PROMO_MAX_CHARS)
@@ -1633,7 +1630,7 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
                 bad = re.sub(r'\s*\|\s*', ' | ', bad)
                 tokens = [t.strip() for t in bad.split('|') if t.strip()]
                 tokens = [t for t in tokens if t not in ("—", "-")]
-                tokens = [t for t in tokens if t.upper() != "MK"]
+                tokens = [t for t in tokens if t.upper() not in EEAT_LANGUAGE_IGNORE_CODES]
                 if tokens:
                     se.append(
                         "Язык заголовков/меты не совпадает с языком текста секции. "
