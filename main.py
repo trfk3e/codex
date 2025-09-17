@@ -1418,28 +1418,64 @@ def _prepare_text_lines_for_prompt(text: Union[str, Sequence[str], None]) -> Lis
             if chunk is None:
                 continue
             candidates.append(str(chunk))
+
     lines: List[str] = []
     for chunk in candidates:
-        for line in re.split(r'(?:\r?\n)+', chunk):
-            cleaned = clean_for_prompt(line)
+        normalized = strip_invisible(chunk or "")
+        if not normalized:
+            continue
+        normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+        chunk_lines = []
+        for raw_line in normalized.split("\n"):
+            cleaned = raw_line.strip()
             if cleaned:
-                lines.append(cleaned)
+                chunk_lines.append(cleaned)
+        if not chunk_lines:
+            continue
+        if lines:
+            lines.append("")
+        lines.extend(chunk_lines)
     return lines
 
 
 def _format_text_for_prompt(
     text: Union[str, Sequence[str], None],
-    prefix: str = "Текст:",
+    prefix: str = "Text",
     max_chars: Optional[int] = None,
 ) -> str:
     lines = _prepare_text_lines_for_prompt(text)
     if not lines:
-        body = "—"
-    else:
-        body = "\n".join(lines)
-        if max_chars is not None:
-            body = clip(body, max_chars)
-    return f"{prefix}\n{body}"
+        return f"{prefix}:\n—"
+
+    blocks: List[List[str]] = []
+    current: List[str] = []
+    for line in lines:
+        if line == "":
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+
+    display_lines: List[str] = []
+    multi_block = len(blocks) > 1
+    for idx, block in enumerate(blocks, 1):
+        label = f"{prefix} #{idx}:" if multi_block else f"{prefix}:"
+        display_lines.append(label)
+        display_lines.extend(block)
+        if idx != len(blocks):
+            display_lines.append("")
+
+    body_text = "\n".join(display_lines)
+    if max_chars is not None and len(body_text) > max_chars:
+        visible = body_text[:max_chars].rstrip()
+        body_text = (
+            f"{visible}\n"
+            f"[Обрезано: показано {max_chars} из {len(body_text)} символов]"
+        )
+    return body_text
 
 
 def _format_headings_for_prompt(headings: Sequence[Tuple[Optional[int], str]]) -> str:
@@ -1452,9 +1488,14 @@ def _format_headings_for_prompt(headings: Sequence[Tuple[Optional[int], str]]) -
         else:
             lvl, text = None, entry  # type: ignore[assignment]
         label = f"H{lvl}" if isinstance(lvl, int) and 1 <= lvl <= 6 else "H?"
-        text_clean = clean_for_prompt(text)
-        if text_clean:
-            text_clean = clip(text_clean, 400)
+        text_clean = strip_invisible(text or "")
+        text_clean = text_clean.strip()
+        if text_clean and len(text_clean) > 600:
+            trimmed = text_clean[:600].rstrip()
+            text_clean = (
+                f"{trimmed}\n"
+                f"[Обрезано: показано 600 из {len(text_clean)} символов]"
+            )
         formatted.append(f"{label}: {text_clean or '—'}")
     return "\n".join(formatted) if formatted else "—"
 
@@ -1464,7 +1505,7 @@ def build_article_headings_vs_text_prompt(
     body: Union[str, Sequence[str], None],
 ) -> str:
     htxt = _format_headings_for_prompt(headings)
-    body_block = _format_text_for_prompt(body, prefix="Текст:", max_chars=ART_PROMPT_MAX_CHARS)
+    body_block = _format_text_for_prompt(body, prefix="Text", max_chars=ART_PROMPT_MAX_CHARS)
     return (
         "Ты проверяешь совпадение языка заголовков и основного текста.\n"
         "Каждая строка в блоке <HEADINGS> начинается с H1:, H2: и т.д.\n"
@@ -1472,6 +1513,7 @@ def build_article_headings_vs_text_prompt(
         "Определи доминирующий язык блока <TEXT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, аббревиатуры, числа, валюты и одиночные заимствования.\n"
         "Сравни язык каждого заголовка из <HEADINGS> с языком <TEXT>.\n"
+        "Каждый фрагмент текста в <TEXT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
         "Если хотя бы один заголовок на другом языке — ответь «Нет». Если все совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
         f"\n<HEADINGS>\n{htxt}\n</HEADINGS>"
@@ -1483,7 +1525,7 @@ def build_article_list_problem_headings_prompt(
     body: Union[str, Sequence[str], None],
 ) -> str:
     htxt = _format_headings_for_prompt(headings)
-    body_block = _format_text_for_prompt(body, prefix="Текст:", max_chars=ART_PROMPT_MAX_CHARS)
+    body_block = _format_text_for_prompt(body, prefix="Text", max_chars=ART_PROMPT_MAX_CHARS)
     return (
         "Определи ДОМИНИРУЮЩИЙ язык <TEXT> СТРОГО по блоку <TEXT> ниже. Язык промпта на котором это написано не причем. Не упоминай его."
         "Игнорируй язык этих инструкций и всё, что вне тегов. Только язык с <TEXT>. "
@@ -1491,6 +1533,7 @@ def build_article_list_problem_headings_prompt(
         "Игнорируй бренды/имена, домены/URL, аббревиатуры, числа/валюты и одиночные англ. заимствования.\n"
         "Сравни каждый заголовок из <HEADINGS> с языком <TEXT>. "
         "Каждая строка в <HEADINGS> имеет вид H1:, H2: и т.д.\n"
+        "Каждый фрагмент текста в <TEXT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
         "Если заголовок совпадает по языку — пропусти. "
         "Если нет — укажи точную проблему.\n"
         "Начни ответ с «Да», если найдены ошибки, иначе ответь ровно «Нет».\n"
@@ -1519,6 +1562,7 @@ def build_slug_consistency_prompt(
     body.append("SLUG пишут без диакритики — это нормально, если он всё равно про ту же тему.")
     body.append("Если SLUG заметно про другую тему или язык — ответь «Нет». Иначе ответь «Да».")
     body.append("Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.")
+    body.append("Каждый текстовый фрагмент ниже помечен строкой «Text:» (если он один) или «Text #N:» (если их несколько).")
     body.append("")
     body.append(slug or "—")
     body.append("")
@@ -1527,7 +1571,7 @@ def build_slug_consistency_prompt(
     if mk: body.append(f"MK: {mk}")
     if h1: body.append(f"H1: {h1}")
     body.append("")
-    body.append(_format_text_for_prompt(content, prefix="Текст:", max_chars=EEAT_PROMPT_MAX_CHARS))
+    body.append(_format_text_for_prompt(content, prefix="Text", max_chars=EEAT_PROMPT_MAX_CHARS))
     return "\n".join(body)
 
 def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
@@ -1539,7 +1583,7 @@ def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
 
 
 def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
-    content_block = _format_text_for_prompt(content, prefix="Текст:", max_chars=EEAT_PROMPT_MAX_CHARS)
+    content_block = _format_text_for_prompt(content, prefix="Text", max_chars=EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
         "Ты проверяешь, совпадает ли язык MT/MD/MK/H1 с языком текста секции.\n"
@@ -1547,6 +1591,7 @@ def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content:
         "Определи доминирующий язык <CONTENT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, числа, валюты и одиночные заимствования.\n"
         "Сравни язык MT, MD, MK и H1 с языком <CONTENT>.\n"
+        "Каждый фрагмент текста в <CONTENT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
         "Если хотя бы один элемент явно на другом языке — ответь «Нет». Если всё совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.\n"
         f"\n<META>\n{meta_block}\n</META>"
@@ -1555,13 +1600,14 @@ def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content:
 
 
 def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
-    content_block = _format_text_for_prompt(content, prefix="Текст:", max_chars=EEAT_PROMPT_MAX_CHARS)
+    content_block = _format_text_for_prompt(content, prefix="Text", max_chars=EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
         "Если найдёшь несоответствие языков — ответь «Да», иначе ответь ровно «Нет».\n"
         "Если ответ «Да», перечисли ТОЛЬКО ярлыки из набора MT | MD | MK | H1, разделяя их через « | ». Никаких пояснений.\n"
         "Анализируй исключительно данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык этих инструкций."
         "\nПомни: бренды, домены и одиночные заимствованные слова не считаются сменой языка; оценивай основную часть текста.\n"
+        "Каждый фрагмент текста в <CONTENT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
         f"\n<META>\n{meta_block}\n</META>"
         f"\n\n<CONTENT>\n{content_block}\n</CONTENT>"
     )
