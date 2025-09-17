@@ -75,7 +75,7 @@ import traceback
 import asyncio
 import random
 import threading
-from typing import List, Tuple, Dict, Optional, Callable, Any, Sequence, Union
+from typing import List, Tuple, Dict, Optional, Callable, Any, Sequence, Union, Awaitable, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aiogram import Bot, Dispatcher, F
@@ -2543,11 +2543,22 @@ def validate_eeat_from_url(url: str, tmpdir: Optional[str] = None) -> Tuple[bool
 
 async def run_full_validation_async(project: str,
                                     articles: List[Tuple[str, str]],
-                                    eeat_link: Optional[str] = None) -> Tuple[bool, str, List[Tuple[str, str]], Optional[str]]:
+                                    eeat_link: Optional[str] = None,
+                                    progress_cb: Optional[Callable[[str], Awaitable[None]]] = None) -> Tuple[bool, str, List[Tuple[str, str]], Optional[str]]:
     tmpdir = tempfile.mkdtemp(prefix="docxv_")
     sem = asyncio.Semaphore(max(1, VALIDATOR_CONCURRENCY))
     per_item_logs: List[Tuple[str, str]] = []
     zip_items: List[Tuple[str, str]] = []
+
+    async def _emit_stage(stage: str) -> None:
+        if not progress_cb:
+            return
+        try:
+            maybe = progress_cb(stage)
+            if asyncio.iscoroutine(maybe):
+                await maybe
+        except Exception:
+            pass
 
     async def run_article(tag: str, url: str):
         async with sem:
@@ -2558,42 +2569,86 @@ async def run_full_validation_async(project: str,
             return await asyncio.to_thread(validate_eeat_from_url, url, tmpdir)
 
     try:
-        tasks = [asyncio.create_task(run_article(tag, url)) for tag, url in articles]
-        eeat_task = asyncio.create_task(run_eeat(eeat_link)) if eeat_link else None
+        task_lookup: Dict[asyncio.Task, Tuple[str, Optional[int], Optional[str]]] = {}
+        for idx, (tag, url) in enumerate(articles):
+            task = asyncio.create_task(run_article(tag, url))
+            task_lookup[task] = ("article", idx, tag)
+        if eeat_link:
+            task = asyncio.create_task(run_eeat(eeat_link))
+            task_lookup[task] = ("eeat", None, None)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        eeat_result = await asyncio.gather(eeat_task, return_exceptions=True) if eeat_task else []
+        total_items = len(task_lookup)
+        if total_items:
+            initial_label = "Проверяем материалы" if articles else "Анализируем EEAT"
+            await _emit_stage(f"{initial_label} (0 из {total_items})")
+
+        completed = 0
+        article_results: List[Optional[Union[Tuple[bool, str, Optional[str]], Exception]]] = [None] * len(articles)
+        eeat_result_obj: Optional[Union[Tuple[bool, str, Optional[str]], Exception]] = None
+        keys_error: Optional[KeysExhaustedError] = None
+
+        pending: Set[asyncio.Task] = set(task_lookup.keys())
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                kind, idx, tag = task_lookup.get(finished, ("article", None, None))
+                try:
+                    result = finished.result()
+                except KeysExhaustedError as exc:
+                    keys_error = exc
+                    result = exc
+                except Exception as ex:
+                    result = ex
+
+                if kind == "article" and idx is not None:
+                    article_results[idx] = result
+                    label = f"Проверяем «{clip(tag, 40)}»" if tag else "Проверяем материалы"
+                else:
+                    eeat_result_obj = result
+                    label = "Анализируем EEAT"
+
+                completed += 1
+                if total_items:
+                    await _emit_stage(f"{label} ({completed} из {total_items})")
+                else:
+                    await _emit_stage(label)
+
+        if keys_error:
+            raise keys_error
 
         overall_ok = True
         report_lines: List[str] = []
 
-        for i, res in enumerate(results):
-            tag = articles[i][0]
-            if isinstance(res, KeysExhaustedError):
-                raise res
+        for idx, (tag, _url) in enumerate(articles):
+            res = article_results[idx]
             if isinstance(res, Exception):
                 per_item_logs.append((tag, f"🛑 Ошибка выполнения: {res!r}"))
+                overall_ok = False
+                continue
+            if res is None:
+                per_item_logs.append((tag, "🛑 Ошибка выполнения: результат не получен"))
                 overall_ok = False
                 continue
             ok, log_text, zip_src_path = res
             overall_ok = overall_ok and ok
             per_item_logs.append((tag, log_text))
-            report_lines.append(log_text); report_lines.append("")
+            report_lines.append(log_text)
+            report_lines.append("")
             if ok and zip_src_path:
                 zip_items.append((zip_src_path, f"{tag}.docx"))
 
         report_lines += [BAR, "📑 EEAT", BAR]
         if eeat_link:
-            er = eeat_result[0]
-            if isinstance(er, KeysExhaustedError):
-                raise er
+            er = eeat_result_obj
             if isinstance(er, Exception):
+                if isinstance(er, KeysExhaustedError):
+                    raise er
                 eeat_log = f"🛑 EEAT: ошибка выполнения — {er!r}"
                 per_item_logs.append(("EEAT", eeat_log))
                 report_lines.append(eeat_log)
                 overall_ok = False
             else:
-                ok, eeat_log, eeat_zip_src = er
+                ok, eeat_log, eeat_zip_src = er if er is not None else (False, "EEAT: результат не получен", None)
                 overall_ok = overall_ok and ok
                 per_item_logs.append(("EEAT", eeat_log))
                 report_lines.append(eeat_log)
@@ -2946,9 +3001,11 @@ async def on_text(message: Message):
             )
             current_stage = "Подготавливаем проверку"
 
-            await update_stage("Получаем и проверяем материалы")
+            async def relay_stage(stage: str) -> None:
+                await update_stage(stage)
+
             overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
-                "Project", articles, eeat_link
+                "Project", articles, eeat_link, progress_cb=relay_stage
             )
 
             await update_stage("Собираем отчёт")
