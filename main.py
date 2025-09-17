@@ -1609,18 +1609,19 @@ def build_slug_consistency_prompt(
     return "\n".join(body)
 
 def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
-    def _fmt(label: str, value: str) -> str:
-        clean = strip_invisible(value or "").strip()
-        return f"{label}: {clean or '—'}"
+    blocks: List[str] = []
+    for label, raw_value in (("MT", mt), ("MD", md), ("MK", mk), ("H1", h1)):
+        clean_value = strip_invisible(raw_value or "").strip()
+        block_lines = [
+            "Заголовки:",
+            f"{label}: {clean_value or '—'}",
+            "",
+            "Текст:",
+            clean_value or "—",
+        ]
+        blocks.append("\n".join(block_lines))
 
-    lines = [
-        "Заголовки:",
-        _fmt("MT", mt),
-        _fmt("MD", md),
-        _fmt("MK", mk),
-        _fmt("H1", h1),
-    ]
-    return "\n".join(lines)
+    return "\n\n".join(blocks)
 
 
 def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
