@@ -1473,6 +1473,22 @@ def _format_heading_text_block(
     return "\n".join(lines)
 
 
+PromoSection = Tuple[str, Optional[str], Sequence[str]]
+
+
+def _format_labeled_sections_for_prompt(sections: Sequence[PromoSection]) -> str:
+    if not sections:
+        return "—"
+
+    blocks: List[str] = []
+    for idx, (label, heading, body) in enumerate(sections, 1):
+        blocks.append(_format_heading_text_block(label, heading, body))
+        if idx != len(sections):
+            blocks.append("")
+
+    return "\n".join(blocks)
+
+
 def _format_text_for_prompt(
     text: Union[str, Sequence[str], None],
     prefix: str = "Текст",
@@ -1630,27 +1646,78 @@ def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, conte
         f"\n\n<CONTENT>\n{_format_heading_text_block('H1', h1, content, max_chars=EEAT_PROMPT_MAX_CHARS)}\n</CONTENT>"
     )
 
-def build_promo_scan_prompt(full_text: str) -> str:
-    block = _format_heading_text_block("H?", None, full_text, max_chars=PROMO_MAX_CHARS)
+def build_promo_scan_prompt(sections: Sequence[PromoSection]) -> str:
+    block = _format_labeled_sections_for_prompt(sections)
     return (
         "Определи, есть ли в тексте настоящий ПРОМОКОД — заглавный буквенно-цифровой шаблон вроде «CODE123».\n"
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы измерения («MB», «GB», «TB» и т.п.).\n"
         "Если нашёл хотя бы один промокод — ответь «Да». Если не нашёл — ответь «Нет».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
-        "Фрагмент ниже разбит на блок «Заголовки:» и, при наличии содержимого, на блок «Текст:» без сокращений.\n\n"
-        f"{block}"
+        "Фрагменты ниже повторяют структуру документа: каждый раздел начинается блоком «Заголовки:», а при наличии содержимого «Текст:».\n\n"
+        f"<РАЗДЕЛЫ>\n{block}\n</РАЗДЕЛЫ>"
     )
 
-def build_promo_extract_prompt(full_text: str) -> str:
-    block = _format_heading_text_block("H?", None, full_text, max_chars=PROMO_MAX_CHARS)
+
+def build_promo_extract_prompt(sections: Sequence[PromoSection]) -> str:
+    block = _format_labeled_sections_for_prompt(sections)
     return (
         "Выпиши из текста только настоящие ПРОМОКОДЫ (заглавные буквенно-цифровые шаблоны). "
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы "
         "измерения («MB», «GB», «TB» и т.п.). Если промокоды найдены, начни ответ с «Да» и на той же строке "
         "после двоеточия перечисли их через « | ». Если промокодов нет — ответь ровно «Нет».\n\n"
-        "Фрагмент ниже разбит на блок «Заголовки:» и, при наличии содержимого, на блок «Текст:» без сокращений.\n\n"
-        f"{block}"
+        "Фрагменты ниже повторяют структуру документа: каждый раздел оформлен блоками «Заголовки:» и, при наличии содержимого, «Текст:».\n\n"
+        f"<РАЗДЕЛЫ>\n{block}\n</РАЗДЕЛЫ>"
     )
+
+
+def _promo_sections_from_article(article_sections: Sequence[Dict[str, Any]]) -> List[PromoSection]:
+    sections: List[PromoSection] = []
+    for sec in article_sections:
+        body_src = sec.get("body") or []
+        body_lines = [strip_invisible(ln or "").strip() for ln in body_src]
+        body_lines = [ln for ln in body_lines if ln]
+        if not body_lines:
+            continue
+        lvl = sec.get("level")
+        label = f"H{lvl}" if isinstance(lvl, int) and 1 <= lvl <= 6 else "H?"
+        heading = strip_invisible(sec.get("heading") or "")
+        sections.append((label, heading, body_lines))
+    return sections
+
+
+def _promo_sections_from_eeat(sections_data: Sequence[Dict[str, Any]]) -> List[PromoSection]:
+    sections: List[PromoSection] = []
+    for idx, sec in enumerate(sections_data, 1):
+        parts: List[str] = []
+
+        slug_raw = sec.get("slug") or ""
+        slug_clean = strip_invisible(slug_raw).strip()
+        if slug_clean:
+            parts.append(f"SLUG: {slug_clean}")
+
+        meta_lines: List[str] = []
+        for key in ("MT", "MD", "MK"):
+            val_raw = sec.get(key) or ""
+            val = strip_invisible(val_raw).strip()
+            if val:
+                meta_lines.append(f"{key}: {val}")
+        if meta_lines:
+            parts.append("\n".join(meta_lines))
+
+        content_src = sec.get("content_texts") or []
+        for chunk in content_src:
+            cleaned = strip_invisible(chunk or "").strip()
+            if cleaned:
+                parts.append(cleaned)
+
+        if not parts:
+            continue
+
+        heading_raw = strip_invisible(sec.get("h1") or "").strip()
+        heading = heading_raw or (slug_clean or f"Секция #{idx}")
+        sections.append(("H1", heading, parts))
+    return sections
+
 
 def filter_promo_codes(raw: str) -> List[str]:
     if not raw:
@@ -1948,16 +2015,17 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
         errors.append(f"Нейросетевая проверка языка заголовков/текста не выполнена: {ex}")
 
     try:
-        full_text = " ".join([t for t in (body_texts + [t for _, t in headings]) if t])
-        q1 = build_promo_scan_prompt(full_text)
-        has_code = llm_yesno(q1, purpose=purpose("Промокоды — скан"))
-        if has_code == "Да":
-            q2 = build_promo_extract_prompt(full_text)
-            codes = llm_text(q2, purpose=purpose("Промокоды — извлечение"), max_tokens=256)
-            codes = codes.strip()
-            filtered = filter_promo_codes(codes)
-            if filtered:
-                errors.append(f"Обнаружен посторонний промокод: {' | '.join(filtered)}")
+        promo_sections = _promo_sections_from_article(article_sections)
+        if promo_sections:
+            q1 = build_promo_scan_prompt(promo_sections)
+            has_code = llm_yesno(q1, purpose=purpose("Промокоды — скан"))
+            if has_code == "Да":
+                q2 = build_promo_extract_prompt(promo_sections)
+                codes = llm_text(q2, purpose=purpose("Промокоды — извлечение"), max_tokens=256)
+                codes = codes.strip()
+                filtered = filter_promo_codes(codes)
+                if filtered:
+                    errors.append(f"Обнаружен посторонний промокод: {' | '.join(filtered)}")
     except KeysExhaustedError:
         raise
     except Exception:
@@ -2133,23 +2201,17 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
 
     # Промокод — скан по всем секциям
     try:
-        full = []
-        for sec in sections:
-            for k in ("MT","MD","MK","h1"):
-                v = (sec.get(k) or "")
-                if v: full.append(f"{k.upper()}: {v}")
-            for ln in (sec.get("content_texts") or []):
-                if ln: full.append(ln)
-        all_text = " ".join(full)
-        q1 = build_promo_scan_prompt(all_text)
-        has_code = llm_yesno(q1, purpose=eeat_purpose("Промокоды — скан"))
-        if has_code == "Да":
-            q2 = build_promo_extract_prompt(all_text)
-            codes = llm_text(q2, purpose=eeat_purpose("Промокоды — извлечение"), max_tokens=256)
-            codes = codes.strip()
-            filtered = filter_promo_codes(codes)
-            if filtered:
-                errors.append(f"EEAT: обнаружен посторонний промокод: {' | '.join(filtered)}")
+        promo_sections = _promo_sections_from_eeat(sections)
+        if promo_sections:
+            q1 = build_promo_scan_prompt(promo_sections)
+            has_code = llm_yesno(q1, purpose=eeat_purpose("Промокоды — скан"))
+            if has_code == "Да":
+                q2 = build_promo_extract_prompt(promo_sections)
+                codes = llm_text(q2, purpose=eeat_purpose("Промокоды — извлечение"), max_tokens=256)
+                codes = codes.strip()
+                filtered = filter_promo_codes(codes)
+                if filtered:
+                    errors.append(f"EEAT: обнаружен посторонний промокод: {' | '.join(filtered)}")
     except KeysExhaustedError:
         raise
     except Exception:
