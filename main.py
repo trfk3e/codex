@@ -1631,10 +1631,14 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
                 prompt2 = build_section_lang_list_bad_prompt(mt, md, mk, h1, content_texts)
                 bad = llm_text(prompt2, purpose="EEAT list bad items", max_tokens=64).strip()
                 bad = re.sub(r'\s*\|\s*', ' | ', bad)
-                if bad in ("—", "-", ""):
-                    se.append("Язык заголовков/меты не совпадает с языком текста секции.")
-                else:
-                    se.append(f"Язык заголовков/меты не совпадает с языком текста секции. (Проблемные элементы: {bad}.)")
+                tokens = [t.strip() for t in bad.split('|') if t.strip()]
+                tokens = [t for t in tokens if t not in ("—", "-")]
+                tokens = [t for t in tokens if t.upper() != "MK"]
+                if tokens:
+                    se.append(
+                        "Язык заголовков/меты не совпадает с языком текста секции. "
+                        f"(Проблемные элементы: {' | '.join(tokens)}.)"
+                    )
         except KeysExhaustedError:
             raise
         except Exception as ex:
