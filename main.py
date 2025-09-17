@@ -38,6 +38,12 @@ LLM_MAX_RETRIES_LOCAL  = int(os.environ.get("OPENAI_MAX_RETRIES", "1"))
 PROMO_MAX_CHARS        = int(os.environ.get("PROMO_MAX_CHARS", "12000"))
 EEAT_PROMPT_MAX_CHARS  = int(os.environ.get("EEAT_PROMPT_MAX_CHARS", "6000"))
 ART_PROMPT_MAX_CHARS   = int(os.environ.get("ART_PROMPT_MAX_CHARS", "6000"))
+
+# Разрешенные служебные метки, которые не считаются промокодами.
+PROMO_IGNORE_CODES = {
+    "MT", "MD", "MK", "MB", "H1", "H2", "H3", "H4",
+    "CTA", "FAQ", "SEO", "URL", "WWW", "HTTP", "HTTPS",
+}
 VALIDATOR_CONCURRENCY  = int(os.environ.get("VALIDATOR_CONCURRENCY", "8"))
 
 # --- Новые параметры (Zoho OAuth: кеш и задержки) ---
@@ -1249,13 +1255,44 @@ def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, conte
 
 def build_promo_scan_prompt(full_text: str) -> str:
     full_text = clip(clean_for_prompt(full_text), PROMO_MAX_CHARS)
-    return ("Перепроверь данный текст от А до Я, есть ли в нем какой-то ПРОМОКОД СТРОГО написанный заглавными буквами, либо типичный буквенно-цифровой шаблон?.\n Например 'COD', 'CODE', 'MONEY' и т.п. только капслоком, тащательно изучи текст от А до Я. \n Выпиши его даже если он упоминается один раз в тексте."
-            "Строго ответь «Да» или «Нет». Никаких комментариев.\n\n" + full_text)
+    return (
+        "Определи, есть ли в тексте настоящий ПРОМОКОД, написанный заглавными буквами "
+        "или характерный буквенно-цифровой шаблон. Игнорируй служебные метки вроде "
+        "«MT», «MD», «MK», «H1», «H2», «H3», «H4», а также единицы измерения «MB», "
+        "«GB», «TB» и подобные — это НЕ промокоды.\nНапример, настоящими промокодами могут быть "
+        "«CODE123», «SALE50» и т.п. Если промокодов нет — ответь «Нет».\n"
+        "Строго ответь «Да» или «Нет». Никаких комментариев.\n\n" + full_text
+    )
 
 def build_promo_extract_prompt(full_text: str) -> str:
     full_text = clip(clean_for_prompt(full_text), PROMO_MAX_CHARS)
-    return ("Выпиши из текста все найденные ПРОМОКОДЫ (только которые написаны заглавными буквами), без комментариев. "
-            "Каждый код — отдельно, через « | » в одной строке. Если ничего нет — «—».\n\n" + full_text)
+    return (
+        "Выпиши из текста только настоящие ПРОМОКОДЫ (заглавные буквенно-цифровые шаблоны). "
+        "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы "
+        "измерения («MB», «GB», «TB» и т.п.). Каждый код пиши отдельно, через « | » в "
+        "одной строке. Если промокодов нет — выведи «—».\n\n" + full_text
+    )
+
+def filter_promo_codes(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[|,\n]+", raw)
+    cleaned: List[str] = []
+    seen: set = set()
+    for part in parts:
+        token = part.strip()
+        if not token or token in ("—", "-"):
+            continue
+        norm = re.sub(r"[^0-9A-Z]", "", token.upper())
+        if not norm:
+            continue
+        if norm in PROMO_IGNORE_CODES:
+            continue
+        if norm in seen:
+            continue
+        cleaned.append(token)
+        seen.add(norm)
+    return cleaned
 
 # =========================================================
 # ==================== ВАЛИДАЦИЯ СТАТЕЙ ===================
@@ -1479,8 +1516,9 @@ def validate_text_article(doc: Document) -> List[str]:
             q2 = build_promo_extract_prompt(full_text)
             codes = llm_text(q2, purpose="Promo code extract", max_tokens=256)
             codes = codes.strip()
-            if codes and codes != "—":
-                errors.append(f"Обнаружен посторонний промокод: {codes}")
+            filtered = filter_promo_codes(codes)
+            if filtered:
+                errors.append(f"Обнаружен посторонний промокод: {' | '.join(filtered)}")
     except KeysExhaustedError:
         raise
     except Exception:
@@ -1641,8 +1679,9 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
             q2 = build_promo_extract_prompt(all_text)
             codes = llm_text(q2, purpose="Promo code extract (EEAT)", max_tokens=256)
             codes = codes.strip()
-            if codes and codes != "—":
-                errors.append(f"EEAT: обнаружен посторонний промокод: {codes}")
+            filtered = filter_promo_codes(codes)
+            if filtered:
+                errors.append(f"EEAT: обнаружен посторонний промокод: {' | '.join(filtered)}")
     except KeysExhaustedError:
         raise
     except Exception:
