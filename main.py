@@ -1478,69 +1478,75 @@ def _format_text_for_prompt(
     return body_text
 
 
-def _format_headings_for_prompt(headings: Sequence[Tuple[Optional[int], str]]) -> str:
-    formatted: List[str] = []
-    for entry in headings:
-        lvl: Optional[int]
-        text: Optional[str]
-        if isinstance(entry, tuple) and len(entry) >= 2:
-            lvl, text = entry[0], entry[1]
-        else:
-            lvl, text = None, entry  # type: ignore[assignment]
+def _format_article_sections_for_prompt(
+    sections: Sequence[Tuple[Optional[int], str, Sequence[str]]],
+    max_chars: Optional[int] = None,
+) -> str:
+    if not sections:
+        return "—"
+
+    lines: List[str] = []
+    for idx, (lvl, heading, body_lines) in enumerate(sections, 1):
         label = f"H{lvl}" if isinstance(lvl, int) and 1 <= lvl <= 6 else "H?"
-        text_clean = strip_invisible(text or "")
-        text_clean = text_clean.strip()
-        if text_clean and len(text_clean) > 600:
-            trimmed = text_clean[:600].rstrip()
-            text_clean = (
+        heading_clean = strip_invisible(heading or "").strip()
+        if heading_clean and len(heading_clean) > 600:
+            trimmed = heading_clean[:600].rstrip()
+            heading_clean = (
                 f"{trimmed}\n"
-                f"[Обрезано: показано 600 из {len(text_clean)} символов]"
+                f"[Обрезано: показано 600 из {len(heading_clean)} символов]"
             )
-        formatted.append(f"{label}: {text_clean or '—'}")
-    return "\n".join(formatted) if formatted else "—"
+        lines.append(f"Заголовок {label}: {heading_clean or '—'}")
+
+        prepared_body = _prepare_text_lines_for_prompt(body_lines)
+        if prepared_body:
+            lines.append("Текст:")
+            lines.extend(prepared_body)
+        else:
+            lines.append("Текст: —")
+
+        if idx != len(sections):
+            lines.append("")
+
+    block = "\n".join(lines)
+    if max_chars is not None and len(block) > max_chars:
+        visible = block[:max_chars].rstrip()
+        block = (
+            f"{visible}\n"
+            f"[Обрезано: показано {max_chars} из {len(block)} символов]"
+        )
+    return block
 
 
 def build_article_headings_vs_text_prompt(
-    headings: Sequence[Tuple[Optional[int], str]],
-    body: Union[str, Sequence[str], None],
+    sections: Sequence[Tuple[Optional[int], str, Sequence[str]]],
 ) -> str:
-    htxt = _format_headings_for_prompt(headings)
-    body_block = _format_text_for_prompt(body, prefix="Text", max_chars=ART_PROMPT_MAX_CHARS)
+    section_block = _format_article_sections_for_prompt(sections, max_chars=ART_PROMPT_MAX_CHARS)
     return (
         "Ты проверяешь совпадение языка заголовков и основного текста.\n"
-        "Каждая строка в блоке <HEADINGS> начинается с H1:, H2: и т.д.\n"
-        "Смотри только в блоки <HEADINGS> и <TEXT> ниже и игнорируй язык этих инструкций.\n"
-        "Определи доминирующий язык блока <TEXT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
+        "Смотри только в блок <РАЗДЕЛЫ> ниже и игнорируй язык этих инструкций.\n"
+        "Каждый раздел записан в том же порядке, что и в DOCX: сначала строка «Заголовок H#: ...», затем блок «Текст:».\n"
+        "Определи доминирующий язык каждого блока «Текст» по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, аббревиатуры, числа, валюты и одиночные заимствования.\n"
-        "Сравни язык каждого заголовка из <HEADINGS> с языком <TEXT>.\n"
-        "Каждый фрагмент текста в <TEXT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
-        "Если хотя бы один заголовок на другом языке — ответь «Нет». Если все совпадает — ответь «Да».\n"
+        "Сравни язык строки «Заголовок ...» с языком соответствующего блока «Текст».\n"
+        "Если хотя бы один заголовок на другом языке, чем его текст — ответь «Нет». Если все совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
-        f"\n<HEADINGS>\n{htxt}\n</HEADINGS>"
-        f"\n\n<TEXT>\n{body_block}\n</TEXT>"
+        f"\n<РАЗДЕЛЫ>\n{section_block}\n</РАЗДЕЛЫ>"
     )
 
 def build_article_list_problem_headings_prompt(
-    headings: Sequence[Tuple[Optional[int], str]],
-    body: Union[str, Sequence[str], None],
+    sections: Sequence[Tuple[Optional[int], str, Sequence[str]]],
 ) -> str:
-    htxt = _format_headings_for_prompt(headings)
-    body_block = _format_text_for_prompt(body, prefix="Text", max_chars=ART_PROMPT_MAX_CHARS)
+    section_block = _format_article_sections_for_prompt(sections, max_chars=ART_PROMPT_MAX_CHARS)
     return (
-        "Определи ДОМИНИРУЮЩИЙ язык <TEXT> СТРОГО по блоку <TEXT> ниже. Язык промпта на котором это написано не причем. Не упоминай его."
-        "Игнорируй язык этих инструкций и всё, что вне тегов. Только язык с <TEXT>. "
-        "Диакритику игнорируй (á→a, ü→u и т.п.). "
+        "Определи доминирующий язык каждого блока «Текст» строго по содержимому блока <РАЗДЕЛЫ> ниже. Язык этих инструкций игнорируй."
+        "Диакриику игнорируй (á→a, ü→u и т.п.). "
         "Игнорируй бренды/имена, домены/URL, аббревиатуры, числа/валюты и одиночные англ. заимствования.\n"
-        "Сравни каждый заголовок из <HEADINGS> с языком <TEXT>. "
-        "Каждая строка в <HEADINGS> имеет вид H1:, H2: и т.д.\n"
-        "Каждый фрагмент текста в <TEXT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
-        "Если заголовок совпадает по языку — пропусти. "
-        "Если нет — укажи точную проблему.\n"
+        "Сравни язык строки «Заголовок ...» с языком блока «Текст» в каждом разделе. "
+        "Если заголовок совпадает по языку — пропусти. Если нет — укажи точную проблему.\n"
         "Начни ответ с «Да», если найдены ошибки, иначе ответь ровно «Нет».\n"
         "Если ответ «Да», на следующих строках перечисли проблемные заголовки.\n"
-        "Каждый оформляй так: 'проблемный заголовок' — краткое пояснение.\n"
-        f"\n<HEADINGS>\n{htxt}\n</HEADINGS>"
-        f"\n\n<TEXT>\n{body_block}\n</TEXT>"
+        "Каждый оформляй так: 'Заголовок ...' — краткое пояснение.\n"
+        f"\n<РАЗДЕЛЫ>\n{section_block}\n</РАЗДЕЛЫ>"
     )
 
 
@@ -1763,6 +1769,8 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
     errors: List[str] = []
     headings: List[Tuple[int, str]] = []
     body_texts: List[str] = []
+    article_sections: List[Dict[str, Any]] = []
+    current_section: Optional[Dict[str, Any]] = None
 
     tag_clean = (tag or "").strip()
     section_label = f"Статья {tag_clean}" if tag_clean else "Статья"
@@ -1826,8 +1834,15 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
                 headings.append((lvl, text))
                 if len(text) > 350:
                     errors.append(f'Ошибка, текст отмечен как заголовок: "{first_words(text, 3)}"')
+                current_section = {"level": lvl, "heading": text, "body": []}
+                article_sections.append(current_section)
             else:
                 body_texts.append(text)
+                if text:
+                    if current_section is None:
+                        current_section = {"level": None, "heading": "", "body": []}
+                        article_sections.append(current_section)
+                    current_section["body"].append(text)
 
             ltype = paragraph_list_type(block, num_maps)
             if ltype == "bullet":   bullets += 1
@@ -1857,6 +1872,14 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
     if document_total_images(doc) < 2: errors.append("Картинок меньше двух (минимум 2).")
 
     try:
+        sections_for_prompt: List[Tuple[Optional[int], str, List[str]]] = []
+        for sec in article_sections:
+            heading_text = sec.get("heading") or ""
+            level = sec.get("level")
+            body_lines = [ln for ln in (sec.get("body") or []) if (ln or "").strip()]
+            if not heading_text and not body_lines:
+                continue
+            sections_for_prompt.append((level, heading_text, body_lines))
         heading_pairs = [(lvl, txt) for (lvl, txt) in headings if (txt or "").strip()]
         body_blocks = [t for t in body_texts if (t or "").strip()]
         body_sample_lines = _prepare_text_lines_for_prompt(body_blocks)
@@ -1885,10 +1908,10 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
                         "Язык: заголовок «{}» написан другим алфавитом ({}), "
                         "чем основной текст ({})".format(display, _script_label(h_script), label_body)
                     )
-            prompt = build_article_headings_vs_text_prompt(heading_pairs, body_blocks)
+            prompt = build_article_headings_vs_text_prompt(sections_for_prompt)
             yn = llm_yesno(prompt, purpose=purpose("Язык заголовков vs текст"))
             if yn == "Нет" or script_mismatch_found:
-                prompt2 = build_article_list_problem_headings_prompt(heading_pairs, body_blocks)
+                prompt2 = build_article_list_problem_headings_prompt(sections_for_prompt)
                 bad_raw = llm_text(prompt2, purpose=purpose("Проблемные заголовки"), max_tokens=256)
                 bad_raw = bad_raw.strip()
                 yn_bad, bad_details = _split_yesno_details(bad_raw)
