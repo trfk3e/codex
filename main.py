@@ -2866,6 +2866,37 @@ async def on_text(message: Message):
     db_init()
     admin_user = is_admin(getattr(message.from_user, "id", None))
 
+    progress_message: Optional[Message] = None
+
+    async def update_progress(stage: str) -> None:
+        nonlocal progress_message
+        text = f"⌛Ожидайте... программа на этапе: {stage}"
+        try:
+            if progress_message is None:
+                progress_message = await message.answer(text)
+            else:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=progress_message.message_id,
+                    text=text,
+                )
+        except Exception:
+            pass
+
+    async def clear_progress() -> None:
+        nonlocal progress_message
+        if progress_message is None:
+            return
+        try:
+            await message.bot.delete_message(
+                chat_id=message.chat.id,
+                message_id=progress_message.message_id,
+            )
+        except Exception:
+            pass
+        finally:
+            progress_message = None
+
     try:
         if _PENDING_KEYS.get(message.chat.id) and admin_user:
             added = db_add_keys_bulk(message.text or "")
@@ -2873,12 +2904,14 @@ async def on_text(message: Message):
             await message.answer(f"✅ Добавлено ключей: {added}.")
             return
 
+        await update_progress("Считываем ссылки")
         raw = message.text or ""
         articles, eeat_link, parse_errors = parse_lines_to_pairs(raw)
         if parse_errors and not articles and not eeat_link:
             await message.answer("Не удалось распознать ни одной строки:\n• " + "\n• ".join(parse_errors))
             return
 
+        await update_progress("Готовим проверку")
         keys = db_list_keys()
         if not keys and not os.environ.get("OPENAI_API_KEY"):
             if admin_user:
@@ -2887,10 +2920,12 @@ async def on_text(message: Message):
                 await message.answer("Бот временно не настроен. Сообщите администратору.")
             return
 
+        await update_progress("Идет проверка документов")
         try:
             overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
                 "Project", articles, eeat_link
             )
+            await update_progress("Собираем результаты")
             final_msg = build_single_message("Project", per_item_logs, overall_ok)
 
             if overall_ok and zip_path and os.path.exists(zip_path):
@@ -2916,6 +2951,7 @@ async def on_text(message: Message):
         except Exception as ex:
             await message.answer(f"🛑 Внутренняя ошибка: {ex}")
     finally:
+        await clear_progress()
         await maybe_send_admin_debug_logs(message)
 
 async def main():
