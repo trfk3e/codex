@@ -2887,12 +2887,36 @@ async def on_text(message: Message):
                 await message.answer("Бот временно не настроен. Сообщите администратору.")
             return
 
+        progress_message: Optional[Message] = None
+        current_stage: Optional[str] = None
+
+        async def update_stage(stage: str) -> None:
+            nonlocal current_stage
+            if not progress_message:
+                return
+            if current_stage == stage:
+                return
+            current_stage = stage
+            with contextlib.suppress(Exception):
+                await progress_message.edit_text(
+                    f"⌛Ожидайте... программа на этапе: {stage}"
+                )
+
         try:
+            progress_message = await message.answer(
+                "⌛Ожидайте... программа на этапе: Подготавливаем проверку"
+            )
+            current_stage = "Подготавливаем проверку"
+
+            await update_stage("Получаем и проверяем материалы")
             overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
                 "Project", articles, eeat_link
             )
+
+            await update_stage("Собираем отчёт")
             final_msg = build_single_message("Project", per_item_logs, overall_ok)
 
+            await update_stage("Отправляем результаты")
             if overall_ok and zip_path and os.path.exists(zip_path):
                 try:
                     await message.bot.send_document(
@@ -2910,11 +2934,20 @@ async def on_text(message: Message):
                     disable_web_page_preview=True
                 )
         except KeysExhaustedError as ex:
+            await update_stage("Возникла ошибка")
             await message.answer("Закончились ключи, пишите @locosd")
             if admin_user:
                 await message.answer(f"🛠 Детали: {ex}")
         except Exception as ex:
+            await update_stage("Возникла ошибка")
             await message.answer(f"🛑 Внутренняя ошибка: {ex}")
+        finally:
+            if progress_message:
+                with contextlib.suppress(Exception):
+                    await message.bot.delete_message(
+                        chat_id=progress_message.chat.id,
+                        message_id=progress_message.message_id,
+                    )
     finally:
         await maybe_send_admin_debug_logs(message)
 
