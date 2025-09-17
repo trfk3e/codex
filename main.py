@@ -138,6 +138,72 @@ def first_words(text: str, n: int = 3) -> str:
     return (" ".join(words[:n]) + "...") if words else ""
 
 # =========================================================
+# =====================  ОПРЕДЕЛЕНИЕ ПИСЬМА  ==============
+# =========================================================
+_SCRIPT_RANGES = {
+    "latin": (
+        (0x0041, 0x005A), (0x0061, 0x007A),
+        (0x00C0, 0x00FF), (0x0100, 0x017F), (0x0180, 0x024F),
+    ),
+    "cyrillic": (
+        (0x0400, 0x04FF), (0x0500, 0x052F),
+        (0x2DE0, 0x2DFF), (0xA640, 0xA69F),
+    ),
+    "greek": (
+        (0x0370, 0x03FF), (0x1F00, 0x1FFF),
+    ),
+    "hebrew": ((0x0590, 0x05FF),),
+    "arabic": (
+        (0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
+        (0xFB50, 0xFDFF), (0xFE70, 0xFEFF),
+    ),
+}
+
+_SCRIPT_LABELS = {
+    "latin": "латиница",
+    "cyrillic": "кириллица",
+    "greek": "греческий алфавит",
+    "hebrew": "иврит",
+    "arabic": "арабский алфавит",
+}
+
+
+def _char_script(ch: str) -> Optional[str]:
+    code = ord(ch)
+    for script, ranges in _SCRIPT_RANGES.items():
+        for start, end in ranges:
+            if start <= code <= end:
+                return script
+    return None
+
+
+def _dominant_script(text: str) -> Optional[str]:
+    counts: Dict[str, int] = {}
+    total = 0
+    for ch in strip_invisible(text or ""):
+        if not ch.isalpha():
+            continue
+        script = _char_script(ch)
+        if not script:
+            continue
+        counts[script] = counts.get(script, 0) + 1
+        total += 1
+    if not counts or total == 0:
+        return None
+    script, count = max(counts.items(), key=lambda kv: kv[1])
+    if count < 3:
+        return None
+    if (count / total) < 0.6:
+        return None
+    return script
+
+
+def _script_label(script: Optional[str]) -> str:
+    if not script:
+        return "неизвестный алфавит"
+    return _SCRIPT_LABELS.get(script, script)
+
+# =========================================================
 # ======================  БАЗА ДАННЫХ  ====================
 # =========================================================
 def db_init():
@@ -1159,15 +1225,13 @@ def build_article_headings_vs_text_prompt(headings: List[str], body: str) -> str
     htxt = "\n".join([f"- {clean_for_prompt(h)}" for h in headings if (h or "").strip()])
     body = clip(clean_for_prompt(body), ART_PROMPT_MAX_CHARS)
     return (
-        "Ты — валидатор совпадения языка заголовков и основного текста. Язык промпта на котором это написано не причем. Не упоминай его.\n"
-        "Анализируй СТРОГО только содержимое внутри тегов <HEADINGS> и <TEXT> ниже. "
-        "Игнорируй язык этих инструкций и всё, что вне тегов.\n"
-        "1) Определи ДОМИНИРУЮЩИЙ язык блока <TEXT> по грамматике/служебным словам "
-        "(диакритику игнорируй: á→a, ü→u и т.п.).\n"
-        "2) Игнорируй бренды/имена, домены/URL, аббревиатуры, числа/валюты и одиночные англ. заимствования "
-        "(например: login, casino, bonus).\n"
-        "3) Сравни каждый заголовок из <HEADINGS> с языком <TEXT>.\n"
-        "Ответ строго одним словом: «Да» (совпадает) или «Нет» (есть заголовки на другом языке). Никаких комментариев.  Главное не ошибайся, думай столько сколько нужно.\n"
+        "Ты проверяешь совпадение языка заголовков и основного текста.\n"
+        "Смотри только в блоки <HEADINGS> и <TEXT> ниже и игнорируй язык этих инструкций.\n"
+        "Определи доминирующий язык блока <TEXT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
+        "Игнорируй бренды, домены/URL, аббревиатуры, числа, валюты и одиночные заимствования.\n"
+        "Сравни язык каждого заголовка из <HEADINGS> с языком <TEXT>.\n"
+        "Если хотя бы один заголовок на другом языке — ответь «Нет». Если все совпадает — ответь «Да».\n"
+        "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
         f"\n<HEADINGS>\n{htxt or '—'}\n</HEADINGS>"
         f"\n\n<TEXT>\n{body}\n</TEXT>"
     )
@@ -1197,11 +1261,12 @@ def build_slug_consistency_prompt(slug: str, mt: str, md: str, mk: str, h1: str,
     h1 = (h1 or "").strip()
     content = clip((content or "").strip(), EEAT_PROMPT_MAX_CHARS)
     body = []
-    body.append("Соответствует ли SLUG тематике и языку текста? При проверке учитывать, что SLUG обычно пишется без диакритики (это нормально).")
-    body.append("Акцент — на СООТВЕТСТВИИ СОДЕРЖАНИЯ: slug должен отражать тему раздела. Допустимы мелкие отличия или заимствованные слова (например iGaming, бренды).")
-    body.append("Ответь строго «Да» или «Нет». Никаких пояснений.")
+    body.append("Проверь, отражает ли SLUG тему и язык секции.")
+    body.append("SLUG пишут без диакритики — это нормально, если он всё равно про ту же тему.")
+    body.append("Если SLUG заметно про другую тему или язык — ответь «Нет». Иначе ответь «Да».")
+    body.append("Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.")
     body.append("")
-    body.append(slug)
+    body.append(slug or "—")
     body.append("")
     if mt: body.append(f"MT: {mt}")
     if md: body.append(f"MD: {md}")
@@ -1225,14 +1290,13 @@ def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content:
     content_block = clip((content or "").strip() or "—", EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
-        "Ты — строгий валидатор совпадения языка между мета-полями и текстом секции. "
-        "Проанализируй ТОЛЬКО данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык инструкций.\n"
-        "\nПоследовательность:"
-        "\n1) Определи доминирующий язык секции по грамматике, служебным словам и фразам."
-        "\n2) Полностью игнорируй диакритику (á=а, ü=u и т.д.), бренды, домены/URL, числа, валюты и одиночные заимствованные слова."
-        "\n3) MT, MD и MK могут содержать бренды и короткие вставки на другом языке — считай их совпадающими, если основная часть соответствует языку текста."
-        "\n4) Ответь строго одним словом: «Да» (языки совпадают) или «Нет» (есть явное несоответствие)."
-        "\n5) В спорных ситуациях выбирай «Да».\n"
+        "Ты проверяешь, совпадает ли язык MT/MD/MK/H1 с языком текста секции.\n"
+        "Анализируй только содержимое блоков <META> и <CONTENT> ниже и игнорируй язык этих инструкций.\n"
+        "Определи доминирующий язык <CONTENT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
+        "Игнорируй бренды, домены/URL, числа, валюты и одиночные заимствования.\n"
+        "Сравни язык MT, MD, MK и H1 с языком <CONTENT>.\n"
+        "Если хотя бы один элемент явно на другом языке — ответь «Нет». Если всё совпадает — ответь «Да».\n"
+        "Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.\n"
         f"\n<META>\n{meta_block}\n</META>"
         f"\n\n<CONTENT>\n{content_block}\n</CONTENT>"
     )
@@ -1253,12 +1317,10 @@ def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, conte
 def build_promo_scan_prompt(full_text: str) -> str:
     full_text = clip(clean_for_prompt(full_text), PROMO_MAX_CHARS)
     return (
-        "Определи, есть ли в тексте настоящий ПРОМОКОД, написанный заглавными буквами "
-        "или характерный буквенно-цифровой шаблон. Игнорируй служебные метки вроде "
-        "«MT», «MD», «MK», «H1», «H2», «H3», «H4», а также единицы измерения «MB», "
-        "«GB», «TB» и подобные — это НЕ промокоды.\nНапример, настоящими промокодами могут быть "
-        "«CODE123», «SALE50» и т.п. Если промокодов нет — ответь «Нет».\n"
-        "Строго ответь «Да» или «Нет». Никаких комментариев.\n\n" + full_text
+        "Определи, есть ли в тексте настоящий ПРОМОКОД — заглавный буквенно-цифровой шаблон вроде «CODE123».\n"
+        "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы измерения («MB», «GB», «TB» и т.п.).\n"
+        "Если нашёл хотя бы один промокод — ответь «Да». Если не нашёл — ответь «Нет».\n"
+        "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n\n" + full_text
     )
 
 def build_promo_extract_prompt(full_text: str) -> str:
@@ -1488,18 +1550,44 @@ def validate_text_article(doc: Document) -> List[str]:
     try:
         heading_texts = [t for _, t in headings if (t or "").strip()]
         body_join = clip(" ".join([t for t in body_texts if (t or "").strip()]), ART_PROMPT_MAX_CHARS)
+        script_mismatch_found = False
         if heading_texts and body_join:
+            body_script = _dominant_script(body_join)
+            if body_script:
+                label_body = _script_label(body_script)
+                seen_script_notes: set = set()
+                for heading in heading_texts:
+                    h_script = _dominant_script(heading)
+                    if not h_script or h_script == body_script:
+                        continue
+                    script_mismatch_found = True
+                    display = first_words(heading, 6)
+                    if not display:
+                        display = clip((heading or "").strip(), 60)
+                    if not display:
+                        display = "—"
+                    key = (display, h_script)
+                    if key in seen_script_notes:
+                        continue
+                    seen_script_notes.add(key)
+                    errors.append(
+                        "Язык: заголовок «{}» написан другим алфавитом ({}), "
+                        "чем основной текст ({})".format(display, _script_label(h_script), label_body)
+                    )
             prompt = build_article_headings_vs_text_prompt(heading_texts, body_join)
             yn = llm_yesno(prompt, purpose="Headings vs Text language (article)")
-            if yn == "Нет":
+            if yn == "Нет" or script_mismatch_found:
                 prompt2 = build_article_list_problem_headings_prompt(heading_texts, body_join)
                 bad = llm_text(prompt2, purpose="List problem headings", max_tokens=256)
                 bad = re.sub(r'\s*\|\s*', ' | ', bad.strip())
                 if bad in ("—", "-", ""):
-                    errors.append("Язык: заголовки не совпадают с языком основного текста.")
+                    if not script_mismatch_found:
+                        errors.append("Язык: заголовки не совпадают с языком основного текста.")
                 else:
-                    errors.append(f"Язык: заголовки не совпадают с языком основного текста. "
-                                  f"(Проблемные заголовки: {bad}.)")
+                    errors.append(
+                        "Язык: заголовки не совпадают с языком основного текста. "
+                        f"(Проблемные заголовки: {bad}.)"
+                    )
     except KeysExhaustedError:
         raise
     except Exception as ex:
@@ -1582,6 +1670,16 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
         mk = (sec.get("MK") or "")
         h1 = (sec.get("h1") or "")
         content_texts = " ".join([t for t in (sec.get("content_texts") or []) if (t or "").strip()])
+
+        content_script = _dominant_script(content_texts)
+        if content_script:
+            h1_script = _dominant_script(h1)
+            if h1_script and h1_script != content_script:
+                se.append(
+                    "H1 написан другим алфавитом ({}) чем основной текст секции ({}).".format(
+                        _script_label(h1_script), _script_label(content_script)
+                    )
+                )
 
         # ===== НОВОЕ: строгие проверки форматирования маркеров для EEAT (исправлено/группировка) =====
         lead_list = [m for m in ("MT", "MD", "MK") if sec.get(f"{m}_leading_space")]
