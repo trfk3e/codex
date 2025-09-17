@@ -383,12 +383,42 @@ def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: i
     chat_api = getattr(client, "chat", None)
     completions_api = getattr(chat_api, "completions", None) if chat_api else None
     if completions_api is not None:
-        resp = completions_api.create(
+        common_kwargs = dict(
             model=OPENAI_MODEL,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
         )
+        resp = None
+        last_error: Optional[Exception] = None
+
+        for param_name in ("max_completion_tokens", "max_tokens"):
+            try:
+                resp = completions_api.create(
+                    **common_kwargs,
+                    **{param_name: max_tokens},
+                )
+                break
+            except TypeError as ex:
+                last_error = ex
+                text = " ".join(str(a) for a in ex.args)
+                if param_name == "max_completion_tokens" and (
+                    "unexpected" in text.lower() and param_name in text
+                ):
+                    continue
+                raise
+            except Exception as ex:
+                last_error = ex
+                text = str(getattr(ex, "message", "")) or str(ex)
+                if param_name == "max_completion_tokens" and (
+                    "unsupported" in text.lower() and param_name in text
+                ):
+                    continue
+                raise
+
+        if resp is None:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Не удалось вызвать chat.completions API")
         choice0 = getattr(resp, "choices", None)
         if isinstance(choice0, list) and choice0:
             msg0 = choice0[0]
