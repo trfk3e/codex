@@ -397,11 +397,39 @@ def _content_to_text(content: Any) -> Optional[str]:
                 stripped = value_val.strip()
                 if stripped:
                     texts.append(stripped)
-            for key in ("content", "contents", "data", "values", "items", "parts"):
+            for key in (
+                "content",
+                "contents",
+                "data",
+                "values",
+                "items",
+                "parts",
+                "choices",
+                "message",
+                "messages",
+                "output",
+                "outputs",
+                "result",
+                "response",
+                "segments",
+            ):
                 if key in obj:
                     _gather(obj[key])
             return
-        for attr in ("text", "content", "value", "data", "parts"):
+        for attr in (
+            "text",
+            "content",
+            "value",
+            "data",
+            "parts",
+            "choices",
+            "message",
+            "messages",
+            "output",
+            "outputs",
+            "result",
+            "response",
+        ):
             if hasattr(obj, attr):
                 try:
                     _gather(getattr(obj, attr))
@@ -567,12 +595,26 @@ def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: i
             if last_error is not None:
                 raise last_error
             raise RuntimeError("Не удалось вызвать chat.completions API")
-        choice0 = getattr(resp, "choices", None)
-        if isinstance(choice0, list) and choice0:
-            first_choice = choice0[0]
-            content = _extract_text_from_chat_choice(first_choice)
-            if content:
-                return content, "chat.completions"
+        choices = getattr(resp, "choices", None)
+        if isinstance(choices, list) and choices:
+            for choice in choices:
+                content = _extract_text_from_chat_choice(choice)
+                if content:
+                    return content, "chat.completions"
+
+        fallback = _content_to_text(resp)
+        if fallback:
+            return fallback, "chat.completions"
+
+        for attr in ("model_dump", "dict", "to_dict"):
+            if hasattr(resp, attr):
+                try:
+                    data = getattr(resp, attr)()
+                except Exception:
+                    continue
+                fallback = _content_to_text(data)
+                if fallback:
+                    return fallback, "chat.completions"
         raise RuntimeError("Пустой ответ от chat.completions")
 
     if last_exc is not None:
