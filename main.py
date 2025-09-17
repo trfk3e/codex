@@ -74,7 +74,7 @@ import traceback
 import asyncio
 import random
 import threading
-from typing import List, Tuple, Dict, Optional, Callable, Any
+from typing import List, Tuple, Dict, Optional, Callable, Any, Sequence, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aiogram import Bot, Dispatcher, F
@@ -1407,46 +1407,113 @@ def parse_eeat_sections(doc: Document):
 # =========================================================
 # ===================== ПРОМПТЫ LLM =======================
 # =========================================================
-def build_article_headings_vs_text_prompt(headings: List[str], body: str) -> str:
-    htxt = "\n".join([f"- {clean_for_prompt(h)}" for h in headings if (h or "").strip()])
-    body = clip(clean_for_prompt(body), ART_PROMPT_MAX_CHARS)
+def _prepare_text_lines_for_prompt(text: Union[str, Sequence[str], None]) -> List[str]:
+    if text is None:
+        return []
+    if isinstance(text, str):
+        candidates = [text]
+    else:
+        candidates = []
+        for chunk in text:
+            if chunk is None:
+                continue
+            candidates.append(str(chunk))
+    lines: List[str] = []
+    for chunk in candidates:
+        for line in re.split(r'(?:\r?\n)+', chunk):
+            cleaned = clean_for_prompt(line)
+            if cleaned:
+                lines.append(cleaned)
+    return lines
+
+
+def _format_text_for_prompt(
+    text: Union[str, Sequence[str], None],
+    prefix: str = "Текст:",
+    max_chars: Optional[int] = None,
+) -> str:
+    lines = _prepare_text_lines_for_prompt(text)
+    if not lines:
+        body = "—"
+    else:
+        body = "\n".join(lines)
+        if max_chars is not None:
+            body = clip(body, max_chars)
+    return f"{prefix}\n{body}"
+
+
+def _format_headings_for_prompt(headings: Sequence[Tuple[Optional[int], str]]) -> str:
+    formatted: List[str] = []
+    for entry in headings:
+        lvl: Optional[int]
+        text: Optional[str]
+        if isinstance(entry, tuple) and len(entry) >= 2:
+            lvl, text = entry[0], entry[1]
+        else:
+            lvl, text = None, entry  # type: ignore[assignment]
+        label = f"H{lvl}" if isinstance(lvl, int) and 1 <= lvl <= 6 else "H?"
+        text_clean = clean_for_prompt(text)
+        if text_clean:
+            text_clean = clip(text_clean, 400)
+        formatted.append(f"{label}: {text_clean or '—'}")
+    return "\n".join(formatted) if formatted else "—"
+
+
+def build_article_headings_vs_text_prompt(
+    headings: Sequence[Tuple[Optional[int], str]],
+    body: Union[str, Sequence[str], None],
+) -> str:
+    htxt = _format_headings_for_prompt(headings)
+    body_block = _format_text_for_prompt(body, prefix="Текст:", max_chars=ART_PROMPT_MAX_CHARS)
     return (
         "Ты проверяешь совпадение языка заголовков и основного текста.\n"
+        "Каждая строка в блоке <HEADINGS> начинается с H1:, H2: и т.д.\n"
         "Смотри только в блоки <HEADINGS> и <TEXT> ниже и игнорируй язык этих инструкций.\n"
         "Определи доминирующий язык блока <TEXT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, аббревиатуры, числа, валюты и одиночные заимствования.\n"
         "Сравни язык каждого заголовка из <HEADINGS> с языком <TEXT>.\n"
         "Если хотя бы один заголовок на другом языке — ответь «Нет». Если все совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
-        f"\n<HEADINGS>\n{htxt or '—'}\n</HEADINGS>"
-        f"\n\n<TEXT>\n{body}\n</TEXT>"
+        f"\n<HEADINGS>\n{htxt}\n</HEADINGS>"
+        f"\n\n<TEXT>\n{body_block}\n</TEXT>"
     )
 
-def build_article_list_problem_headings_prompt(headings: List[str], body: str) -> str:
-    htxt = "\n".join([f"- {clean_for_prompt(h)}" for h in headings if (h or "").strip()])
-    body = clip(clean_for_prompt(body), ART_PROMPT_MAX_CHARS)
+def build_article_list_problem_headings_prompt(
+    headings: Sequence[Tuple[Optional[int], str]],
+    body: Union[str, Sequence[str], None],
+) -> str:
+    htxt = _format_headings_for_prompt(headings)
+    body_block = _format_text_for_prompt(body, prefix="Текст:", max_chars=ART_PROMPT_MAX_CHARS)
     return (
         "Определи ДОМИНИРУЮЩИЙ язык <TEXT> СТРОГО по блоку <TEXT> ниже. Язык промпта на котором это написано не причем. Не упоминай его."
         "Игнорируй язык этих инструкций и всё, что вне тегов. Только язык с <TEXT>. "
         "Диакритику игнорируй (á→a, ü→u и т.п.). "
         "Игнорируй бренды/имена, домены/URL, аббревиатуры, числа/валюты и одиночные англ. заимствования.\n"
         "Сравни каждый заголовок из <HEADINGS> с языком <TEXT>. "
+        "Каждая строка в <HEADINGS> имеет вид H1:, H2: и т.д.\n"
         "Если заголовок совпадает по языку — пропусти. "
         "Если нет — укажи точную проблему.\n"
         "Начни ответ с «Да», если найдены ошибки, иначе ответь ровно «Нет».\n"
         "Если ответ «Да», на следующих строках перечисли проблемные заголовки.\n"
         "Каждый оформляй так: 'проблемный заголовок' — краткое пояснение.\n"
-        f"\n<HEADINGS>\n{htxt or '—'}\n</HEADINGS>"
-        f"\n\n<TEXT>\n{body}\n</TEXT>"
+        f"\n<HEADINGS>\n{htxt}\n</HEADINGS>"
+        f"\n\n<TEXT>\n{body_block}\n</TEXT>"
     )
 
-def build_slug_consistency_prompt(slug: str, mt: str, md: str, mk: str, h1: str, content: str) -> str:
+
+def build_slug_consistency_prompt(
+    slug: str,
+    mt: str,
+    md: str,
+    mk: str,
+    h1: str,
+    content: Union[str, Sequence[str], None],
+) -> str:
     slug = (slug or "").strip()
     mt = (mt or "").strip()
     md = (md or "").strip()
     mk = (mk or "").strip()
     h1 = (h1 or "").strip()
-    content = clip((content or "").strip(), EEAT_PROMPT_MAX_CHARS)
     body = []
     body.append("Проверь, отражает ли SLUG тему и язык секции.")
     body.append("SLUG пишут без диакритики — это нормально, если он всё равно про ту же тему.")
@@ -1460,9 +1527,7 @@ def build_slug_consistency_prompt(slug: str, mt: str, md: str, mk: str, h1: str,
     if mk: body.append(f"MK: {mk}")
     if h1: body.append(f"H1: {h1}")
     body.append("")
-    if content:
-        body.append("Текст секции:")
-        body.append(content)
+    body.append(_format_text_for_prompt(content, prefix="Текст:", max_chars=EEAT_PROMPT_MAX_CHARS))
     return "\n".join(body)
 
 def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
@@ -1473,8 +1538,8 @@ def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
     return "\n".join(lines)
 
 
-def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: str) -> str:
-    content_block = clip((content or "").strip() or "—", EEAT_PROMPT_MAX_CHARS)
+def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
+    content_block = _format_text_for_prompt(content, prefix="Текст:", max_chars=EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
         "Ты проверяешь, совпадает ли язык MT/MD/MK/H1 с языком текста секции.\n"
@@ -1489,8 +1554,8 @@ def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content:
     )
 
 
-def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, content: str) -> str:
-    content_block = clip((content or "").strip() or "—", EEAT_PROMPT_MAX_CHARS)
+def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
+    content_block = _format_text_for_prompt(content, prefix="Текст:", max_chars=EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
         "Если найдёшь несоответствие языков — ответь «Да», иначе ответь ровно «Нет».\n"
@@ -1746,15 +1811,17 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
     if document_total_images(doc) < 2: errors.append("Картинок меньше двух (минимум 2).")
 
     try:
-        heading_texts = [t for _, t in headings if (t or "").strip()]
-        body_join = clip(" ".join([t for t in body_texts if (t or "").strip()]), ART_PROMPT_MAX_CHARS)
+        heading_pairs = [(lvl, txt) for (lvl, txt) in headings if (txt or "").strip()]
+        body_blocks = [t for t in body_texts if (t or "").strip()]
+        body_sample_lines = _prepare_text_lines_for_prompt(body_blocks)
+        body_join = clip(" ".join(body_sample_lines), ART_PROMPT_MAX_CHARS)
         script_mismatch_found = False
-        if heading_texts and body_join:
+        if heading_pairs and body_join:
             body_script = _dominant_script(body_join)
             if body_script:
                 label_body = _script_label(body_script)
                 seen_script_notes: set = set()
-                for heading in heading_texts:
+                for _, heading in heading_pairs:
                     h_script = _dominant_script(heading)
                     if not h_script or h_script == body_script:
                         continue
@@ -1772,10 +1839,10 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
                         "Язык: заголовок «{}» написан другим алфавитом ({}), "
                         "чем основной текст ({})".format(display, _script_label(h_script), label_body)
                     )
-            prompt = build_article_headings_vs_text_prompt(heading_texts, body_join)
+            prompt = build_article_headings_vs_text_prompt(heading_pairs, body_blocks)
             yn = llm_yesno(prompt, purpose=purpose("Язык заголовков vs текст"))
             if yn == "Нет" or script_mismatch_found:
-                prompt2 = build_article_list_problem_headings_prompt(heading_texts, body_join)
+                prompt2 = build_article_list_problem_headings_prompt(heading_pairs, body_blocks)
                 bad_raw = llm_text(prompt2, purpose=purpose("Проблемные заголовки"), max_tokens=256)
                 bad_raw = bad_raw.strip()
                 yn_bad, bad_details = _split_yesno_details(bad_raw)
@@ -1874,7 +1941,9 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
         md = (sec.get("MD") or "")
         mk = (sec.get("MK") or "")
         h1 = (sec.get("h1") or "")
-        content_texts = " ".join([t for t in (sec.get("content_texts") or []) if (t or "").strip()])
+        content_lines = [t for t in (sec.get("content_texts") or []) if (t or "").strip()]
+        content_sample_lines = _prepare_text_lines_for_prompt(content_lines)
+        content_text_sample = clip(" ".join(content_sample_lines), EEAT_PROMPT_MAX_CHARS)
 
         section_descriptor = f"EEAT секция #{idx}"
         extra = (slug_clean.strip() or h1.strip())
@@ -1884,7 +1953,7 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
         def section_purpose(task: str) -> str:
             return f"{section_descriptor}: {task}"
 
-        content_script = _dominant_script(content_texts)
+        content_script = _dominant_script(content_text_sample)
         if content_script:
             h1_script = _dominant_script(h1)
             if h1_script and h1_script != content_script:
@@ -1922,7 +1991,7 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
 
         # 1) slug ↔ содержимое
         try:
-            prompt = build_slug_consistency_prompt(slug_clean, mt, md, mk, h1, content_texts)
+            prompt = build_slug_consistency_prompt(slug_clean, mt, md, mk, h1, content_lines)
             yn = llm_yesno(prompt, purpose=section_purpose("SLUG ↔ содержимое"))
             if yn == "Нет":
                 se.append("SLUG не соответствует содержимому секции либо написан некорректно\n(Совет: сделайте /slug с заголовка или уточните у ChatGPT).")
@@ -1933,10 +2002,10 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
 
         # 2) MT/MD/MK/H1 ↔ язык текста секции
         try:
-            prompt = build_section_lang_match_prompt(mt, md, mk, h1, content_texts)
+            prompt = build_section_lang_match_prompt(mt, md, mk, h1, content_lines)
             yn = llm_yesno(prompt, purpose=section_purpose("Язык элементов"))
             if yn == "Нет":
-                prompt2 = build_section_lang_list_bad_prompt(mt, md, mk, h1, content_texts)
+                prompt2 = build_section_lang_list_bad_prompt(mt, md, mk, h1, content_lines)
                 bad_raw = llm_text(prompt2, purpose=section_purpose("Проблемные элементы"), max_tokens=64).strip()
                 ans_bad, tokens = _parse_yesno_list(bad_raw)
                 filtered = [t for t in tokens if t.upper() not in EEAT_LANGUAGE_IGNORE_CODES]
