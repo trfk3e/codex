@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 DOCX Validator Telegram Bot — Articles & EEAT (Zoho Writer API)
-ВЕРСИЯ: 2.0.0 — Gemini API switch, multi Gemini keys, robust DOCX patch, improved prompts, promo-code scan
+ВЕРСИЯ: 2.1.0 — GPT‑5 mini integration, responses API fallback, admin-only keys menu, robust DOCX patch, improved prompts, promo-code scan
 Дата: 2025‑09‑15
 """
 
@@ -14,13 +14,12 @@ import os  # <— важно: os должен быть раньше исполь
 BOT_TOKEN = "7506878864:AAEsjLOa0yT-WfB-4AKhrhFA3xopuJzaHPY"
 
 # 2) ID администратора (целое число).
-#    Только этот пользователь увидит кнопку/команду «Добавить Gemini Keys».
+#    Только этот пользователь увидит кнопку/команду «Добавить OpenAI Keys».
 #    Пример: ALLOWED_USER_ID = 123456789
 ADMIN_TG_ID = 408198196  # <-- введите свой Telegram ID
 
-# 3) Модель Gemini (быстро/дёшево)
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_API_BASE = os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com").rstrip("/")
+# 3) Модель OpenAI (GPT‑5 mini по умолчанию)
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 
 # 4) Путь к локальной БД (сюда сохраняются ключи и служебное состояние)
 DB_PATH = "bot_state.sqlite3"
@@ -33,9 +32,9 @@ ZOHO_ACCOUNTS_URL  = os.environ.get("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.
 ZOHOAPIS_DOMAIN_DEFAULT = os.environ.get("ZOHOAPIS_DOMAIN", "www.zohoapis.com")
 
 # 6) Производительность / лимиты
-GEMINI_TIMEOUT_SEC     = float(os.environ.get("GEMINI_TIMEOUT", "25.0"))
-GEMINI_POOL_MAXCONN    = int(os.environ.get("GEMINI_POOL_MAXCONN", "12"))
-GEMINI_MAX_RETRIES_LOCAL  = int(os.environ.get("GEMINI_MAX_RETRIES", "1"))
+OPENAI_TIMEOUT_SEC     = float(os.environ.get("OPENAI_TIMEOUT", "25.0"))
+OPENAI_POOL_MAXCONN    = int(os.environ.get("OPENAI_POOL_MAXCONN", "12"))
+LLM_MAX_RETRIES_LOCAL  = int(os.environ.get("OPENAI_MAX_RETRIES", "1"))
 PROMO_MAX_CHARS        = int(os.environ.get("PROMO_MAX_CHARS", "12000"))
 EEAT_PROMPT_MAX_CHARS  = int(os.environ.get("EEAT_PROMPT_MAX_CHARS", "6000"))
 ART_PROMPT_MAX_CHARS   = int(os.environ.get("ART_PROMPT_MAX_CHARS", "6000"))
@@ -89,6 +88,8 @@ except Exception:
     _URLLIB3_Retry = None
 
 import httpx
+from openai import OpenAI
+
 BAR = "═" * 26
 WORD_JOINER = "\u2060"
 
@@ -142,19 +143,19 @@ def db_init():
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS gemini_keys (
+            CREATE TABLE IF NOT EXISTS openai_keys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sk TEXT NOT NULL UNIQUE,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
         try:
-            cur = conn.execute("PRAGMA table_info(gemini_keys)")
+            cur = conn.execute("PRAGMA table_info(openai_keys)")
             cols = {r[1] for r in cur.fetchall()}
             if "sk" not in cols:
-                conn.execute(f"ALTER TABLE gemini_keys RENAME TO gemini_keys_backup_{int(time.time())}")
+                conn.execute(f"ALTER TABLE openai_keys RENAME TO openai_keys_backup_{int(time.time())}")
                 conn.execute("""
-                    CREATE TABLE gemini_keys (
+                    CREATE TABLE openai_keys (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         sk TEXT NOT NULL UNIQUE,
                         created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
@@ -162,29 +163,24 @@ def db_init():
                 """)
         except Exception:
             pass
-
         try:
-            cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='openai_keys'")
+            cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gemini_keys'")
             if cur.fetchone():
-                conn.execute("""
-                    INSERT OR IGNORE INTO gemini_keys(sk, created_at)
-                    SELECT sk, created_at FROM openai_keys
-                """)
-                conn.execute("DROP TABLE openai_keys")
+                conn.execute("DROP TABLE gemini_keys")
         except Exception:
             pass
         conn.commit()
 
 def db_add_keys_bulk(text: str) -> int:
     text = text or ""
-    candidates = re.findall(r'\bAIza[0-9A-Za-z_\-]{20,}\b', text)
+    candidates = re.findall(r'\b(?:sk|rk)-[A-Za-z0-9_\-]{15,}\b', text)
     added = 0
     if not candidates:
         return 0
     with sqlite3.connect(DB_PATH) as conn:
         for sk in candidates:
             try:
-                conn.execute("INSERT OR IGNORE INTO gemini_keys(sk) VALUES(?)", (sk.strip(),))
+                conn.execute("INSERT OR IGNORE INTO openai_keys(sk) VALUES(?)", (sk.strip(),))
                 added += 1
             except Exception:
                 pass
@@ -193,17 +189,17 @@ def db_add_keys_bulk(text: str) -> int:
 
 def db_list_keys() -> List[str]:
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT sk FROM gemini_keys ORDER BY id ASC")
+        cur = conn.execute("SELECT sk FROM openai_keys ORDER BY id ASC")
         return [r[0] for r in cur.fetchall()]
 
 def db_clear_keys() -> int:
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("DELETE FROM gemini_keys")
+        cur = conn.execute("DELETE FROM openai_keys")
         conn.commit()
         return cur.rowcount
 
 # =========================================================
-# ==============  GEMINI (карусель ключей)  ===============
+# ==============  OPENAI (карусель ключей)  ===============
 # =========================================================
 import contextlib
 
@@ -212,141 +208,166 @@ class KeysExhaustedError(RuntimeError):
 
 def _httpx_client():
     return httpx.Client(
-        timeout=GEMINI_TIMEOUT_SEC,
-        limits=httpx.Limits(max_connections=GEMINI_POOL_MAXCONN, max_keepalive_connections=GEMINI_POOL_MAXCONN),
+        timeout=OPENAI_TIMEOUT_SEC,
+        limits=httpx.Limits(max_connections=OPENAI_POOL_MAXCONN, max_keepalive_connections=OPENAI_POOL_MAXCONN),
         follow_redirects=True,
     )
 
-def _message_to_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, (int, float)):
-        return str(content)
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            txt = _message_to_text(item)
-            if txt:
-                parts.append(txt)
-        return "\n".join(parts)
-    if isinstance(content, dict):
-        if isinstance(content.get("text"), str):
-            return content["text"]
-        if content.get("type") == "text" and isinstance(content.get("text"), str):
-            return content["text"]
-        if isinstance(content.get("content"), str):
-            return content["content"]
-    return str(content)
+def _openai_client_for_key(sk: str) -> OpenAI:
+    return OpenAI(api_key=sk, http_client=_httpx_client())
 
-def _convert_messages_to_gemini(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
-    system_parts: List[str] = []
-    contents: List[Dict[str, Any]] = []
+def _responses_input_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    formatted: List[Dict[str, Any]] = []
     for msg in messages or []:
-        role = (msg.get("role") or "").lower()
-        text = _message_to_text(msg.get("content"))
-        if not text:
-            continue
-        if role == "system":
-            system_parts.append(text)
-            continue
-        if role in ("assistant", "model"):
-            gemini_role = "model"
+        role = str(msg.get("role") or "user")
+        content = msg.get("content", "")
+        blocks: List[Dict[str, str]] = []
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") and "text" in part:
+                    blocks.append({"type": part.get("type", "text"), "text": str(part.get("text", ""))})
+                elif isinstance(part, str):
+                    blocks.append({"type": "text", "text": part})
+                else:
+                    blocks.append({"type": "text", "text": str(part)})
         else:
-            gemini_role = "user"
-        contents.append({"role": gemini_role, "parts": [{"text": text}]})
-    system_instruction = "\n\n".join(system_parts).strip() if system_parts else None
-    return system_instruction, contents
+            blocks.append({"type": "text", "text": str(content or "")})
+        formatted.append({"role": role, "content": blocks})
+    return formatted
 
-def _extract_gemini_text(data: Dict[str, Any]) -> str:
-    if not isinstance(data, dict):
-        return ""
-    candidates = data.get("candidates")
-    if isinstance(candidates, list):
-        for cand in candidates:
-            if not isinstance(cand, dict):
+def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
+    if resp is None:
+        return None
+
+    text_attr = getattr(resp, "output_text", None)
+    if isinstance(text_attr, str) and text_attr.strip():
+        return text_attr.strip()
+
+    output = getattr(resp, "output", None)
+    texts: List[str] = []
+
+    def _gather(obj: Any):
+        if obj is None:
+            return
+        if isinstance(obj, str):
+            texts.append(obj)
+            return
+        if isinstance(obj, list):
+            for item in obj:
+                _gather(item)
+            return
+        if isinstance(obj, dict):
+            typ = obj.get("type")
+            if isinstance(typ, str) and typ.lower() in {"output_text", "text"} and isinstance(obj.get("text"), str):
+                texts.append(obj["text"])
+            for key in ("content", "contents", "items", "data", "output"):
+                if key in obj:
+                    _gather(obj[key])
+            return
+        for attr_name in ("text", "value"):
+            if hasattr(obj, attr_name):
+                val = getattr(obj, attr_name)
+                if isinstance(val, str):
+                    texts.append(val)
+        for attr_name in ("content", "contents"):
+            if hasattr(obj, attr_name):
+                _gather(getattr(obj, attr_name))
+
+    if output:
+        _gather(output)
+    if texts:
+        combined = "".join(texts).strip()
+        if combined:
+            return combined
+
+    for attr in ("model_dump", "dict", "to_dict"):
+        if hasattr(resp, attr):
+            try:
+                data = getattr(resp, attr)()
+            except Exception:
                 continue
-            content = cand.get("content") or {}
-            parts = content.get("parts") if isinstance(content, dict) else None
-            texts: List[str] = []
-            if isinstance(parts, list):
-                for part in parts:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        texts.append(part["text"])
-            text = "\n".join(t for t in texts if t).strip()
+            _gather(data)
+            if texts:
+                combined = "".join(texts).strip()
+                if combined:
+                    return combined
+    return None
+
+def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> str:
+    last_exc: Optional[Exception] = None
+    responses_api = getattr(client, "responses", None)
+    if responses_api is not None:
+        try:
+            resp = responses_api.create(
+                model=OPENAI_MODEL,
+                input=_responses_input_from_messages(messages),
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
+            text = _extract_text_from_openai_response(resp)
             if text:
                 return text
-            finish_reason = (cand.get("finishReason") or "").upper()
-            if finish_reason and finish_reason not in {"", "STOP", "MAX_TOKENS"}:
-                raise RuntimeError(f"Ответ отклонён моделью: {finish_reason}")
-    prompt_feedback = data.get("promptFeedback")
-    if isinstance(prompt_feedback, dict):
-        reason = prompt_feedback.get("blockReason")
-        if reason:
-            raise RuntimeError(f"Запрос отклонён моделью: {reason}")
-    return ""
+            raise RuntimeError("Пустой ответ от Responses API")
+        except Exception as ex:
+            last_exc = ex
 
-def _call_gemini_with_keys(messages: List[Dict], max_tokens: int = 64, temperature: float = 0.0) -> str:
+    chat_api = getattr(client, "chat", None)
+    completions_api = getattr(chat_api, "completions", None) if chat_api else None
+    if completions_api is not None:
+        resp = completions_api.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        choice0 = getattr(resp, "choices", None)
+        if isinstance(choice0, list) and choice0:
+            msg0 = choice0[0]
+            content = None
+            if isinstance(msg0, dict):
+                content = ((msg0.get("message") or {}).get("content")) or msg0.get("text")
+            else:
+                message_attr = getattr(msg0, "message", None)
+                if message_attr is not None:
+                    content = getattr(message_attr, "content", None)
+                if content is None:
+                    content = getattr(msg0, "text", None)
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+        raise RuntimeError("Пустой ответ от chat.completions")
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("У клиента OpenAI нет поддерживаемых методов Responses/chat")
+
+def _call_openai_with_keys(messages: List[Dict], max_tokens: int = 64, temperature: float = 0.0) -> str:
     keys = db_list_keys()
-    env_sk = os.environ.get("GEMINI_API_KEY")
+    env_sk = os.environ.get("OPENAI_API_KEY")
     if env_sk and env_sk not in keys:
         keys.append(env_sk)
 
     if not keys:
-        raise KeysExhaustedError("Нет ни одного Gemini API Key")
+        raise KeysExhaustedError("Нет ни одного OpenAI API Key")
 
-    system_instruction, contents = _convert_messages_to_gemini(messages)
-    if not contents:
-        raise RuntimeError("Пустой запрос к модели")
-
-    last_exc: Optional[Exception] = None
-    client = _httpx_client()
-    try:
-        for round_idx in (1, 2):
-            for sk in keys:
-                local_exc: Optional[Exception] = None
-                for attempt in range(GEMINI_MAX_RETRIES_LOCAL + 1):
+    last_exc = None
+    for round_idx in (1, 2):
+        for sk in keys:
+            try:
+                client = _openai_client_for_key(sk)
+                local_exc = None
+                for attempt in range(LLM_MAX_RETRIES_LOCAL + 1):
                     try:
-                        payload: Dict[str, Any] = {"contents": contents}
-                        if system_instruction:
-                            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-                        generation_config: Dict[str, Any] = {}
-                        if max_tokens is not None:
-                            generation_config["maxOutputTokens"] = int(max_tokens)
-                        if temperature is not None:
-                            generation_config["temperature"] = float(temperature)
-                        if generation_config:
-                            payload["generationConfig"] = generation_config
-
-                        response = client.post(
-                            f"{GEMINI_API_BASE}/v1beta/models/{GEMINI_MODEL}:generateContent",
-                            params={"key": sk},
-                            json=payload,
-                        )
-                        if response.status_code >= 400:
-                            try:
-                                err_json = response.json()
-                                err_msg = err_json.get("error", {}).get("message") or response.text
-                            except Exception:
-                                err_msg = response.text
-                            raise RuntimeError(f"HTTP {response.status_code}: {err_msg}")
-
-                        data = response.json()
-                        text = _extract_gemini_text(data)
-                        if text:
-                            return text.strip()
-                        raise RuntimeError("Модель не вернула текст")
+                        answer = _invoke_openai(client, messages, max_tokens, temperature)
+                        if isinstance(answer, str) and answer.strip():
+                            return answer.strip()
+                        raise RuntimeError("Пустой ответ модели OpenAI")
                     except Exception as ex:
                         local_exc = ex
                         time.sleep(0.2 * (attempt + 1))
-                        continue
-                if local_exc:
-                    last_exc = RuntimeError(f"[{mask_secret(sk, 4, 4)}] {local_exc}")
-                    time.sleep(0.2 * (round_idx + 1))
-    finally:
-        client.close()
-
+                last_exc = local_exc
+            except Exception as ex:
+                last_exc = ex
+                continue
     raise KeysExhaustedError(f"Не удалось получить ответ от модели: {last_exc}")
 
 def _normalize_yesno(s: str) -> Optional[str]:
@@ -369,12 +390,12 @@ def llm_yesno(question: str, purpose: str) -> str:
                     "Отвечай ТОЛЬКО одним словом: «Да» или «Нет». Никаких комментариев."},
         {"role": "user", "content": question}
     ]
-    raw = _call_gemini_with_keys(messages=messages, max_tokens=4, temperature=0.0)
+    raw = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0)
     yn = _normalize_yesno(raw)
     if yn in ("Да", "Нет"):
         return yn
     messages.append({"role": "user", "content": "Напомню: нужно одно слово — «Да» или «Нет»."})
-    raw2 = _call_gemini_with_keys(messages=messages, max_tokens=4, temperature=0.0)
+    raw2 = _call_openai_with_keys(messages=messages, max_tokens=4, temperature=0.0)
     yn2 = _normalize_yesno(raw2)
     if yn2 in ("Да", "Нет"):
         return yn2
@@ -386,7 +407,7 @@ def llm_text(question: str, purpose: str, max_tokens: int = 256) -> str:
          "content": "Ты краткий русскоязычный ассистент. Пиши только то, что просят, без лишних слов."},
         {"role": "user", "content": question}
     ]
-    return _call_gemini_with_keys(messages=messages, max_tokens=max_tokens, temperature=0.0)
+    return _call_openai_with_keys(messages=messages, max_tokens=max_tokens, temperature=0.0)
 
 # =========================================================
 # ================= DOCX без KeyError (patch) =============
@@ -1812,7 +1833,7 @@ async def setup_menu_commands(bot: Bot, chat_id: Optional[int] = None):
                 commands=[
                     BotCommand(command="start", description="Запустить бота"),
                     BotCommand(command="help", description="Как пользоваться валидатором"),
-                    BotCommand(command="keys_add", description="Добавить Gemini ключи"),
+                    BotCommand(command="keys_add", description="Добавить OpenAI ключи"),
                     BotCommand(command="keys_list", description="Список ключей"),
                     BotCommand(command="keys_clear", description="Удалить все ключи"),
                 ],
@@ -1895,7 +1916,7 @@ async def on_help(message: Message):
         "Отправьте построчно пары `название<TAB/пробел>ссылка/путь`.\n"
         "`eeat <ссылка/путь>` — EEAT‑проверка.\n"
         "Ссылки: `https://writer.zoho.{dc}/writer/open/<id>` или локальные пути к .docx.\n\n"
-        "Администратор управляет ключами Gemini через меню команд возле строки ввода."
+        "Администратор управляет ключами OpenAI через меню команд возле строки ввода."
     )
 
 @dp.message(Command("keys_add"))
@@ -1905,8 +1926,8 @@ async def on_keys_add(message: Message):
         return
     _PENDING_KEYS[message.chat.id] = True
     await message.answer(
-        "Пришлите ключи Gemini (каждый в новой строке). Пример:\n"
-        "AIzaSy...\nAIzaSy...\n\n"
+        "Пришлите ключи OpenAI (каждый в новой строке). Пример:\n"
+        "sk-proj-...\nsk-...\n\n"
         "Будут сохранены только корректные строки, дубликаты игнорируются."
     )
 
@@ -1948,9 +1969,9 @@ async def on_text(message: Message):
         return
 
     keys = db_list_keys()
-    if not keys and not os.environ.get("GEMINI_API_KEY"):
+    if not keys and not os.environ.get("OPENAI_API_KEY"):
         if is_admin(getattr(message.from_user, "id", None)):
-            await message.answer("Бот не настроен: нет ключей Gemini. Добавьте через /keys_add.")
+            await message.answer("Бот не настроен: нет ключей OpenAI. Добавьте через /keys_add.")
         else:
             await message.answer("Бот временно не настроен. Сообщите администратору.")
         return
