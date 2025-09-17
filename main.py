@@ -74,7 +74,7 @@ import traceback
 import asyncio
 import random
 import threading
-from typing import List, Tuple, Dict, Optional, Callable, Any, Sequence, Union
+from typing import List, Tuple, Dict, Optional, Callable, Awaitable, Any, Sequence, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aiogram import Bot, Dispatcher, F
@@ -2541,11 +2541,20 @@ def validate_eeat_from_url(url: str, tmpdir: Optional[str] = None) -> Tuple[bool
 
 async def run_full_validation_async(project: str,
                                     articles: List[Tuple[str, str]],
-                                    eeat_link: Optional[str] = None) -> Tuple[bool, str, List[Tuple[str, str]], Optional[str]]:
+                                    eeat_link: Optional[str] = None,
+                                    progress_cb: Optional[Callable[[str], Awaitable[None]]] = None) -> Tuple[bool, str, List[Tuple[str, str]], Optional[str]]:
     tmpdir = tempfile.mkdtemp(prefix="docxv_")
     sem = asyncio.Semaphore(max(1, VALIDATOR_CONCURRENCY))
     per_item_logs: List[Tuple[str, str]] = []
     zip_items: List[Tuple[str, str]] = []
+
+    async def report(stage: str) -> None:
+        if not progress_cb:
+            return
+        try:
+            await progress_cb(stage)
+        except Exception:
+            pass
 
     async def run_article(tag: str, url: str):
         async with sem:
@@ -2559,8 +2568,35 @@ async def run_full_validation_async(project: str,
         tasks = [asyncio.create_task(run_article(tag, url)) for tag, url in articles]
         eeat_task = asyncio.create_task(run_eeat(eeat_link)) if eeat_link else None
 
+        total_articles = len(tasks)
+        article_done = 0
+        article_lock = asyncio.Lock()
+
+        if total_articles:
+            await report(f"Проверяем статьи (0 из {total_articles})")
+        elif eeat_task:
+            await report("Проверяем EEAT документ")
+
+        async def on_article_done() -> None:
+            nonlocal article_done
+            async with article_lock:
+                article_done += 1
+                await report(f"Проверяем статьи ({article_done} из {total_articles})")
+                if article_done == total_articles and eeat_task and not eeat_task.done():
+                    await report("Проверяем EEAT документ")
+
+        def _article_callback(_task: asyncio.Task) -> None:
+            if progress_cb:
+                asyncio.create_task(on_article_done())
+
+        for task in tasks:
+            task.add_done_callback(_article_callback)
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
         eeat_result = await asyncio.gather(eeat_task, return_exceptions=True) if eeat_task else []
+
+        if eeat_task:
+            await report("EEAT документ обработан")
 
         overall_ok = True
         report_lines: List[str] = []
@@ -2923,7 +2959,7 @@ async def on_text(message: Message):
         await update_progress("Идет проверка документов")
         try:
             overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
-                "Project", articles, eeat_link
+                "Project", articles, eeat_link, progress_cb=update_progress
             )
             await update_progress("Собираем результаты")
             final_msg = build_single_message("Project", per_item_logs, overall_ok)
