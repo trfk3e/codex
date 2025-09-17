@@ -78,6 +78,7 @@ from typing import List, Tuple, Dict, Optional, Callable, Any, Sequence, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (Message, FSInputFile, CallbackQuery, BotCommand,
                            BotCommandScopeDefault, BotCommandScopeChat)
@@ -2889,18 +2890,54 @@ async def on_text(message: Message):
 
         progress_message: Optional[Message] = None
         current_stage: Optional[str] = None
+        progress_cleanup_stage: Optional[str] = None
 
         async def update_stage(stage: str) -> None:
-            nonlocal current_stage
+            nonlocal current_stage, progress_message
             if not progress_message:
                 return
             if current_stage == stage:
                 return
-            current_stage = stage
-            with contextlib.suppress(Exception):
-                await progress_message.edit_text(
+            try:
+                updated = await progress_message.edit_text(
                     f"⌛Ожидайте... программа на этапе: {stage}"
                 )
+            except TelegramBadRequest as exc:
+                details = (exc.message or str(exc)).lower()
+                if "message is not modified" in details:
+                    current_stage = stage
+                else:
+                    return
+            except Exception:
+                return
+            else:
+                if isinstance(updated, Message):
+                    progress_message = updated
+                current_stage = stage
+
+        async def finalize_progress(final_stage: Optional[str] = None) -> None:
+            nonlocal progress_message, current_stage
+            if not progress_message:
+                return
+            if final_stage:
+                await update_stage(final_stage)
+            await asyncio.sleep(0.1)
+            try:
+                await progress_message.delete()
+            except TelegramBadRequest as exc:
+                details = (exc.message or str(exc)).lower()
+                if "message to delete not found" in details or "message can't be deleted" in details:
+                    with contextlib.suppress(Exception):
+                        await progress_message.edit_text("✅ Готово")
+                else:
+                    with contextlib.suppress(Exception):
+                        await progress_message.edit_text("✅ Готово")
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await progress_message.edit_text("✅ Готово")
+            finally:
+                progress_message = None
+                current_stage = None
 
         try:
             progress_message = await message.answer(
@@ -2933,6 +2970,7 @@ async def on_text(message: Message):
                     text=final_msg,
                     disable_web_page_preview=True
                 )
+            progress_cleanup_stage = "Готово"
         except KeysExhaustedError as ex:
             await update_stage("Возникла ошибка")
             await message.answer("Закончились ключи, пишите @locosd")
@@ -2942,12 +2980,7 @@ async def on_text(message: Message):
             await update_stage("Возникла ошибка")
             await message.answer(f"🛑 Внутренняя ошибка: {ex}")
         finally:
-            if progress_message:
-                with contextlib.suppress(Exception):
-                    await message.bot.delete_message(
-                        chat_id=progress_message.chat.id,
-                        message_id=progress_message.message_id,
-                    )
+            await finalize_progress(progress_cleanup_stage)
     finally:
         await maybe_send_admin_debug_logs(message)
 
