@@ -404,29 +404,41 @@ def _messages_preview(messages: List[Dict[str, Any]], limit: int = 600) -> str:
 
 def _message_content_to_text(content: Any) -> str:
     if isinstance(content, list):
-        texts: List[str] = []
+        pieces: List[str] = []
         for part in content:
             if isinstance(part, dict):
-                txt = str(part.get("text") or "")
+                if "text" in part:
+                    txt = part.get("text")
+                else:
+                    txt = part
             else:
-                txt = str(part)
-            if txt:
-                texts.append(txt.strip())
-        text = " ".join(texts)
-    else:
-        text = str(content or "")
-    return text.strip()
+                txt = part
+            if txt is None:
+                continue
+            s = str(txt)
+            if not s:
+                continue
+            s = s.replace("\r\n", "\n").replace("\r", "\n")
+            pieces.append(s)
+        if not pieces:
+            return ""
+        if len(pieces) == 1:
+            return pieces[0]
+        return "\n\n".join(pieces)
+    if content is None:
+        return ""
+    text = str(content)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _format_messages_for_log(messages: List[Dict[str, Any]]) -> str:
-    lines: List[str] = []
+    blocks: List[str] = []
     for msg in messages or []:
         role = str(msg.get("role") or "?")
         text = _message_content_to_text(msg.get("content"))
-        if not text:
-            text = "(пусто)"
-        lines.append(f"{role}: {text}")
-    return "\n".join(lines)
+        block = f"{role}:\n{text if text else '(пусто)'}"
+        blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 def _format_exception(ex: BaseException) -> str:
