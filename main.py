@@ -1438,9 +1438,42 @@ def _prepare_text_lines_for_prompt(text: Union[str, Sequence[str], None]) -> Lis
     return lines
 
 
+def _format_heading_text_block(
+    label: str,
+    heading: Union[str, None],
+    text: Union[str, Sequence[str], None],
+    max_chars: Optional[int] = None,
+) -> str:
+    heading_clean = strip_invisible(heading or "").strip()
+    if heading_clean and len(heading_clean) > 600:
+        trimmed = heading_clean[:600].rstrip()
+        heading_clean = (
+            f"{trimmed}\n"
+            f"[Обрезано: показано 600 из {len(heading_clean)} символов]"
+        )
+
+    lines = [f"Заголовок {label}: {heading_clean or '—'}"]
+
+    prepared_body = _prepare_text_lines_for_prompt(text)
+    if prepared_body:
+        lines.append("Текст:")
+        lines.extend(prepared_body)
+    else:
+        lines.append("Текст: —")
+
+    block = "\n".join(lines)
+    if max_chars is not None and len(block) > max_chars:
+        visible = block[:max_chars].rstrip()
+        block = (
+            f"{visible}\n"
+            f"[Обрезано: показано {max_chars} из {len(block)} символов]"
+        )
+    return block
+
+
 def _format_text_for_prompt(
     text: Union[str, Sequence[str], None],
-    prefix: str = "Text",
+    prefix: str = "Текст",
     max_chars: Optional[int] = None,
 ) -> str:
     lines = _prepare_text_lines_for_prompt(text)
@@ -1488,22 +1521,8 @@ def _format_article_sections_for_prompt(
     lines: List[str] = []
     for idx, (lvl, heading, body_lines) in enumerate(sections, 1):
         label = f"H{lvl}" if isinstance(lvl, int) and 1 <= lvl <= 6 else "H?"
-        heading_clean = strip_invisible(heading or "").strip()
-        if heading_clean and len(heading_clean) > 600:
-            trimmed = heading_clean[:600].rstrip()
-            heading_clean = (
-                f"{trimmed}\n"
-                f"[Обрезано: показано 600 из {len(heading_clean)} символов]"
-            )
-        lines.append(f"Заголовок {label}: {heading_clean or '—'}")
-
-        prepared_body = _prepare_text_lines_for_prompt(body_lines)
-        if prepared_body:
-            lines.append("Текст:")
-            lines.extend(prepared_body)
-        else:
-            lines.append("Текст: —")
-
+        block = _format_heading_text_block(label, heading, body_lines)
+        lines.append(block)
         if idx != len(sections):
             lines.append("")
 
@@ -1563,33 +1582,38 @@ def build_slug_consistency_prompt(
     md = (md or "").strip()
     mk = (mk or "").strip()
     h1 = (h1 or "").strip()
-    body = []
-    body.append("Проверь, отражает ли SLUG тему и язык секции.")
-    body.append("SLUG пишут без диакритики — это нормально, если он всё равно про ту же тему.")
-    body.append("Если SLUG заметно про другую тему или язык — ответь «Нет». Иначе ответь «Да».")
-    body.append("Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.")
-    body.append("Каждый текстовый фрагмент ниже помечен строкой «Text:» (если он один) или «Text #N:» (если их несколько).")
-    body.append("")
-    body.append(slug or "—")
-    body.append("")
-    if mt: body.append(f"MT: {mt}")
-    if md: body.append(f"MD: {md}")
-    if mk: body.append(f"MK: {mk}")
-    if h1: body.append(f"H1: {h1}")
-    body.append("")
-    body.append(_format_text_for_prompt(content, prefix="Text", max_chars=EEAT_PROMPT_MAX_CHARS))
+    body = [
+        "Проверь, отражает ли SLUG тему и язык секции.",
+        "SLUG пишут без диакритики — это нормально, если он всё равно про ту же тему.",
+        "Если SLUG заметно про другую тему или язык — ответь «Нет». Иначе ответь «Да».",
+        "Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.",
+        "Все фрагменты ниже оформлены парами «Заголовок ...» и «Текст:».",
+        "",
+        "<SLUG>",
+        _format_heading_text_block("SLUG", slug or "—", None),
+        "</SLUG>",
+        "",
+        "<META>",
+        _format_meta_block(mt, md, mk, h1),
+        "</META>",
+        "",
+        "<CONTENT>",
+        _format_heading_text_block("H1", h1, content, max_chars=EEAT_PROMPT_MAX_CHARS),
+        "</CONTENT>",
+    ]
     return "\n".join(body)
 
 def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
-    lines = ["MT: " + ((mt or "").strip() or "—"),
-             "MD: " + ((md or "").strip() or "—"),
-             "MK: " + ((mk or "").strip() or "—"),
-             "H1: " + ((h1 or "").strip() or "—")]
-    return "\n".join(lines)
+    blocks = [
+        _format_heading_text_block("MT", mt, None),
+        _format_heading_text_block("MD", md, None),
+        _format_heading_text_block("MK", mk, None),
+        _format_heading_text_block("H1", h1, None),
+    ]
+    return "\n\n".join(blocks)
 
 
 def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
-    content_block = _format_text_for_prompt(content, prefix="Text", max_chars=EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
         "Ты проверяешь, совпадает ли язык MT/MD/MK/H1 с языком текста секции.\n"
@@ -1597,43 +1621,46 @@ def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content:
         "Определи доминирующий язык <CONTENT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, числа, валюты и одиночные заимствования.\n"
         "Сравни язык MT, MD, MK и H1 с языком <CONTENT>.\n"
-        "Каждый фрагмент текста в <CONTENT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
+        "Каждый блок оформлен через «Заголовок ...» и «Текст:», чтобы не путаться.\n"
         "Если хотя бы один элемент явно на другом языке — ответь «Нет». Если всё совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.\n"
         f"\n<META>\n{meta_block}\n</META>"
-        f"\n\n<CONTENT>\n{content_block}\n</CONTENT>"
+        f"\n\n<CONTENT>\n{_format_heading_text_block('H1', h1, content, max_chars=EEAT_PROMPT_MAX_CHARS)}\n</CONTENT>"
     )
 
 
 def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, content: Union[str, Sequence[str], None]) -> str:
-    content_block = _format_text_for_prompt(content, prefix="Text", max_chars=EEAT_PROMPT_MAX_CHARS)
     meta_block = _format_meta_block(mt, md, mk, h1)
     return (
         "Если найдёшь несоответствие языков — ответь «Да», иначе ответь ровно «Нет».\n"
         "Если ответ «Да», перечисли ТОЛЬКО ярлыки из набора MT | MD | MK | H1, разделяя их через « | ». Никаких пояснений.\n"
         "Анализируй исключительно данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык этих инструкций."
         "\nПомни: бренды, домены и одиночные заимствованные слова не считаются сменой языка; оценивай основную часть текста.\n"
-        "Каждый фрагмент текста в <CONTENT> начинается строкой «Text:» (если он один) или «Text #N:» (если их несколько).\n"
+        "Все блоки оформлены парами «Заголовок ...» и «Текст:».\n"
         f"\n<META>\n{meta_block}\n</META>"
-        f"\n\n<CONTENT>\n{content_block}\n</CONTENT>"
+        f"\n\n<CONTENT>\n{_format_heading_text_block('H1', h1, content, max_chars=EEAT_PROMPT_MAX_CHARS)}\n</CONTENT>"
     )
 
 def build_promo_scan_prompt(full_text: str) -> str:
-    full_text = clip(clean_for_prompt(full_text), PROMO_MAX_CHARS)
+    block = _format_heading_text_block("H?", "—", full_text, max_chars=PROMO_MAX_CHARS)
     return (
         "Определи, есть ли в тексте настоящий ПРОМОКОД — заглавный буквенно-цифровой шаблон вроде «CODE123».\n"
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы измерения («MB», «GB», «TB» и т.п.).\n"
         "Если нашёл хотя бы один промокод — ответь «Да». Если не нашёл — ответь «Нет».\n"
-        "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n\n" + full_text
+        "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
+        "Текст передан в блоке с пометками «Заголовок H?: ...» и «Текст:».\n\n"
+        f"{block}"
     )
 
 def build_promo_extract_prompt(full_text: str) -> str:
-    full_text = clip(clean_for_prompt(full_text), PROMO_MAX_CHARS)
+    block = _format_heading_text_block("H?", "—", full_text, max_chars=PROMO_MAX_CHARS)
     return (
         "Выпиши из текста только настоящие ПРОМОКОДЫ (заглавные буквенно-цифровые шаблоны). "
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы "
         "измерения («MB», «GB», «TB» и т.п.). Если промокоды найдены, начни ответ с «Да» и на той же строке "
-        "после двоеточия перечисли их через « | ». Если промокодов нет — ответь ровно «Нет».\n\n" + full_text
+        "после двоеточия перечисли их через « | ». Если промокодов нет — ответь ровно «Нет».\n\n"
+        "Текст передан в блоке с пометками «Заголовок H?: ...» и «Текст:».\n\n"
+        f"{block}"
     )
 
 def filter_promo_codes(raw: str) -> List[str]:
