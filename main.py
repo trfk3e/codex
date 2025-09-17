@@ -1438,6 +1438,15 @@ def _prepare_text_lines_for_prompt(text: Union[str, Sequence[str], None]) -> Lis
     return lines
 
 
+def _is_meaningful_heading(text: Optional[str]) -> bool:
+    cleaned = strip_invisible(text or "").strip()
+    if not cleaned:
+        return False
+    if all(ch in "-—–•·" for ch in cleaned):
+        return False
+    return True
+
+
 def _format_heading_text_block(
     label: str,
     heading: Union[str, None],
@@ -1452,14 +1461,22 @@ def _format_heading_text_block(
             f"[Обрезано: показано 600 из {len(heading_clean)} символов]"
         )
 
-    lines = [f"Заголовок {label}: {heading_clean or '—'}"]
+    lines = ["Заголовки:"]
+    label_clean = (label or "").strip()
+    if not label_clean:
+        label_clean = "—"
+    if label_clean.upper() == "H?" and not heading_clean:
+        lines.append("—")
+    else:
+        lines.append(f"{label_clean}: {heading_clean or '—'}")
+    lines.append("")
+    lines.append("Текст:")
 
     prepared_body = _prepare_text_lines_for_prompt(text)
     if prepared_body:
-        lines.append("Текст:")
         lines.extend(prepared_body)
     else:
-        lines.append("Текст: —")
+        lines.append("—")
 
     block = "\n".join(lines)
     if max_chars is not None and len(block) > max_chars:
@@ -1543,10 +1560,10 @@ def build_article_headings_vs_text_prompt(
     return (
         "Ты проверяешь совпадение языка заголовков и основного текста.\n"
         "Смотри только в блок <РАЗДЕЛЫ> ниже и игнорируй язык этих инструкций.\n"
-        "Каждый раздел записан в том же порядке, что и в DOCX: сначала строка «Заголовок H#: ...», затем блок «Текст:».\n"
+        "Каждый раздел повторяет структуру DOCX: сначала блок «Заголовки:» со строкой вида «H#: ...», затем блок «Текст:».\n"
         "Определи доминирующий язык каждого блока «Текст» по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, аббревиатуры, числа, валюты и одиночные заимствования.\n"
-        "Сравни язык строки «Заголовок ...» с языком соответствующего блока «Текст».\n"
+        "Сравни язык строки H# из блока «Заголовки:» с языком соответствующего блока «Текст:».\n"
         "Если хотя бы один заголовок на другом языке, чем его текст — ответь «Нет». Если все совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
         f"\n<РАЗДЕЛЫ>\n{section_block}\n</РАЗДЕЛЫ>"
@@ -1560,11 +1577,11 @@ def build_article_list_problem_headings_prompt(
         "Определи доминирующий язык каждого блока «Текст» строго по содержимому блока <РАЗДЕЛЫ> ниже. Язык этих инструкций игнорируй."
         "Диакриику игнорируй (á→a, ü→u и т.п.). "
         "Игнорируй бренды/имена, домены/URL, аббревиатуры, числа/валюты и одиночные англ. заимствования.\n"
-        "Сравни язык строки «Заголовок ...» с языком блока «Текст» в каждом разделе. "
+        "Сравни язык строки H# из блока «Заголовки:» с языком блока «Текст» в каждом разделе. "
         "Если заголовок совпадает по языку — пропусти. Если нет — укажи точную проблему.\n"
         "Начни ответ с «Да», если найдены ошибки, иначе ответь ровно «Нет».\n"
         "Если ответ «Да», на следующих строках перечисли проблемные заголовки.\n"
-        "Каждый оформляй так: 'Заголовок ...' — краткое пояснение.\n"
+        "Каждый оформляй так: 'H#: …' — краткое пояснение.\n"
         f"\n<РАЗДЕЛЫ>\n{section_block}\n</РАЗДЕЛЫ>"
     )
 
@@ -1587,7 +1604,7 @@ def build_slug_consistency_prompt(
         "SLUG пишут без диакритики — это нормально, если он всё равно про ту же тему.",
         "Если SLUG заметно про другую тему или язык — ответь «Нет». Иначе ответь «Да».",
         "Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.",
-        "Все фрагменты ниже оформлены парами «Заголовок ...» и «Текст:».",
+        "Все фрагменты ниже оформлены блоками «Заголовки:» и «Текст:».",
         "",
         "<SLUG>",
         _format_heading_text_block("SLUG", slug or "—", None),
@@ -1621,7 +1638,7 @@ def build_section_lang_match_prompt(mt: str, md: str, mk: str, h1: str, content:
         "Определи доминирующий язык <CONTENT> по грамматике и служебным словам (диакритику игнорируй: á→a, ü→u и т.п.).\n"
         "Игнорируй бренды, домены/URL, числа, валюты и одиночные заимствования.\n"
         "Сравни язык MT, MD, MK и H1 с языком <CONTENT>.\n"
-        "Каждый блок оформлен через «Заголовок ...» и «Текст:», чтобы не путаться.\n"
+        "Каждый блок оформлен через «Заголовки:» и «Текст:», чтобы не путаться.\n"
         "Если хотя бы один элемент явно на другом языке — ответь «Нет». Если всё совпадает — ответь «Да».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких пояснений.\n"
         f"\n<META>\n{meta_block}\n</META>"
@@ -1636,30 +1653,30 @@ def build_section_lang_list_bad_prompt(mt: str, md: str, mk: str, h1: str, conte
         "Если ответ «Да», перечисли ТОЛЬКО ярлыки из набора MT | MD | MK | H1, разделяя их через « | ». Никаких пояснений.\n"
         "Анализируй исключительно данные внутри тегов <META> и <CONTENT> ниже. Игнорируй язык этих инструкций."
         "\nПомни: бренды, домены и одиночные заимствованные слова не считаются сменой языка; оценивай основную часть текста.\n"
-        "Все блоки оформлены парами «Заголовок ...» и «Текст:».\n"
+        "Все блоки оформлены парами «Заголовки:» и «Текст:».\n"
         f"\n<META>\n{meta_block}\n</META>"
         f"\n\n<CONTENT>\n{_format_heading_text_block('H1', h1, content, max_chars=EEAT_PROMPT_MAX_CHARS)}\n</CONTENT>"
     )
 
 def build_promo_scan_prompt(full_text: str) -> str:
-    block = _format_heading_text_block("H?", "—", full_text, max_chars=PROMO_MAX_CHARS)
+    block = _format_heading_text_block("H?", None, full_text, max_chars=PROMO_MAX_CHARS)
     return (
         "Определи, есть ли в тексте настоящий ПРОМОКОД — заглавный буквенно-цифровой шаблон вроде «CODE123».\n"
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы измерения («MB», «GB», «TB» и т.п.).\n"
         "Если нашёл хотя бы один промокод — ответь «Да». Если не нашёл — ответь «Нет».\n"
         "Отвечай строго одним словом «Да» или «Нет». Никаких комментариев.\n"
-        "Текст передан в блоке с пометками «Заголовок H?: ...» и «Текст:».\n\n"
+        "Фрагмент ниже разбит на блоки «Заголовки:» и «Текст:» без сокращений.\n\n"
         f"{block}"
     )
 
 def build_promo_extract_prompt(full_text: str) -> str:
-    block = _format_heading_text_block("H?", "—", full_text, max_chars=PROMO_MAX_CHARS)
+    block = _format_heading_text_block("H?", None, full_text, max_chars=PROMO_MAX_CHARS)
     return (
         "Выпиши из текста только настоящие ПРОМОКОДЫ (заглавные буквенно-цифровые шаблоны). "
         "Игнорируй служебные метки («MT», «MD», «MK», «H1», «H2», «H3», «H4») и единицы "
         "измерения («MB», «GB», «TB» и т.п.). Если промокоды найдены, начни ответ с «Да» и на той же строке "
         "после двоеточия перечисли их через « | ». Если промокодов нет — ответь ровно «Нет».\n\n"
-        "Текст передан в блоке с пометками «Заголовок H?: ...» и «Текст:».\n\n"
+        "Фрагмент ниже разбит на блоки «Заголовки:» и «Текст:» без сокращений.\n\n"
         f"{block}"
     )
 
@@ -1885,10 +1902,10 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
     if not headings:
         errors.append("Нет ни одного заголовка.")
     else:
-        has_nonempty_h1 = any(lvl == 1 and (txt or "").strip() for lvl, txt in headings)
+        has_nonempty_h1 = any(lvl == 1 and _is_meaningful_heading(txt) for lvl, txt in headings)
         if not has_nonempty_h1:
             errors.append("Нет ни одного заголовка H1 (или все H1 пустые).")
-        first_nonempty = next(((lvl, txt) for (lvl, txt) in headings if (txt or "").strip()), None)
+        first_nonempty = next(((lvl, txt) for (lvl, txt) in headings if _is_meaningful_heading(txt)), None)
         if first_nonempty and first_nonempty[0] != 1:
             errors.append("Первый заголовок должен быть H1.")
         if not any(lvl == 2 for lvl,_ in headings): errors.append("Нет ни одного заголовка H2.")
@@ -1907,10 +1924,10 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
             body_lines = [ln for ln in (sec.get("body") or []) if (ln or "").strip()]
             if not heading_clean and not body_lines:
                 continue
-            if not heading_clean:
+            if not _is_meaningful_heading(heading_raw):
                 continue
             sections_for_prompt.append((level, heading_raw, body_lines))
-        heading_pairs = [(lvl, txt) for (lvl, txt) in headings if (txt or "").strip()]
+        heading_pairs = [(lvl, txt) for (lvl, txt) in headings if _is_meaningful_heading(txt)]
         body_blocks = [t for t in body_texts if (t or "").strip()]
         body_sample_lines = _prepare_text_lines_for_prompt(body_blocks)
         body_join = clip(" ".join(body_sample_lines), ART_PROMPT_MAX_CHARS)
