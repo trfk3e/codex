@@ -418,24 +418,14 @@ def _message_content_to_text(content: Any) -> str:
     return text.strip()
 
 
-def _format_messages_for_log(messages: List[Dict[str, Any]], max_len: int = 3200) -> str:
+def _format_messages_for_log(messages: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
-    total = 0
-    truncated = False
     for msg in messages or []:
         role = str(msg.get("role") or "?")
         text = _message_content_to_text(msg.get("content"))
         if not text:
             text = "(пусто)"
-        line = f"{role}: {text}"
-        projected = total + len(line) + (1 if lines else 0)
-        if projected > max_len:
-            truncated = True
-            break
-        lines.append(line)
-        total = projected
-    if truncated:
-        lines.append(f"…(обрезано, лимит {max_len} символов)")
+        lines.append(f"{role}: {text}")
     return "\n".join(lines)
 
 
@@ -457,17 +447,41 @@ def _log_llm_chat(label: str,
         header.append(f", метод {method}")
     header.append(")")
     prompt_text = _format_messages_for_log(messages)
+    if not prompt_text:
+        prompt_text = "(пусто)"
     if error is None:
-        resp = trim(response_text or "", 600)
+        resp = (response_text or "").strip()
         if not resp:
             resp = "(пустой ответ)"
         admin_debug_log(
-            "".join(header) + f"\nЗапрос:\n{prompt_text}\nОтвет:\n{resp}"
+            "\n".join(
+                [
+                    "".join(header),
+                    BAR,
+                    "Запрос:",
+                    prompt_text,
+                    "",
+                    "Ответ:",
+                    resp,
+                ]
+            )
         )
     else:
-        err_txt = trim(_format_exception(error), 400)
+        err_txt = _format_exception(error)
         admin_debug_log(
-            "".join(header) + f"\nЗапрос:\n{prompt_text}\nОтвет:\nОшибка: {err_txt}\nПочему так?"
+            "\n".join(
+                [
+                    "".join(header),
+                    BAR,
+                    "Запрос:",
+                    prompt_text,
+                    "",
+                    "Ответ:",
+                    f"Ошибка: {err_txt}",
+                    "",
+                    "Почему так?",
+                ]
+            )
         )
 
 def _responses_input_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1634,10 +1648,16 @@ def _validate_markers_in_plain_doc(doc: Document) -> List[str]:
 
     return errors
 
-def validate_text_article(doc: Document) -> List[str]:
+def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]:
     errors: List[str] = []
     headings: List[Tuple[int, str]] = []
     body_texts: List[str] = []
+
+    tag_clean = (tag or "").strip()
+    section_label = f"Статья {tag_clean}" if tag_clean else "Статья"
+
+    def purpose(task: str) -> str:
+        return f"{section_label}: {task}"
 
     def build_numbering_maps(doc: Document):
         maps = {"num_to_abs": {}, "abs_to_fmt": {}}
@@ -1753,10 +1773,10 @@ def validate_text_article(doc: Document) -> List[str]:
                         "чем основной текст ({})".format(display, _script_label(h_script), label_body)
                     )
             prompt = build_article_headings_vs_text_prompt(heading_texts, body_join)
-            yn = llm_yesno(prompt, purpose="Headings vs Text language (article)")
+            yn = llm_yesno(prompt, purpose=purpose("Язык заголовков vs текст"))
             if yn == "Нет" or script_mismatch_found:
                 prompt2 = build_article_list_problem_headings_prompt(heading_texts, body_join)
-                bad_raw = llm_text(prompt2, purpose="List problem headings", max_tokens=256)
+                bad_raw = llm_text(prompt2, purpose=purpose("Проблемные заголовки"), max_tokens=256)
                 bad_raw = bad_raw.strip()
                 yn_bad, bad_details = _split_yesno_details(bad_raw)
                 bad_details = re.sub(r'\s*\|\s*', ' | ', (bad_details or "").strip())
@@ -1776,10 +1796,10 @@ def validate_text_article(doc: Document) -> List[str]:
     try:
         full_text = " ".join([t for t in (body_texts + [t for _, t in headings]) if t])
         q1 = build_promo_scan_prompt(full_text)
-        has_code = llm_yesno(q1, purpose="Promo code scan (article)")
+        has_code = llm_yesno(q1, purpose=purpose("Промокоды — скан"))
         if has_code == "Да":
             q2 = build_promo_extract_prompt(full_text)
-            codes = llm_text(q2, purpose="Promo code extract", max_tokens=256)
+            codes = llm_text(q2, purpose=purpose("Промокоды — извлечение"), max_tokens=256)
             codes = codes.strip()
             filtered = filter_promo_codes(codes)
             if filtered:
@@ -1804,6 +1824,11 @@ def validate_text_article(doc: Document) -> List[str]:
 def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
     errors: List[str] = []
     details = {"summary": {}, "section_blocks": []}
+
+    eeat_scope_label = "EEAT (все секции)"
+
+    def eeat_purpose(task: str) -> str:
+        return f"{eeat_scope_label}: {task}"
 
     # Жёсткие правила по заголовкам
     headings_strict = []
@@ -1851,6 +1876,14 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
         h1 = (sec.get("h1") or "")
         content_texts = " ".join([t for t in (sec.get("content_texts") or []) if (t or "").strip()])
 
+        section_descriptor = f"EEAT секция #{idx}"
+        extra = (slug_clean.strip() or h1.strip())
+        if extra:
+            section_descriptor += f" ({extra})"
+
+        def section_purpose(task: str) -> str:
+            return f"{section_descriptor}: {task}"
+
         content_script = _dominant_script(content_texts)
         if content_script:
             h1_script = _dominant_script(h1)
@@ -1890,7 +1923,7 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
         # 1) slug ↔ содержимое
         try:
             prompt = build_slug_consistency_prompt(slug_clean, mt, md, mk, h1, content_texts)
-            yn = llm_yesno(prompt, purpose=f"EEAT slug consistency #{idx}")
+            yn = llm_yesno(prompt, purpose=section_purpose("SLUG ↔ содержимое"))
             if yn == "Нет":
                 se.append("SLUG не соответствует содержимому секции либо написан некорректно\n(Совет: сделайте /slug с заголовка или уточните у ChatGPT).")
         except KeysExhaustedError:
@@ -1901,10 +1934,10 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
         # 2) MT/MD/MK/H1 ↔ язык текста секции
         try:
             prompt = build_section_lang_match_prompt(mt, md, mk, h1, content_texts)
-            yn = llm_yesno(prompt, purpose=f"EEAT section language match #{idx}")
+            yn = llm_yesno(prompt, purpose=section_purpose("Язык элементов"))
             if yn == "Нет":
                 prompt2 = build_section_lang_list_bad_prompt(mt, md, mk, h1, content_texts)
-                bad_raw = llm_text(prompt2, purpose="EEAT list bad items", max_tokens=64).strip()
+                bad_raw = llm_text(prompt2, purpose=section_purpose("Проблемные элементы"), max_tokens=64).strip()
                 ans_bad, tokens = _parse_yesno_list(bad_raw)
                 filtered = [t for t in tokens if t.upper() not in EEAT_LANGUAGE_IGNORE_CODES]
                 if ans_bad == "Да" and not filtered:
@@ -1953,10 +1986,10 @@ def validate_eeat(doc: Document) -> Tuple[List[str], Dict]:
                 if ln: full.append(ln)
         all_text = " ".join(full)
         q1 = build_promo_scan_prompt(all_text)
-        has_code = llm_yesno(q1, purpose="Promo code scan (EEAT)")
+        has_code = llm_yesno(q1, purpose=eeat_purpose("Промокоды — скан"))
         if has_code == "Да":
             q2 = build_promo_extract_prompt(all_text)
-            codes = llm_text(q2, purpose="Promo code extract (EEAT)", max_tokens=256)
+            codes = llm_text(q2, purpose=eeat_purpose("Промокоды — извлечение"), max_tokens=256)
             codes = codes.strip()
             filtered = filter_promo_codes(codes)
             if filtered:
@@ -2213,7 +2246,7 @@ def validate_article_from_url(tag: str, url: str, tmpdir: Optional[str] = None) 
 
         try:
             doc = _open_doc_safe(orig_path)
-            errors = validate_text_article(doc)
+            errors = validate_text_article(doc, tag)
             if errors:
                 ok = False
                 lines.append(f"🛑 [{tag}] ОШИБКИ:")
@@ -2431,18 +2464,22 @@ async def maybe_send_admin_debug_logs(message: Message, heading: str = "🛠 Л�
     logs = admin_debug_drain()
     if not logs:
         return
-    base_limit = max(1000, 3800 - len(heading))
-    for log in logs:
-        pieces = _split_text_for_telegram(log, limit=base_limit)
-        if not pieces:
-            continue
-        total_parts = len(pieces)
-        for idx, piece in enumerate(pieces, start=1):
-            if total_parts == 1:
-                text = f"{heading}:\n{piece}"
-            else:
-                text = f"{heading} (часть {idx}/{total_parts}):\n{piece}"
-            await message.answer(text)
+    log_text = "\n\n".join(logs)
+    fd, tmp_path = tempfile.mkstemp(prefix="llm_log_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(log_text)
+            if not log_text.endswith("\n"):
+                fh.write("\n")
+        await message.answer_document(
+            FSInputFile(tmp_path, filename="log.txt"),
+            caption=heading,
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 async def setup_menu_commands(bot: Bot, chat_id: Optional[int] = None):
     await bot.set_my_commands(
