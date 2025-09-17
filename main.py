@@ -39,7 +39,6 @@ PROMO_MAX_CHARS        = int(os.environ.get("PROMO_MAX_CHARS", "12000"))
 EEAT_PROMPT_MAX_CHARS  = int(os.environ.get("EEAT_PROMPT_MAX_CHARS", "6000"))
 ART_PROMPT_MAX_CHARS   = int(os.environ.get("ART_PROMPT_MAX_CHARS", "6000"))
 VALIDATOR_CONCURRENCY  = int(os.environ.get("VALIDATOR_CONCURRENCY", "8"))
-OPENAI_REASONING_MIN_OUTPUT_TOKENS = int(os.environ.get("OPENAI_REASONING_MIN_OUTPUT_TOKENS", "64"))
 
 # --- Новые параметры (Zoho OAuth: кеш и задержки) ---
 ZOHO_OAUTH_MAX_RETRIES       = int(os.environ.get("ZOHO_OAUTH_MAX_RETRIES", "3"))
@@ -543,175 +542,63 @@ def _extract_text_from_chat_choice(choice: Any) -> Optional[str]:
     return None
 
 
-def _should_retry_without_temperature(temperature: Optional[float], exc: Exception) -> bool:
-    if temperature is None:
-        return False
-    try:
-        if float(temperature) == 1.0:
-            return False
-    except Exception:
-        pass
-
-    parts: List[str] = []
-    for attr in ("message", "detail", "text"):
-        val = getattr(exc, attr, None)
-        if isinstance(val, str):
-            parts.append(val)
-
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict):
-            msg = err.get("message")
-            if isinstance(msg, str):
-                parts.append(msg)
-
-    for arg in getattr(exc, "args", ()):
-        if isinstance(arg, str):
-            parts.append(arg)
-
-    message = " ".join(p for p in parts if p) or str(exc)
-    lowered = message.lower()
-    if "temperature" not in lowered:
-        return False
-    triggers = ("unsupported", "does not support", "default", "allowed", "unexpected", "invalid")
-    return any(token in lowered for token in triggers)
-
-
-def _normalize_max_output_tokens_for_model(max_tokens: int) -> int:
-    try:
-        limit = int(max_tokens)
-    except (TypeError, ValueError):
-        return max_tokens
-
-    if limit <= 0:
-        return limit
-
-    if OPENAI_REASONING_MIN_OUTPUT_TOKENS <= 0:
-        return limit
-
-    model_name = (OPENAI_MODEL or "").lower()
-    if not model_name:
-        return limit
-
-    reasoning_markers = (
-        "gpt-5",
-        "o4",
-        "o3",
-        "o1",
-        "reason",
-        "thinking",
-        "deepseek-r1",
-    )
-    if any(marker in model_name for marker in reasoning_markers) and limit < OPENAI_REASONING_MIN_OUTPUT_TOKENS:
-        return OPENAI_REASONING_MIN_OUTPUT_TOKENS
-
-    return limit
-
-
 def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> Tuple[str, str]:
     last_exc: Optional[Exception] = None
     responses_api = getattr(client, "responses", None)
     if responses_api is not None:
-        include_temperature = temperature is not None
-        while True:
-            try:
-                kwargs = dict(
-                    model=OPENAI_MODEL,
-                    input=_responses_input_from_messages(messages),
-                    max_output_tokens=max_tokens,
-                )
-                if include_temperature:
-                    kwargs["temperature"] = temperature
-                resp = responses_api.create(**kwargs)
-                text = _extract_text_from_openai_response(resp)
-                if text:
-                    return text, "responses"
-                raise RuntimeError("Пустой ответ от Responses API")
-            except Exception as ex:
-                last_exc = ex
-                if include_temperature and _should_retry_without_temperature(temperature, ex):
-                    include_temperature = False
-                    continue
-                break
+        try:
+            resp = responses_api.create(
+                model=OPENAI_MODEL,
+                input=_responses_input_from_messages(messages),
+            )
+            text = _extract_text_from_openai_response(resp)
+            if text:
+                return text, "responses"
+            raise RuntimeError("Пустой ответ от Responses API")
+        except Exception as ex:
+            last_exc = ex
 
     chat_api = getattr(client, "chat", None)
     completions_api = getattr(chat_api, "completions", None) if chat_api else None
     if completions_api is not None:
-        resp = None
-        last_error: Optional[Exception] = None
-        use_temperature = temperature is not None
+        try:
+            resp = completions_api.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+            )
+        except Exception as ex:
+            last_exc = ex
+        else:
+            choices = getattr(resp, "choices", None)
+            if isinstance(choices, list) and choices:
+                for choice in choices:
+                    content = _extract_text_from_chat_choice(choice)
+                    if content:
+                        return content, "chat.completions"
 
-        for param_name in ("max_completion_tokens", "max_tokens"):
-            while True:
-                try:
-                    kwargs = dict(
-                        model=OPENAI_MODEL,
-                        messages=messages,
-                        **({"temperature": temperature} if use_temperature else {}),
-                    )
-                    kwargs[param_name] = max_tokens
-                    resp = completions_api.create(**kwargs)
-                    break
-                except TypeError as ex:
-                    last_error = ex
-                    text = " ".join(str(a) for a in ex.args)
-                    if use_temperature and _should_retry_without_temperature(temperature, ex):
-                        use_temperature = False
-                        continue
-                    if param_name == "max_completion_tokens" and (
-                        "unexpected" in text.lower() and param_name in text
-                    ):
-                        break
-                    raise
-                except Exception as ex:
-                    last_error = ex
-                    if use_temperature and _should_retry_without_temperature(temperature, ex):
-                        use_temperature = False
-                        continue
-                    text = str(getattr(ex, "message", "")) or str(ex)
-                    if param_name == "max_completion_tokens" and (
-                        "unsupported" in text.lower() and param_name in text
-                    ):
-                        break
-                    raise
-            if resp is not None:
-                break
-
-        if resp is None:
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError("Не удалось вызвать chat.completions API")
-        choices = getattr(resp, "choices", None)
-        if isinstance(choices, list) and choices:
-            for choice in choices:
-                content = _extract_text_from_chat_choice(choice)
-                if content:
-                    return content, "chat.completions"
-
-        fallback = _content_to_text(resp)
-        if fallback:
-            return fallback, "chat.completions"
-
-        dumped = _object_to_builtins(resp)
-        if dumped is not None:
-            fallback = _content_to_text(dumped)
+            fallback = _content_to_text(resp)
             if fallback:
                 return fallback, "chat.completions"
 
-        debug_payload = dumped if dumped is not None else resp
-        try:
-            if isinstance(debug_payload, (dict, list)):
-                serialized = json.dumps(debug_payload, ensure_ascii=False)
-            else:
-                serialized = str(debug_payload)
-        except Exception:
-            serialized = repr(debug_payload)
-        admin_debug_log(
-            "LLM[chat.completions] Не удалось извлечь текст. Сырой ответ: "
-            f"{trim(serialized, 800)}"
-        )
-        raise RuntimeError("Пустой ответ от chat.completions")
+            dumped = _object_to_builtins(resp)
+            if dumped is not None:
+                fallback = _content_to_text(dumped)
+                if fallback:
+                    return fallback, "chat.completions"
+
+            debug_payload = dumped if dumped is not None else resp
+            try:
+                if isinstance(debug_payload, (dict, list)):
+                    serialized = json.dumps(debug_payload, ensure_ascii=False)
+                else:
+                    serialized = str(debug_payload)
+            except Exception:
+                serialized = repr(debug_payload)
+            admin_debug_log(
+                "LLM[chat.completions] Не удалось извлечь текст. Сырой ответ: "
+                f"{trim(serialized, 800)}"
+            )
+            raise RuntimeError("Пустой ответ от chat.completions")
 
     if last_exc is not None:
         raise last_exc
@@ -726,16 +613,6 @@ def _call_openai_with_keys(messages: List[Dict],
     if prompt_preview:
         admin_debug_log(f"LLM[{label}] Prompt: {prompt_preview}")
 
-    adjusted_max_tokens = _normalize_max_output_tokens_for_model(max_tokens)
-    if adjusted_max_tokens != max_tokens:
-        admin_debug_log(
-            "LLM[{}] Модель {} требует запас вывода: max_tokens {}→{}".format(
-                label,
-                OPENAI_MODEL,
-                max_tokens,
-                adjusted_max_tokens,
-            )
-        )
     keys = db_list_keys()
     env_sk = os.environ.get("OPENAI_API_KEY")
     if env_sk and env_sk not in keys:
@@ -757,7 +634,7 @@ def _call_openai_with_keys(messages: List[Dict],
                         admin_debug_log(
                             f"LLM[{label}] Ключ {key_masked}: попытка {attempt + 1} (раунд {round_idx})"
                         )
-                        answer, method = _invoke_openai(client, messages, adjusted_max_tokens, temperature)
+                        answer, method = _invoke_openai(client, messages, max_tokens, temperature)
                         if isinstance(answer, str) and answer.strip():
                             text = answer.strip()
                             admin_debug_log(
