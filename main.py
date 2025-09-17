@@ -286,6 +286,7 @@ def db_set_kv(key: str, value: str) -> None:
 _ADMIN_DEBUG_LOCK = threading.Lock()
 _ADMIN_DEBUG_ENABLED: Optional[bool] = None
 _ADMIN_DEBUG_LOGS: List[str] = []
+_ADMIN_DEBUG_SEQ: int = 0
 
 def admin_debug_enabled() -> bool:
     global _ADMIN_DEBUG_ENABLED
@@ -308,8 +309,12 @@ def admin_debug_set(enabled: bool) -> None:
 def admin_debug_log(message: str) -> None:
     if not admin_debug_enabled():
         return
-    line = f"[{now_str()}] {message}"
+    global _ADMIN_DEBUG_SEQ
+    timestamp = now_str()
     with _ADMIN_DEBUG_LOCK:
+        _ADMIN_DEBUG_SEQ += 1
+        seq = _ADMIN_DEBUG_SEQ
+        line = f"[{timestamp} #{seq:04d}] {message}"
         _ADMIN_DEBUG_LOGS.append(line)
         if len(_ADMIN_DEBUG_LOGS) > 200:
             del _ADMIN_DEBUG_LOGS[:-200]
@@ -319,6 +324,43 @@ def admin_debug_drain() -> List[str]:
         logs = list(_ADMIN_DEBUG_LOGS)
         _ADMIN_DEBUG_LOGS.clear()
     return logs
+
+
+def _split_text_for_telegram(text: str, limit: int = 3500) -> List[str]:
+    if not text:
+        return []
+    try:
+        limit_val = int(limit)
+    except (TypeError, ValueError):
+        limit_val = 3500
+    limit = max(1, limit_val)
+    parts: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    lines = text.split('\n')
+    for idx, line in enumerate(lines):
+        suffix = '\n' if idx < len(lines) - 1 else ''
+        chunk = line + suffix
+        while chunk:
+            available = limit - current_len
+            if available <= 0:
+                parts.append("".join(current))
+                current = []
+                current_len = 0
+                available = limit
+            take = min(len(chunk), available)
+            current.append(chunk[:take])
+            current_len += take
+            chunk = chunk[take:]
+            if current_len >= limit:
+                parts.append("".join(current))
+                current = []
+                current_len = 0
+    if current:
+        parts.append("".join(current))
+
+    return [p for p in parts if p]
 
 # =========================================================
 # ==============  OPENAI (карусель ключей)  ===============
@@ -373,23 +415,27 @@ def _message_content_to_text(content: Any) -> str:
         text = " ".join(texts)
     else:
         text = str(content or "")
-    return clip(text.strip(), 600)
+    return text.strip()
 
 
-def _format_messages_for_log(messages: List[Dict[str, Any]], max_len: int = 1600) -> str:
+def _format_messages_for_log(messages: List[Dict[str, Any]], max_len: int = 3200) -> str:
     lines: List[str] = []
     total = 0
+    truncated = False
     for msg in messages or []:
         role = str(msg.get("role") or "?")
         text = _message_content_to_text(msg.get("content"))
         if not text:
             text = "(пусто)"
         line = f"{role}: {text}"
-        lines.append(line)
-        total += len(line) + 1
-        if total > max_len:
-            lines.append("…(обрезано)")
+        projected = total + len(line) + (1 if lines else 0)
+        if projected > max_len:
+            truncated = True
             break
+        lines.append(line)
+        total = projected
+    if truncated:
+        lines.append(f"…(обрезано, лимит {max_len} символов)")
     return "\n".join(lines)
 
 
@@ -857,24 +903,34 @@ def _parse_yesno_list(raw: str) -> Tuple[Optional[str], List[str]]:
 
 
 def llm_yesno(question: str, purpose: str) -> str:
+    system_prompt = (
+        "Ты аккуратный русскоязычный ассистент контроля качества. "
+        "Отвечай ТОЛЬКО одним словом: «Да» или «Нет». Никаких комментариев."
+    )
     base_messages = [
-        {"role": "system",
-         "content": "Ты аккуратный русскоязычный ассистент контроля качества. "
-                    "Отвечай ТОЛЬКО одним словом: «Да» или «Нет». Никаких комментариев."},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": question}
     ]
     raw = _call_openai_with_keys(messages=base_messages, max_tokens=4, temperature=0.0, purpose=purpose)
     yn = _normalize_yesno(raw)
     if yn in ("Да", "Нет"):
         return yn
-    reminder_messages = base_messages + [
-        {"role": "user", "content": "Напомню: нужно одно слово — «Да» или «Нет»."}
+    reminder_text = (question or "").strip()
+    if reminder_text:
+        reminder_text += "\n\nОтветь одним словом: «Да» или «Нет»."
+    else:
+        reminder_text = "Ответь одним словом: «Да» или «Нет»."
+    reminder_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": reminder_text}
     ]
     raw2 = _call_openai_with_keys(messages=reminder_messages, max_tokens=4, temperature=0.0, purpose=f"{purpose} (retry)")
     yn2 = _normalize_yesno(raw2)
     if yn2 in ("Да", "Нет"):
         return yn2
-    raise RuntimeError(f"[{purpose}] Не удалось интерпретировать ответ модели: {raw!r}")
+    raise RuntimeError(
+        f"[{purpose}] Не удалось интерпретировать ответы модели: первичный={raw!r}, повторный={raw2!r}"
+    )
 
 def llm_text(question: str, purpose: str, max_tokens: int = 256) -> str:
     messages = [
@@ -2375,20 +2431,18 @@ async def maybe_send_admin_debug_logs(message: Message, heading: str = "🛠 Л�
     logs = admin_debug_drain()
     if not logs:
         return
-    max_len = 3500
-    chunk: List[str] = []
-    current_len = 0
-    title = heading
-    for line in logs:
-        if current_len + len(line) + 1 > max_len and chunk:
-            await message.answer(f"{title}:\n" + "\n".join(chunk))
-            chunk = []
-            current_len = 0
-            title = "🛠 Лог LLM (продолжение)"
-        chunk.append(line)
-        current_len += len(line) + 1
-    if chunk:
-        await message.answer(f"{title}:\n" + "\n".join(chunk))
+    base_limit = max(1000, 3800 - len(heading))
+    for log in logs:
+        pieces = _split_text_for_telegram(log, limit=base_limit)
+        if not pieces:
+            continue
+        total_parts = len(pieces)
+        for idx, piece in enumerate(pieces, start=1):
+            if total_parts == 1:
+                text = f"{heading}:\n{piece}"
+            else:
+                text = f"{heading} (часть {idx}/{total_parts}):\n{piece}"
+            await message.answer(text)
 
 async def setup_menu_commands(bot: Bot, chat_id: Optional[int] = None):
     await bot.set_my_commands(
