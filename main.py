@@ -1612,13 +1612,15 @@ def _format_meta_block(mt: str, md: str, mk: str, h1: str) -> str:
     blocks: List[str] = []
     for label, raw_value in (("MT", mt), ("MD", md), ("MK", mk), ("H1", h1)):
         clean_value = strip_invisible(raw_value or "").strip()
-        block_lines = [
-            "Заголовки:",
-            f"{label}: {clean_value or '—'}",
-            "",
-            "Текст:",
-            clean_value or "—",
-        ]
+        heading_display = label.strip() or "—"
+
+        block_lines = ["Заголовки:", heading_display]
+
+        text_lines = _prepare_text_lines_for_prompt(clean_value)
+        if text_lines:
+            block_lines.extend(["", "Текст:"])
+            block_lines.extend(text_lines)
+
         blocks.append("\n".join(block_lines))
 
     return "\n\n".join(blocks)
