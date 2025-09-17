@@ -363,6 +363,103 @@ def _extract_text_from_openai_response(resp: Any) -> Optional[str]:
     return None
 
 
+def _content_to_text(content: Any) -> Optional[str]:
+    if content is None:
+        return None
+    if isinstance(content, str):
+        text = content.strip()
+        return text or None
+
+    texts: List[str] = []
+
+    def _gather(obj: Any) -> None:
+        if obj is None:
+            return
+        if isinstance(obj, str):
+            stripped = obj.strip()
+            if stripped:
+                texts.append(stripped)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                _gather(item)
+            return
+        if isinstance(obj, dict):
+            typ = obj.get("type")
+            text_val = obj.get("text")
+            if isinstance(text_val, str):
+                if not isinstance(typ, str) or typ.lower() not in {"input_text", "user_message"}:
+                    stripped = text_val.strip()
+                    if stripped:
+                        texts.append(stripped)
+            value_val = obj.get("value")
+            if isinstance(value_val, str):
+                stripped = value_val.strip()
+                if stripped:
+                    texts.append(stripped)
+            for key in ("content", "contents", "data", "values", "items", "parts"):
+                if key in obj:
+                    _gather(obj[key])
+            return
+        for attr in ("text", "content", "value", "data", "parts"):
+            if hasattr(obj, attr):
+                try:
+                    _gather(getattr(obj, attr))
+                except Exception:
+                    continue
+
+    _gather(content)
+    if not texts:
+        return None
+    combined = "".join(texts).strip()
+    return combined or None
+
+
+def _extract_text_from_chat_choice(choice: Any) -> Optional[str]:
+    candidate = None
+    if isinstance(choice, dict):
+        if "message" in choice:
+            candidate = _extract_text_from_chat_choice(choice["message"])
+            if candidate:
+                return candidate
+        text = choice.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        candidate = _content_to_text(choice.get("content"))
+        if candidate:
+            return candidate
+        for key in ("delta", "result", "response"):
+            if key in choice:
+                candidate = _extract_text_from_chat_choice(choice[key])
+                if candidate:
+                    return candidate
+        return None
+
+    message_attr = getattr(choice, "message", None)
+    if message_attr is not None:
+        candidate = _extract_text_from_chat_choice(message_attr)
+        if candidate:
+            return candidate
+
+    text_attr = getattr(choice, "text", None)
+    if isinstance(text_attr, str) and text_attr.strip():
+        return text_attr.strip()
+
+    content_attr = getattr(choice, "content", None)
+    candidate = _content_to_text(content_attr)
+    if candidate:
+        return candidate
+
+    for attr in ("delta", "result", "response"):
+        nested = getattr(choice, attr, None)
+        if nested is not None:
+            candidate = _extract_text_from_chat_choice(nested)
+            if candidate:
+                return candidate
+
+    return None
+
+
 def _should_retry_without_temperature(temperature: Optional[float], exc: Exception) -> bool:
     if temperature is None:
         return False
@@ -472,18 +569,10 @@ def _invoke_openai(client: OpenAI, messages: List[Dict[str, Any]], max_tokens: i
             raise RuntimeError("Не удалось вызвать chat.completions API")
         choice0 = getattr(resp, "choices", None)
         if isinstance(choice0, list) and choice0:
-            msg0 = choice0[0]
-            content = None
-            if isinstance(msg0, dict):
-                content = ((msg0.get("message") or {}).get("content")) or msg0.get("text")
-            else:
-                message_attr = getattr(msg0, "message", None)
-                if message_attr is not None:
-                    content = getattr(message_attr, "content", None)
-                if content is None:
-                    content = getattr(msg0, "text", None)
-            if isinstance(content, str) and content.strip():
-                return content.strip(), "chat.completions"
+            first_choice = choice0[0]
+            content = _extract_text_from_chat_choice(first_choice)
+            if content:
+                return content, "chat.completions"
         raise RuntimeError("Пустой ответ от chat.completions")
 
     if last_exc is not None:
