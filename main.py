@@ -59,9 +59,6 @@ def load_settings(path=SETTINGS_FILE):
     config["main"].setdefault("h1", "100-180")
     config["main"].setdefault("h2", "100-150")
     config["main"].setdefault("h3", "100-150")
-    # новые параметры анти‑429
-    config["main"].setdefault("tpm_limit", "30000")      # tokens per minute org-wide
-    config["main"].setdefault("max_tokens_part", "1100") # потолок вывода на часть
     return config
 
 
@@ -180,39 +177,6 @@ def _is_org_level_limit(response_json: dict) -> bool:
     return "in organization" in msg or "org-" in msg
 
 
-def estimate_tokens_from_messages(messages: list, extra_completion_tokens: int = 0) -> int:
-    """Грубая оценка токенов (без tiktoken): ~3.6 символа/токен + накладные."""
-    total_chars = 0
-    for m in messages:
-        total_chars += len(m.get("content", ""))
-    approx = int(total_chars / 3.6) + 8 * len(messages)
-    return approx + int(extra_completion_tokens or 0)
-
-
-class TokenBucket:
-    """Простой token bucket по TPM (tokens per minute)."""
-    def __init__(self, capacity: int, refill_per_sec: float):
-        self.capacity = float(capacity)
-        self.tokens = float(capacity)
-        self.refill = float(refill_per_sec)
-        self.t = time.monotonic()
-        self.lock = threading.Lock()
-
-    def reserve(self, need: int) -> float:
-        with self.lock:
-            now = time.monotonic()
-            dt = now - self.t
-            self.t = now
-            self.tokens = min(self.capacity, self.tokens + dt * self.refill)
-            if need <= self.tokens:
-                self.tokens -= need
-                return 0.0
-            deficit = need - self.tokens
-            wait = deficit / self.refill
-            self.tokens = 0.0
-            return wait
-
-
 # ─────────────────── Вызов API ───────────────────
 
 def call_api(messages, api_key, log_file=None, model="gpt-5", max_tokens=None, timeout=180):
@@ -246,7 +210,22 @@ def call_api(messages, api_key, log_file=None, model="gpt-5", max_tokens=None, t
 
     if response.status_code == 200:
         result = response.json()
-        content = result["choices"][0]["message"]["content"]
+        try:
+            content = result["choices"][0]["message"].get("content")
+        except (KeyError, IndexError, TypeError):
+            content = None
+
+        if content is None or not str(content).strip():
+            if log_file:
+                try:
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write("ASSISTANT:\n[empty response]\n")
+                except Exception:
+                    pass
+            logger.error("Модель вернула пустой ответ: %s", json.dumps(result, ensure_ascii=False)[:500])
+            raise APIError("Модель вернула пустой ответ")
+
+        content = str(content)
         if log_file:
             try:
                 with open(log_file, "a", encoding="utf-8") as f:
@@ -451,8 +430,6 @@ def generate_part_message(num, total, part, h1amount, h2amount, h3amount):
 
 # ─────────────────── Класс приложения ───────────────────
 
-DEFAULT_TPM_LIMIT = 30000
-DEFAULT_MAX_TOKENS_PER_PART = 1100
 BACKOFF_BASE = 1.5
 BACKOFF_MAX = 30.0
 JITTER_FRAC = 0.15
@@ -491,10 +468,6 @@ class App(ctk.CTk):
         self.h2_var = ctk.StringVar(value=self.config_parser["main"].get("h2", "100-150"))
         self.h3_var = ctk.StringVar(value=self.config_parser["main"].get("h3", "100-150"))
 
-        # Анти‑429 настройки
-        self.tpm_limit_var = ctk.StringVar(value=self.config_parser["main"].get("tpm_limit", str(DEFAULT_TPM_LIMIT)))
-        self.max_tokens_part_var = ctk.StringVar(value=self.config_parser["main"].get("max_tokens_part", str(DEFAULT_MAX_TOKENS_PER_PART)))
-
         # обновляем глобальный путь к ключам
         API_FILE = self.api_path_var.get()
 
@@ -512,7 +485,7 @@ class App(ctk.CTk):
         left = ctk.CTkFrame(self)
         left.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         left.grid_columnconfigure(1, weight=1)
-        left.grid_rowconfigure(8, weight=1)
+        left.grid_rowconfigure(7, weight=1)
 
         ctk.CTkLabel(left, text="Язык").grid(row=0, column=0, padx=5, pady=(5,0), sticky="w")
         ctk.CTkEntry(left, textvariable=self.language_var).grid(row=0, column=1, padx=5, pady=(5,0), sticky="ew")
@@ -529,18 +502,11 @@ class App(ctk.CTk):
         ctk.CTkLabel(left, text="Слов в H3").grid(row=4, column=0, padx=5, pady=(5,0), sticky="w")
         ctk.CTkEntry(left, textvariable=self.h3_var).grid(row=4, column=1, padx=5, pady=(5,0), sticky="ew")
 
-        # Новые поля анти‑429
-        ctk.CTkLabel(left, text="TPM лимит (org)").grid(row=5, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.tpm_limit_var).grid(row=5, column=1, padx=5, pady=(5,0), sticky="ew")
-
-        ctk.CTkLabel(left, text="Max tokens/часть").grid(row=6, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.max_tokens_part_var).grid(row=6, column=1, padx=5, pady=(5,0), sticky="ew")
-
-        ctk.CTkButton(left, text="Настройки", command=self.open_settings).grid(row=7, column=0, columnspan=2, pady=(5,0))
-        ctk.CTkButton(left, text="Старт", command=self.start).grid(row=8, column=0, columnspan=2, pady=10)
+        ctk.CTkButton(left, text="Настройки", command=self.open_settings).grid(row=5, column=0, columnspan=2, pady=(5,0))
+        ctk.CTkButton(left, text="Старт", command=self.start).grid(row=6, column=0, columnspan=2, pady=10)
 
         self.log_box = ctk.CTkTextbox(left)
-        self.log_box.grid(row=9, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.log_box.grid(row=7, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
         self.log_box.configure(state="disabled")
 
         right = ctk.CTkFrame(self)
@@ -812,9 +778,6 @@ class App(ctk.CTk):
         plan_var = ctk.StringVar(value=self.plan_path_var.get())
         api_var = ctk.StringVar(value=self.api_path_var.get())
         out_var = ctk.StringVar(value=self.output_dir_var.get())
-        tpm_var = ctk.StringVar(value=self.tpm_limit_var.get())
-        max_tok_var = ctk.StringVar(value=self.max_tokens_part_var.get())
-
         def choose_plan():
             p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
             if p:
@@ -842,25 +805,17 @@ class App(ctk.CTk):
         ctk.CTkEntry(win, textvariable=out_var, width=300).grid(row=2, column=1, padx=5, pady=5, sticky="ew")
         ctk.CTkButton(win, text="...", command=choose_out, width=30).grid(row=2, column=2, padx=5)
 
-        ctk.CTkLabel(win, text="TPM лимит (org)").grid(row=3, column=0, padx=5, pady=5, sticky="w")
-        ctk.CTkEntry(win, textvariable=tpm_var, width=150).grid(row=3, column=1, padx=5, pady=5, sticky="w")
-
-        ctk.CTkLabel(win, text="Max tokens/часть").grid(row=4, column=0, padx=5, pady=5, sticky="w")
-        ctk.CTkEntry(win, textvariable=max_tok_var, width=150).grid(row=4, column=1, padx=5, pady=5, sticky="w")
-
         def save_and_close():
             self.plan_path_var.set(plan_var.get())
             self.api_path_var.set(api_var.get())
             self.output_dir_var.set(out_var.get())
-            self.tpm_limit_var.set(tpm_var.get())
-            self.max_tokens_part_var.set(max_tok_var.get())
             global API_FILE
             API_FILE = self.api_path_var.get()
             self.load_plan_file()
             self.save_settings()
             win.destroy()
 
-        ctk.CTkButton(win, text="Сохранить", command=save_and_close).grid(row=5, column=0, columnspan=3, pady=10)
+        ctk.CTkButton(win, text="Сохранить", command=save_and_close).grid(row=3, column=0, columnspan=3, pady=10)
 
     def save_settings(self):
         cfg = self.config_parser
@@ -872,8 +827,8 @@ class App(ctk.CTk):
         cfg["main"]["h2"] = self.h2_var.get()
         cfg["main"]["h3"] = self.h3_var.get()
         cfg["main"]["output_dir"] = self.output_dir_var.get()
-        cfg["main"]["tpm_limit"] = self.tpm_limit_var.get()
-        cfg["main"]["max_tokens_part"] = self.max_tokens_part_var.get()
+        cfg["main"].pop("tpm_limit", None)
+        cfg["main"].pop("max_tokens_part", None)
         save_settings(cfg)
 
     def on_close(self):
@@ -904,19 +859,6 @@ class App(ctk.CTk):
             )
         }
 
-        # Троттлер по TPM
-        try:
-            tpm_limit_val = int(float(self.tpm_limit_var.get()))
-        except Exception:
-            tpm_limit_val = DEFAULT_TPM_LIMIT
-        bucket = TokenBucket(capacity=tpm_limit_val, refill_per_sec=tpm_limit_val / 60.0)
-
-        # Порог max_tokens на часть
-        try:
-            max_tokens = int(float(self.max_tokens_part_var.get()))
-        except Exception:
-            max_tokens = DEFAULT_MAX_TOKENS_PER_PART
-
         # Прогресс (может быть восстановлен из чекпоинта)
         idx = int(self._progress.get("idx", 1))
         html_parts = list(self._progress.get("html_parts", []))
@@ -932,19 +874,11 @@ class App(ctk.CTk):
             }
             messages = [system_msg, user_msg]
 
-            # Превентивный троттлинг
-            est_req_tokens = estimate_tokens_from_messages(messages, extra_completion_tokens=max_tokens)
-            wait_pre = bucket.reserve(est_req_tokens)
-            if wait_pre > 0:
-                w = _with_jitter(wait_pre)
-                self.log(f"TPM троттлинг: ждём {w:.2f} с перед частью {idx}")
-                time.sleep(w)
-
             attempt = 0
             while True:
                 attempt += 1
                 try:
-                    result = call_api(messages, key, self.log_file, model="gpt-5", max_tokens=max_tokens)
+                    result = call_api(messages, key, self.log_file, model="gpt-5")
                     html_parts.append(result + "\n")
                     self._progress["html_parts"] = html_parts
                     self._progress["idx"] = idx + 1
@@ -977,7 +911,7 @@ class App(ctk.CTk):
                     backoff = min(BACKOFF_MAX, BACKOFF_BASE ** min(attempt, 8))
                     sleep_for = _with_jitter(max(suggested, backoff))
                     self.log(
-                        f"429 (TPM) на части {idx}. Повтор через {sleep_for:.2f} с "
+                        f"429 (лимит) на части {idx}. Повтор через {sleep_for:.2f} с "
                         f"(org={e.is_org_level}, попытка {attempt})"
                     )
                     logger.info("Rate limited on part %d; sleeping %.2fs", idx, sleep_for)
