@@ -223,7 +223,7 @@ def call_api(messages, api_key, log_file=None, model="gpt-5", max_tokens=None, t
     }
     data = {"model": model, "messages": messages}
     if max_tokens is not None:
-        data["max_tokens"] = int(max_tokens)
+        data["max_completion_tokens"] = int(max_tokens)
 
     if log_file:
         try:
