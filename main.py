@@ -1136,7 +1136,7 @@ class App(ctk.CTk):
         self.shared_output_dir = self.config_parser["main"].get("output_dir", "")
         self.sync_shared_paths(self.shared_api_path, self.shared_output_dir)
 
-        self.tab_menu = tk.Menu(self, tearoff=0)
+        self._tab_popup = None
 
         self.add_tab_button = ctk.CTkButton(self.tab_bar, text="+", width=40, command=self.add_tab)
         self.add_tab_button.pack(side="right", padx=6, pady=6)
@@ -1202,21 +1202,56 @@ class App(ctk.CTk):
         if widget not in self.tab_buttons:
             return
         index = self.tab_buttons.index(widget)
-        self.tab_menu.delete(0, "end")
-        state = tk.NORMAL if len(self.tabs) > 1 else tk.DISABLED
-        self.tab_menu.add_command(
-            label="Удалить вкладку",
-            command=(lambda i=index: self.remove_tab(i)),
-            state=state,
+        self._show_tab_popup(index, event.x_root, event.y_root)
+
+    def _show_tab_popup(self, index: int, x: int, y: int):
+        self._close_tab_popup()
+        popup = ctk.CTkToplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+
+        def on_focus_out(_event):
+            self._close_tab_popup()
+
+        popup.bind("<FocusOut>", on_focus_out)
+        popup.bind("<Escape>", lambda _event: self._close_tab_popup())
+
+        button = ctk.CTkButton(
+            popup,
+            text="Удалить вкладку",
+            command=lambda i=index: self._handle_tab_delete(i),
+            width=160,
         )
-        try:
-            self.tab_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.tab_menu.grab_release()
+        button.pack(padx=12, pady=12)
+
+        tab = self.tabs[index]
+        if getattr(tab, "_running", False) or len(self.tabs) <= 1:
+            button.configure(state="disabled")
+
+        popup.update_idletasks()
+        width = popup.winfo_width()
+        height = popup.winfo_height()
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        popup.deiconify()
+        popup.focus_force()
+        self._tab_popup = popup
+
+    def _handle_tab_delete(self, index: int):
+        self._close_tab_popup()
+        self.remove_tab(index)
+
+    def _close_tab_popup(self):
+        if self._tab_popup is not None:
+            try:
+                self._tab_popup.destroy()
+            finally:
+                self._tab_popup = None
 
     def remove_tab(self, index: int):
         if not (0 <= index < len(self.tabs)):
             return
+        self._close_tab_popup()
         tab = self.tabs[index]
         if getattr(tab, "_running", False):
             messagebox.showwarning("Удаление вкладки", "Нельзя удалить вкладку во время генерации.")
