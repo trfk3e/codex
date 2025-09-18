@@ -295,7 +295,8 @@ def validate_api_keys(keys, log_fn=None):
         logger.info("Validating API key %s...", key[:8] + "…")
         try:
             # минимизируем расход токенов при проверке
-            call_api([{"role": "user", "content": "ping"}], key, model="gpt-5", max_tokens=1)
+            # gpt-5 требует несколько токенов на сервисный ответ, 1 токена недостаточно
+            call_api([{"role": "user", "content": "ping"}], key, model="gpt-5", max_tokens=16)
             logger.info("API key %s is valid", key[:8] + "…")
             log_ui(f"Ключ рабочий: {key[:8]}…")
             return key, bad
