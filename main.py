@@ -130,6 +130,13 @@ def save_bad_keys(bad, path=BAD_API_FILE):
     logger.info("Saved %d bad API keys to %s", len(bad), path)
 
 
+def format_key_tail(key: str, visible: int = 8) -> str:
+    """Вернуть только окончание ключа для логов."""
+    if not key:
+        return ""
+    return f"…{key[-visible:]}"
+
+
 def update_bad_api_key(bad_key, api_keys_file=API_FILE):
     """Удалить bad_key из API.txt и добавить в BadAPI.txt."""
     try:
@@ -139,13 +146,13 @@ def update_bad_api_key(bad_key, api_keys_file=API_FILE):
             new_lines = [line for line in lines if bad_key not in line]
             with open(api_keys_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-            logger.info("Removed bad key %s from %s", bad_key[:8] + "…", api_keys_file)
+            logger.info("Removed bad key %s from %s", format_key_tail(bad_key), api_keys_file)
     except Exception as e:
         logger.error("Ошибка при обновлении API ключей: %s", e)
     try:
         with open(BAD_API_FILE, "a", encoding="utf-8") as f:
             f.write(bad_key + "\n")
-        logger.info("Added bad key %s to %s", bad_key[:8] + "…", BAD_API_FILE)
+        logger.info("Added bad key %s to %s", format_key_tail(bad_key), BAD_API_FILE)
     except Exception as e:
         logger.error("Ошибка при записи bad API ключа: %s", e)
 
@@ -197,7 +204,7 @@ def call_api(messages, api_key, log_file=None, model="gpt-5", max_tokens=None, t
         except Exception as e:
             logger.debug("Failed to write user log: %s", e)
 
-    logger.debug("Calling API with key %s", api_key[:8] + "…")
+    logger.debug("Calling API with key %s", format_key_tail(api_key))
     try:
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -277,14 +284,14 @@ def _validate_key_ping(api_key: str, log_ui=None, retries: int = 2):
                 delay = _with_jitter(1.5 * attempts)
                 logger.warning(
                     "Empty response while validating key %s; retry %d/%d in %.1fs",
-                    api_key[:8] + "…",
+                    format_key_tail(api_key),
                     attempts + 1,
                     retries + 1,
                     delay,
                 )
                 if log_ui:
                     log_ui(
-                        f"Модель вернула пустой ответ, повторная попытка {attempts + 1} для ключа {api_key[:8]}…"
+                        f"Модель вернула пустой ответ, повторная попытка {attempts + 1} для ключа {format_key_tail(api_key)}"
                     )
                 time.sleep(delay)
                 continue
@@ -306,30 +313,30 @@ def validate_api_keys(keys, log_fn=None):
             logger.debug("Failed to write UI log '%s': %s", message, exc)
 
     for key in keys:
-        logger.info("Validating API key %s...", key[:8] + "…")
+        logger.info("Validating API key %s...", format_key_tail(key))
         try:
             _validate_key_ping(key, log_ui)
-            logger.info("API key %s is valid", key[:8] + "…")
-            log_ui(f"Ключ рабочий: {key[:8]}…")
+            logger.info("API key %s is valid", format_key_tail(key))
+            log_ui(f"Ключ рабочий: {format_key_tail(key)}")
             return key, bad
         except RateLimitError:
-            logger.info("API key %s is valid but currently rate-limited", key[:8] + "…")
-            log_ui(f"Ключ валидный, но временно ограничен: {key[:8]}…")
+            logger.info("API key %s is valid but currently rate-limited", format_key_tail(key))
+            log_ui(f"Ключ валидный, но временно ограничен: {format_key_tail(key)}")
             return key, bad
         except QuotaExceededError:
-            logger.warning("API key %s quota exceeded", key[:8] + "…")
+            logger.warning("API key %s quota exceeded", format_key_tail(key))
             bad.append(key)
-            log_ui(f"Квота исчерпана у ключа: {key[:8]}…")
+            log_ui(f"Квота исчерпана у ключа: {format_key_tail(key)}")
         except InvalidAPIKeyError:
-            logger.warning("API key %s is invalid", key[:8] + "…")
+            logger.warning("API key %s is invalid", format_key_tail(key))
             bad.append(key)
-            log_ui(f"Ключ недействителен: {key[:8]}…")
+            log_ui(f"Ключ недействителен: {format_key_tail(key)}")
         except APIError as e:
-            logger.error("Error validating key %s: %s", key[:8] + "…", e)
-            log_ui(f"Ошибка при проверке ключа {key[:8]}…: {e}")
+            logger.error("Error validating key %s: %s", format_key_tail(key), e)
+            log_ui(f"Ошибка при проверке ключа {format_key_tail(key)}: {e}")
         except Exception as e:
-            logger.error("Error validating key %s: %s", key[:8] + "…", e)
-            log_ui(f"Ошибка при проверке ключа {key[:8]}…: {e}")
+            logger.error("Error validating key %s: %s", format_key_tail(key), e)
+            log_ui(f"Ошибка при проверке ключа {format_key_tail(key)}: {e}")
     return None, bad
 
 
@@ -507,8 +514,8 @@ class GenerationTab(ctk.CTkFrame):
         self._running = False
         self._session_id = None
 
-        self.chat_label_var = ctk.StringVar()
-        self._update_chat_title()
+        self.tab_label_var = ctk.StringVar()
+        self._update_tab_title()
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=0, minsize=300)
@@ -521,7 +528,7 @@ class GenerationTab(ctk.CTkFrame):
 
         ctk.CTkLabel(
             left,
-            textvariable=self.chat_label_var,
+            textvariable=self.tab_label_var,
             font=ctk.CTkFont(size=15, weight="bold"),
         ).grid(row=0, column=0, columnspan=2, padx=5, pady=(5, 0), sticky="w")
 
@@ -593,10 +600,10 @@ class GenerationTab(ctk.CTkFrame):
 
     # ───── UI/вспомогательные методы ─────
 
-    def _update_chat_title(self, suffix: str = ""):
-        base = f"Чат {self.tab_id}"
+    def _update_tab_title(self, suffix: str = ""):
+        base = f"Вкладка {self.tab_id}"
         title = base if not suffix else f"{base} • {suffix}"
-        self.chat_label_var.set(title)
+        self.tab_label_var.set(title)
         self.app.rename_tab(self, title)
 
     def select_file(self):
@@ -748,7 +755,7 @@ class GenerationTab(ctk.CTkFrame):
                 logger.debug("Не удалось удалить устаревший чекпоинт %s: %s", legacy, e)
 
     def _load_checkpoint(self, folder):
-        # Для нового чата прогресс всегда начинается заново.
+        # Для новой вкладки прогресс всегда начинается заново.
         self._progress = {"idx": 1, "html_parts": []}
         return False
 
@@ -929,8 +936,8 @@ class GenerationTab(ctk.CTkFrame):
                     self._progress["idx"] = idx
                     self._progress["html_parts"] = html_parts
                     self._save_checkpoint(folder)
-                    self.log(f"Квота исчерпана для ключа {key[:8]}… на части {idx}")
-                    logger.warning("Quota exceeded for key %s at part %d", key[:8] + "…", idx)
+                    self.log(f"Квота исчерпана для ключа {format_key_tail(key)} на части {idx}")
+                    logger.warning("Quota exceeded for key %s at part %d", format_key_tail(key), idx)
                     raise
 
                 except RateLimitError as e:
@@ -979,13 +986,13 @@ class GenerationTab(ctk.CTkFrame):
         session_uuid = uuid.uuid4().hex
         session_label = session_uuid[:8].upper()
         self._session_id = session_uuid
-        self._update_chat_title(session_label)
+        self._update_tab_title(session_label)
 
         self.log_file = LOG_TEMPLATE.format(f"{int(time.time())}_{session_label}")
         open(self.log_file, "a", encoding="utf-8").close()
-        logger.info("Run log file: %s (chat %s)", self.log_file, session_label)
+        logger.info("Run log file: %s (tab %s)", self.log_file, session_label)
         prune_logs()
-        self.log(f"Новый чат запущен: {session_label}")
+        self.log(f"Новая вкладка запущена: {session_label}")
 
         plan_file = self.plan_path_var.get()
         if not plan_file:
@@ -1024,7 +1031,7 @@ class GenerationTab(ctk.CTkFrame):
             return
 
         self.log("Загрузка API ключей...")
-        logger.info("Loading API keys for chat %s", session_label)
+        logger.info("Loading API keys for tab %s", session_label)
         keys = load_api_keys()
         if not keys:
             self.after(0, lambda: messagebox.showerror("Ошибка", "Нет API ключей"))
@@ -1045,21 +1052,21 @@ class GenerationTab(ctk.CTkFrame):
                     return
 
                 self.log("Проверка ключей...")
-                logger.info("Validating API keys for chat %s", session_label)
+                logger.info("Validating API keys for tab %s", session_label)
                 key, bad = validate_api_keys(keys, log_fn=self.log)
                 for b in bad:
                     update_bad_api_key(b, API_FILE)
                     if b in keys:
                         keys.remove(b)
-                    self.log(f"Ключ не работает: {b[:8]}…")
-                    logger.info("Bad key %s moved to %s", b[:8] + "…", BAD_API_FILE)
+                    self.log(f"Ключ не работает: {format_key_tail(b)}")
+                    logger.info("Bad key %s moved to %s", format_key_tail(b), BAD_API_FILE)
 
                 if not key:
                     continue
 
                 current_key = key
-                self.log(f"Используется ключ: {current_key[:8]}…")
-                logger.info("Using API key %s for chat %s", current_key[:8] + "…", session_label)
+                self.log(f"Используется ключ: {format_key_tail(current_key)}")
+                logger.info("Using API key %s for tab %s", format_key_tail(current_key), session_label)
 
             try:
                 filename = self._generate_with_key(current_key, parts, folder)
@@ -1069,12 +1076,19 @@ class GenerationTab(ctk.CTkFrame):
                     return
 
                 self.log("Ошибка при генерации, повторяем с тем же ключом…")
-                logger.info("Retrying generation with the same key %s for chat %s", current_key[:8] + "…", session_label)
+                logger.info(
+                    "Retrying generation with the same key %s for tab %s",
+                    format_key_tail(current_key),
+                    session_label,
+                )
                 continue
 
             except InvalidAPIKeyError:
-                self.log(f"Ключ недействителен: {current_key[:8]}…")
-                logger.warning("API key %s is invalid during generation", current_key[:8] + "…")
+                self.log(f"Ключ недействителен: {format_key_tail(current_key)}")
+                logger.warning(
+                    "API key %s is invalid during generation",
+                    format_key_tail(current_key),
+                )
                 update_bad_api_key(current_key, API_FILE)
                 if current_key in keys:
                     keys.remove(current_key)
@@ -1082,8 +1096,10 @@ class GenerationTab(ctk.CTkFrame):
                 continue
 
             except QuotaExceededError:
-                self.log(f"Квота исчерпана у ключа: {current_key[:8]}… Пытаемся другим ключом.")
-                logger.warning("Quota exceeded for key %s, switching", current_key[:8] + "…")
+                self.log(
+                    f"Квота исчерпана у ключа: {format_key_tail(current_key)}. Пытаемся другим ключом."
+                )
+                logger.warning("Quota exceeded for key %s, switching", format_key_tail(current_key))
                 update_bad_api_key(current_key, API_FILE)
                 if current_key in keys:
                     keys.remove(current_key)
@@ -1092,7 +1108,7 @@ class GenerationTab(ctk.CTkFrame):
 
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Ошибка", f"Критическая ошибка: {e}"))
-                logger.exception("Critical error in chat %s: %s", session_label, e)
+                logger.exception("Critical error in tab %s: %s", session_label, e)
                 self._running = False
                 return
 
@@ -1137,7 +1153,7 @@ class App(ctk.CTk):
         self.tabs.append(tab)
         button = ctk.CTkButton(
             self.tab_bar,
-            text=f"Чат {tab.tab_id}",
+            text=f"Вкладка {tab.tab_id}",
             width=140,
             command=lambda i=index: self.show_tab(i),
         )
