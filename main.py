@@ -1880,6 +1880,73 @@ def _normalize_for_keyword_search(text: str) -> str:
     return cleaned.casefold()
 
 
+_KEYWORD_CONNECTOR_CHARS = frozenset({
+    "-", "–", "—", "‒", "―", "−", "‑", "⁃", "﹘", "﹣", "/", "\\",
+})
+
+
+def _is_keyword_word_char(ch: str) -> bool:
+    if not ch:
+        return False
+    cat = unicodedata.category(ch)
+    if not cat:
+        return False
+    return cat[0] in ("L", "N", "M")
+
+
+def _keyword_match_has_boundaries(text: str, start: int, length: int) -> bool:
+    before_idx = start - 1
+    if before_idx >= 0:
+        prev = text[before_idx]
+        if prev in _KEYWORD_CONNECTOR_CHARS:
+            return False
+        if _is_keyword_word_char(prev):
+            return False
+
+    after_idx = start + length
+    if after_idx < len(text):
+        nxt = text[after_idx]
+        if nxt in _KEYWORD_CONNECTOR_CHARS:
+            return False
+        if _is_keyword_word_char(nxt):
+            return False
+
+        j = after_idx
+        had_space = False
+        while j < len(text) and text[j].isspace():
+            had_space = True
+            j += 1
+        if j < len(text):
+            nxt = text[j]
+            if _is_keyword_word_char(nxt):
+                return False
+            # если соединительный символ идёт сразу после ключа без пробела —
+            # продолжаем поиск, т.к. это часть другого выражения (например
+            # "win aura-casino").
+            if nxt in _KEYWORD_CONNECTOR_CHARS and not had_space and (j + 1 < len(text)):
+                k = j + 1
+                while k < len(text) and text[k].isspace():
+                    k += 1
+                if k < len(text) and _is_keyword_word_char(text[k]):
+                    return False
+
+    return True
+
+
+def _keyword_in_text_with_boundaries(text: str, keyword: str) -> bool:
+    if not keyword:
+        return False
+    idx = 0
+    n = len(keyword)
+    while True:
+        idx = text.find(keyword, idx)
+        if idx < 0:
+            return False
+        if _keyword_match_has_boundaries(text, idx, n):
+            return True
+        idx += 1
+
+
 def _collect_mk_keywords_and_plain_text(doc: Document) -> Tuple[List[str], str]:
     mk_chunks: List[str] = []
     body_chunks: List[str] = []
@@ -2187,7 +2254,7 @@ def validate_text_article(doc: Document, tag: Optional[str] = None, enforce_mk_k
                     norm_kw = _normalize_for_keyword_search(kw)
                     if not norm_kw:
                         continue
-                    if norm_kw not in haystack:
+                    if not _keyword_in_text_with_boundaries(haystack, norm_kw):
                         missing.append(kw)
                 if missing:
                     formatted = ", ".join(f"«{m}»" for m in missing)
