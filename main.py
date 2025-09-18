@@ -13,6 +13,7 @@ import uuid
 from typing import Optional
 
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # === исправление путей для PyInstaller ===
@@ -30,6 +31,9 @@ LOG_TEMPLATE   = os.path.join(BASE_DIR, "log_{}.txt")
 
 # Плейсхолдер для пустых строк в редакторе плана
 PLACEHOLDER = "➖➖➖"
+
+PLAN_FILE_TEMPLATE = "H-plan_tab{}.txt"
+PLAN_FILE_RE = re.compile(r"H-plan_tab(\d+)\.txt$")
 
 # Логирование
 logging.basicConfig(
@@ -485,29 +489,23 @@ def _with_jitter(seconds: float) -> float:
 
 
 class GenerationTab(ctk.CTkFrame):
-    def __init__(self, master, app, tab_id):
+    def __init__(self, master, app, tab_id, plan_path, config_parser):
         super().__init__(master)
-        global API_FILE
 
         self.app = app
         self.tab_id = tab_id
 
-        self.config_parser = load_settings()
+        self.config_parser = config_parser
 
-        self.plan_path_var = ctk.StringVar(value=self.config_parser["main"].get("plan_path", ""))
-        self.api_path_var = ctk.StringVar(value=self.config_parser["main"].get("api_path", API_FILE))
-        self.output_dir_var = ctk.StringVar(value=self.config_parser["main"].get("output_dir", ""))
-
-        if not self.output_dir_var.get() and self.plan_path_var.get():
-            self.output_dir_var.set(os.path.dirname(self.plan_path_var.get()))
+        self.plan_path_var = ctk.StringVar(value=plan_path)
+        self.api_path_var = ctk.StringVar(value=self.app.shared_api_path)
+        self.output_dir_var = ctk.StringVar(value=self.app.shared_output_dir)
 
         self.language_var = ctk.StringVar(value=self.config_parser["main"].get("language", "Lang"))
         self.currency_var = ctk.StringVar(value=self.config_parser["main"].get("currency", "EUR"))
         self.h1_var = ctk.StringVar(value=self.config_parser["main"].get("h1", "100-180"))
         self.h2_var = ctk.StringVar(value=self.config_parser["main"].get("h2", "100-150"))
         self.h3_var = ctk.StringVar(value=self.config_parser["main"].get("h3", "100-150"))
-
-        API_FILE = self.api_path_var.get()
 
         self.log_file = None
         self._progress = {"idx": 1, "html_parts": []}
@@ -615,20 +613,17 @@ class GenerationTab(ctk.CTkFrame):
 
     def load_plan_file(self):
         path = self.plan_path_var.get()
+        self.plan_text.delete("1.0", "end")
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
-            self.plan_text.delete("1.0", "end")
             self.plan_text.insert("1.0", content)
-            self.update_placeholders()
+        self.update_placeholders()
 
     def save_plan_file(self):
         path = self.plan_path_var.get()
         if not path:
-            path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
-            if not path:
-                return
-            self.plan_path_var.set(path)
+            return
         with open(path, "w", encoding="utf-8") as f:
             f.write(self.get_plan_content())
         self.save_settings()
@@ -813,10 +808,6 @@ class GenerationTab(ctk.CTkFrame):
         plan_var = ctk.StringVar(value=self.plan_path_var.get())
         api_var = ctk.StringVar(value=self.api_path_var.get())
         out_var = ctk.StringVar(value=self.output_dir_var.get())
-        def choose_plan():
-            p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
-            if p:
-                plan_var.set(p)
 
         def choose_api():
             p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
@@ -829,8 +820,9 @@ class GenerationTab(ctk.CTkFrame):
                 out_var.set(p)
 
         ctk.CTkLabel(win, text="H-plan путь").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        ctk.CTkEntry(win, textvariable=plan_var, width=300).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        ctk.CTkButton(win, text="...", command=choose_plan, width=30).grid(row=0, column=2, padx=5)
+        ctk.CTkEntry(win, textvariable=plan_var, state="disabled", width=300).grid(
+            row=0, column=1, columnspan=2, padx=5, pady=5, sticky="ew"
+        )
 
         ctk.CTkLabel(win, text="API путь").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         ctk.CTkEntry(win, textvariable=api_var, width=300).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
@@ -841,7 +833,6 @@ class GenerationTab(ctk.CTkFrame):
         ctk.CTkButton(win, text="...", command=choose_out, width=30).grid(row=2, column=2, padx=5)
 
         def save_and_close():
-            self.plan_path_var.set(plan_var.get())
             self.api_path_var.set(api_var.get())
             self.output_dir_var.set(out_var.get())
             global API_FILE
@@ -854,7 +845,7 @@ class GenerationTab(ctk.CTkFrame):
 
     def save_settings(self):
         cfg = self.config_parser
-        cfg["main"]["plan_path"] = self.plan_path_var.get()
+        cfg["main"]["plan_path"] = ""
         cfg["main"]["api_path"] = self.api_path_var.get()
         cfg["main"]["language"] = self.language_var.get()
         cfg["main"]["currency"] = self.currency_var.get()
@@ -865,6 +856,7 @@ class GenerationTab(ctk.CTkFrame):
         cfg["main"].pop("tpm_limit", None)
         cfg["main"].pop("max_tokens_part", None)
         save_settings(cfg)
+        self.app.sync_shared_paths(self.api_path_var.get(), self.output_dir_var.get(), sender=self)
 
     def on_close(self):
         self.save_settings()
@@ -1138,32 +1130,122 @@ class App(ctk.CTk):
         self.tabs = []
         self.tab_buttons = []
         self.active_index = None
-        self._next_tab_id = 1
+
+        self.config_parser = load_settings()
+        self.shared_api_path = self.config_parser["main"].get("api_path", API_FILE)
+        self.shared_output_dir = self.config_parser["main"].get("output_dir", "")
+        self.sync_shared_paths(self.shared_api_path, self.shared_output_dir)
+
+        self.tab_menu = tk.Menu(self, tearoff=0)
 
         self.add_tab_button = ctk.CTkButton(self.tab_bar, text="+", width=40, command=self.add_tab)
         self.add_tab_button.pack(side="right", padx=6, pady=6)
 
-        self.add_tab()
+        existing_tabs = self._discover_plan_files()
+        if existing_tabs:
+            for idx, (tab_id, path) in enumerate(existing_tabs):
+                self._create_tab(tab_id, path, select=(idx == 0))
+        else:
+            self.add_tab()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def add_tab(self):
-        tab = GenerationTab(self.tab_container, self, self._next_tab_id)
+    def _plan_path(self, tab_id: int) -> str:
+        return os.path.join(BASE_DIR, PLAN_FILE_TEMPLATE.format(tab_id))
+
+    def _discover_plan_files(self):
+        files = []
+        for name in os.listdir(BASE_DIR):
+            match = PLAN_FILE_RE.match(name)
+            if match:
+                tab_id = int(match.group(1))
+                files.append((tab_id, os.path.join(BASE_DIR, name)))
+        files.sort(key=lambda item: item[0])
+        return files
+
+    def _allocate_tab_id(self) -> int:
+        used = {tab.tab_id for tab in self.tabs}
+        candidate = 1
+        while True:
+            path = self._plan_path(candidate)
+            if candidate not in used and not os.path.exists(path):
+                return candidate
+            candidate += 1
+
+    def _create_tab(self, tab_id: int, plan_path: str, select: bool = True):
+        tab = GenerationTab(self.tab_container, self, tab_id, plan_path, self.config_parser)
         index = len(self.tabs)
         self.tabs.append(tab)
         button = ctk.CTkButton(
             self.tab_bar,
             text=f"Вкладка {tab.tab_id}",
             width=140,
-            command=lambda i=index: self.show_tab(i),
+            command=lambda: None,
         )
         button.pack(side="left", padx=(6 if index == 0 else 2, 2), pady=6)
+        button.bind("<Button-3>", self._on_tab_button_right_click)
         self.tab_buttons.append(button)
+        button.configure(command=lambda btn=button: self.show_tab(self.tab_buttons.index(btn)))
         tab.grid(row=0, column=0, sticky="nsew")
         tab.grid_remove()
-        self._next_tab_id += 1
-        self.show_tab(index)
+        if select or self.active_index is None:
+            self.show_tab(index)
         return tab
+
+    def add_tab(self):
+        tab_id = self._allocate_tab_id()
+        plan_path = self._plan_path(tab_id)
+        return self._create_tab(tab_id, plan_path, select=True)
+
+    def _on_tab_button_right_click(self, event):
+        widget = event.widget
+        if widget not in self.tab_buttons:
+            return
+        index = self.tab_buttons.index(widget)
+        self.tab_menu.delete(0, "end")
+        state = tk.NORMAL if len(self.tabs) > 1 else tk.DISABLED
+        self.tab_menu.add_command(
+            label="Удалить вкладку",
+            command=(lambda i=index: self.remove_tab(i)),
+            state=state,
+        )
+        try:
+            self.tab_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tab_menu.grab_release()
+
+    def remove_tab(self, index: int):
+        if not (0 <= index < len(self.tabs)):
+            return
+        tab = self.tabs[index]
+        if getattr(tab, "_running", False):
+            messagebox.showwarning("Удаление вкладки", "Нельзя удалить вкладку во время генерации.")
+            return
+
+        plan_path = tab.plan_path_var.get()
+        tab.on_close()
+        tab.destroy()
+
+        del self.tabs[index]
+        button = self.tab_buttons.pop(index)
+        button.destroy()
+
+        if plan_path and os.path.exists(plan_path):
+            try:
+                os.remove(plan_path)
+                logger.info("Удален файл плана %s", plan_path)
+            except Exception as exc:
+                logger.error("Не удалось удалить файл плана %s: %s", plan_path, exc)
+
+        if self.active_index == index:
+            self.active_index = None
+            if self.tabs:
+                self.show_tab(min(index, len(self.tabs) - 1))
+        elif self.active_index is not None and index < self.active_index:
+            self.active_index -= 1
+
+        if not self.tabs:
+            self.add_tab()
 
     def show_tab(self, index: int):
         if self.active_index == index:
@@ -1189,6 +1271,20 @@ class App(ctk.CTk):
         except ValueError:
             return
         self.tab_buttons[idx].configure(text=title)
+
+    def sync_shared_paths(self, api_path: str, output_dir: str, sender: Optional[GenerationTab] = None):
+        resolved_api_path = api_path or os.path.join(BASE_DIR, "API.txt")
+        self.shared_api_path = resolved_api_path
+        self.shared_output_dir = output_dir
+        global API_FILE
+        API_FILE = resolved_api_path
+        for tab in self.tabs:
+            if tab is sender:
+                continue
+            if tab.api_path_var.get() != resolved_api_path:
+                tab.api_path_var.set(resolved_api_path)
+            if tab.output_dir_var.get() != output_dir:
+                tab.output_dir_var.set(output_dir)
 
     def center_window(self, win=None):
         target = win or self
