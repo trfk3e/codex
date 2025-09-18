@@ -215,7 +215,7 @@ class TokenBucket:
 
 # ─────────────────── Вызов API ───────────────────
 
-def call_api(messages, api_key, log_file=None, model="o3", max_tokens=None, timeout=180):
+def call_api(messages, api_key, log_file=None, model="gpt-5", max_tokens=None, timeout=180):
     """Отправить запрос в OpenAI Chat Completions и вернуть текст ответа."""
     headers = {
         "Content-Type": "application/json",
@@ -277,29 +277,43 @@ def call_api(messages, api_key, log_file=None, model="o3", max_tokens=None, time
     raise APIError(f"Ошибка API: {response.status_code} - {response.text}")
 
 
-def validate_api_keys(keys):
+def validate_api_keys(keys, log_fn=None):
     """Вернуть первый «живой» ключ и список гарантированно плохих.
     Важно: 429 считаем признаком «ключ валидный, просто лимит».
     """
     bad = []
+
+    def log_ui(message):
+        if not log_fn:
+            return
+        try:
+            log_fn(message)
+        except Exception as exc:
+            logger.debug("Failed to write UI log '%s': %s", message, exc)
+
     for key in keys:
         logger.info("Validating API key %s...", key[:8] + "…")
         try:
             # минимизируем расход токенов при проверке
-            call_api([{"role": "user", "content": "ping"}], key, model="o3", max_tokens=1)
+            call_api([{"role": "user", "content": "ping"}], key, model="gpt-5", max_tokens=1)
             logger.info("API key %s is valid", key[:8] + "…")
+            log_ui(f"Ключ рабочий: {key[:8]}…")
             return key, bad
         except RateLimitError:
             logger.info("API key %s is valid but currently rate-limited", key[:8] + "…")
+            log_ui(f"Ключ валидный, но временно ограничен: {key[:8]}…")
             return key, bad
         except QuotaExceededError:
             logger.warning("API key %s quota exceeded", key[:8] + "…")
             bad.append(key)
+            log_ui(f"Квота исчерпана у ключа: {key[:8]}…")
         except InvalidAPIKeyError:
             logger.warning("API key %s is invalid", key[:8] + "…")
             bad.append(key)
+            log_ui(f"Ключ недействителен: {key[:8]}…")
         except Exception as e:
             logger.error("Error validating key %s: %s", key[:8] + "…", e)
+            log_ui(f"Ошибка при проверке ключа {key[:8]}…: {e}")
     return None, bad
 
 
@@ -929,7 +943,7 @@ class App(ctk.CTk):
             while True:
                 attempt += 1
                 try:
-                    result = call_api(messages, key, self.log_file, model="o3", max_tokens=max_tokens)
+                    result = call_api(messages, key, self.log_file, model="gpt-5", max_tokens=max_tokens)
                     html_parts.append(result + "\n")
                     self._progress["html_parts"] = html_parts
                     self._progress["idx"] = idx + 1
@@ -1062,7 +1076,7 @@ class App(ctk.CTk):
 
             self.log("Проверка ключей...")
             logger.info("Validating API keys")
-            key, bad = validate_api_keys(keys)
+            key, bad = validate_api_keys(keys, log_fn=self.log)
             for b in bad:
                 update_bad_api_key(b, API_FILE)
                 if b in keys:
