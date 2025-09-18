@@ -1296,7 +1296,7 @@ class App(ctk.CTk):
     def _style_tab_button(self, index: int, active: bool):
         button = self.tab_buttons[index]
         if active:
-            button.configure(fg_color=("gray75", "gray30"), state="disabled")
+            button.configure(fg_color=("gray75", "gray30"), state="normal")
         else:
             button.configure(fg_color="transparent", state="normal")
 
