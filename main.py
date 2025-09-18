@@ -1911,40 +1911,41 @@ def _keyword_match_has_boundaries(text: str, start: int, length: int) -> bool:
         if _is_keyword_word_char(nxt):
             return False
 
-        j = after_idx
-        had_space = False
-        while j < len(text) and text[j].isspace():
-            had_space = True
-            j += 1
-        if j < len(text):
-            nxt = text[j]
-            if _is_keyword_word_char(nxt):
-                return False
-            # если соединительный символ идёт сразу после ключа без пробела —
-            # продолжаем поиск, т.к. это часть другого выражения (например
-            # "win aura-casino").
-            if nxt in _KEYWORD_CONNECTOR_CHARS and not had_space and (j + 1 < len(text)):
-                k = j + 1
-                while k < len(text) and text[k].isspace():
-                    k += 1
-                if k < len(text) and _is_keyword_word_char(text[k]):
-                    return False
-
     return True
 
 
 def _keyword_in_text_with_boundaries(text: str, keyword: str) -> bool:
     if not keyword:
         return False
+    return _find_keyword_with_boundaries(text, keyword) >= 0
+
+
+def _find_keyword_with_boundaries(text: str, keyword: str) -> int:
+    if not keyword:
+        return -1
     idx = 0
     n = len(keyword)
     while True:
         idx = text.find(keyword, idx)
         if idx < 0:
-            return False
+            return -1
         if _keyword_match_has_boundaries(text, idx, n):
-            return True
+            return idx
         idx += 1
+
+
+def _iter_keyword_positions(text: str, keyword: str):
+    if not keyword:
+        return
+    start = 0
+    n = len(keyword)
+    while True:
+        idx = text.find(keyword, start)
+        if idx < 0:
+            return
+        if _keyword_match_has_boundaries(text, idx, n):
+            yield idx
+        start = idx + 1
 
 
 def _collect_mk_keywords_and_plain_text(doc: Document) -> Tuple[List[str], str]:
@@ -2249,16 +2250,52 @@ def validate_text_article(doc: Document, tag: Optional[str] = None, enforce_mk_k
             mk_keywords, body_plain = _collect_mk_keywords_and_plain_text(doc)
             if mk_keywords:
                 haystack = _normalize_for_keyword_search(body_plain)
-                missing: List[str] = []
+                keyword_norms: List[Tuple[str, str]] = []
                 for kw in mk_keywords:
                     norm_kw = _normalize_for_keyword_search(kw)
                     if not norm_kw:
                         continue
-                    if not _keyword_in_text_with_boundaries(haystack, norm_kw):
-                        missing.append(kw)
-                if missing:
-                    formatted = ", ".join(f"«{m}»" for m in missing)
-                    errors.append(f"MK: в тексте не найдены ключевые слова: {formatted}.")
+                    keyword_norms.append((kw, norm_kw))
+
+                if keyword_norms:
+                    spans_by_kw: Dict[str, List[Tuple[int, int]]] = {}
+                    for _, norm_kw in keyword_norms:
+                        positions = list(_iter_keyword_positions(haystack, norm_kw))
+                        spans_by_kw[norm_kw] = [
+                            (pos, pos + len(norm_kw)) for pos in positions
+                        ]
+
+                    missing: List[str] = []
+                    for original_kw, norm_kw in keyword_norms:
+                        spans = spans_by_kw.get(norm_kw, [])
+                        if not spans:
+                            missing.append(original_kw)
+                            continue
+
+                        independent_found = False
+                        for start, end in spans:
+                            covered = False
+                            for other_kw, other_spans in spans_by_kw.items():
+                                if other_kw == norm_kw:
+                                    continue
+                                if len(other_kw) <= len(norm_kw):
+                                    continue
+                                for o_start, o_end in other_spans:
+                                    if o_start <= start and o_end >= end:
+                                        covered = True
+                                        break
+                                if covered:
+                                    break
+                            if not covered:
+                                independent_found = True
+                                break
+
+                        if not independent_found:
+                            missing.append(original_kw)
+
+                    if missing:
+                        formatted = ", ".join(f"«{m}»" for m in missing)
+                        errors.append(f"MK: в тексте не найдены ключевые слова: {formatted}.")
         except Exception as ex:
             errors.append(f"MK: не удалось проверить ключевые слова: {ex}")
 
