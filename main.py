@@ -256,6 +256,40 @@ def call_api(messages, api_key, log_file=None, model="gpt-5", max_tokens=None, t
     raise APIError(f"Ошибка API: {response.status_code} - {response.text}")
 
 
+PING_MESSAGES = [
+    {"role": "system", "content": "You are a helpful assistant that must always reply with the single word 'PONG'."},
+    {"role": "user", "content": "Ответь ровно словом PONG."},
+]
+
+
+def _validate_key_ping(api_key: str, log_ui=None, retries: int = 2):
+    """Проверка ключа с повторными попытками при пустых ответах модели."""
+    attempts = 0
+    while True:
+        try:
+            call_api(PING_MESSAGES, api_key, model="gpt-5", timeout=60)
+            return
+        except APIError as exc:
+            message = str(exc).lower()
+            if "пустой ответ" in message and attempts < retries:
+                attempts += 1
+                delay = _with_jitter(1.5 * attempts)
+                logger.warning(
+                    "Empty response while validating key %s; retry %d/%d in %.1fs",
+                    api_key[:8] + "…",
+                    attempts + 1,
+                    retries + 1,
+                    delay,
+                )
+                if log_ui:
+                    log_ui(
+                        f"Модель вернула пустой ответ, повторная попытка {attempts + 1} для ключа {api_key[:8]}…"
+                    )
+                time.sleep(delay)
+                continue
+            raise
+
+
 def validate_api_keys(keys, log_fn=None):
     """Вернуть первый «живой» ключ и список гарантированно плохих.
     Важно: 429 считаем признаком «ключ валидный, просто лимит».
@@ -273,9 +307,7 @@ def validate_api_keys(keys, log_fn=None):
     for key in keys:
         logger.info("Validating API key %s...", key[:8] + "…")
         try:
-            # минимизируем расход токенов при проверке
-            # gpt-5 требует несколько токенов на сервисный ответ, 1 токена недостаточно
-            call_api([{"role": "user", "content": "ping"}], key, model="gpt-5", max_tokens=16)
+            _validate_key_ping(key, log_ui)
             logger.info("API key %s is valid", key[:8] + "…")
             log_ui(f"Ключ рабочий: {key[:8]}…")
             return key, bad
@@ -291,6 +323,9 @@ def validate_api_keys(keys, log_fn=None):
             logger.warning("API key %s is invalid", key[:8] + "…")
             bad.append(key)
             log_ui(f"Ключ недействителен: {key[:8]}…")
+        except APIError as e:
+            logger.error("Error validating key %s: %s", key[:8] + "…", e)
+            log_ui(f"Ошибка при проверке ключа {key[:8]}…: {e}")
         except Exception as e:
             logger.error("Error validating key %s: %s", key[:8] + "…", e)
             log_ui(f"Ошибка при проверке ключа {key[:8]}…: {e}")
