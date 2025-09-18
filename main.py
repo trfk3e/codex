@@ -9,6 +9,7 @@ import time
 import logging
 import configparser
 import ctypes
+import uuid
 from typing import Optional
 
 import customtkinter as ctk
@@ -476,17 +477,13 @@ def _with_jitter(seconds: float) -> float:
     return max(0.0, seconds + random.uniform(-span, span))
 
 
-class App(ctk.CTk):
-    def __init__(self):
-        super().__init__()
+class GenerationTab(ctk.CTkFrame):
+    def __init__(self, master, app, tab_id):
+        super().__init__(master)
         global API_FILE
-        self.title("Generator")
-        self.minsize(800, 500)
-        self._bind_clipboard_shortcuts()
-        self.after(0, lambda: self.state("zoomed"))
 
-        ctk.set_appearance_mode("System")
-        ctk.set_default_color_theme("blue")
+        self.app = app
+        self.tab_id = tab_id
 
         self.config_parser = load_settings()
 
@@ -503,45 +500,69 @@ class App(ctk.CTk):
         self.h2_var = ctk.StringVar(value=self.config_parser["main"].get("h2", "100-150"))
         self.h3_var = ctk.StringVar(value=self.config_parser["main"].get("h3", "100-150"))
 
-        # обновляем глобальный путь к ключам
         API_FILE = self.api_path_var.get()
 
         self.log_file = None
-        self._progress = {"idx": 1, "html_parts": []}  # прогресс генерации
+        self._progress = {"idx": 1, "html_parts": []}
+        self._running = False
+        self._session_id = None
 
-        # Сетка
+        self.chat_label_var = ctk.StringVar()
+        self._update_chat_title()
+
         self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=0, minsize=280)
+        self.grid_columnconfigure(0, weight=0, minsize=300)
         self.grid_columnconfigure(1, weight=1)
-
-        settings_btn = ctk.CTkButton(self, text="⚙", width=40, height=32, command=self.open_settings)
-        settings_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=10)
 
         left = ctk.CTkFrame(self)
         left.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         left.grid_columnconfigure(1, weight=1)
         left.grid_rowconfigure(7, weight=1)
 
-        ctk.CTkLabel(left, text="Язык").grid(row=0, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.language_var).grid(row=0, column=1, padx=5, pady=(5,0), sticky="ew")
+        ctk.CTkLabel(
+            left,
+            textvariable=self.chat_label_var,
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=0, column=0, columnspan=2, padx=5, pady=(5, 0), sticky="w")
 
-        ctk.CTkLabel(left, text="Валюта").grid(row=1, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.currency_var).grid(row=1, column=1, padx=5, pady=(5,0), sticky="ew")
+        ctk.CTkLabel(left, text="Язык").grid(row=1, column=0, padx=5, pady=(8, 0), sticky="w")
+        ctk.CTkEntry(left, textvariable=self.language_var).grid(
+            row=1, column=1, padx=5, pady=(8, 0), sticky="ew"
+        )
 
-        ctk.CTkLabel(left, text="Слов в H1").grid(row=2, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.h1_var).grid(row=2, column=1, padx=5, pady=(5,0), sticky="ew")
+        ctk.CTkLabel(left, text="Валюта").grid(row=2, column=0, padx=5, pady=(5, 0), sticky="w")
+        ctk.CTkEntry(left, textvariable=self.currency_var).grid(
+            row=2, column=1, padx=5, pady=(5, 0), sticky="ew"
+        )
 
-        ctk.CTkLabel(left, text="Слов в H2").grid(row=3, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.h2_var).grid(row=3, column=1, padx=5, pady=(5,0), sticky="ew")
+        ctk.CTkLabel(left, text="Слов в H1").grid(row=3, column=0, padx=5, pady=(5, 0), sticky="w")
+        ctk.CTkEntry(left, textvariable=self.h1_var).grid(
+            row=3, column=1, padx=5, pady=(5, 0), sticky="ew"
+        )
 
-        ctk.CTkLabel(left, text="Слов в H3").grid(row=4, column=0, padx=5, pady=(5,0), sticky="w")
-        ctk.CTkEntry(left, textvariable=self.h3_var).grid(row=4, column=1, padx=5, pady=(5,0), sticky="ew")
+        ctk.CTkLabel(left, text="Слов в H2").grid(row=4, column=0, padx=5, pady=(5, 0), sticky="w")
+        ctk.CTkEntry(left, textvariable=self.h2_var).grid(
+            row=4, column=1, padx=5, pady=(5, 0), sticky="ew"
+        )
 
-        ctk.CTkButton(left, text="Настройки", command=self.open_settings).grid(row=5, column=0, columnspan=2, pady=(5,0))
-        ctk.CTkButton(left, text="Старт", command=self.start).grid(row=6, column=0, columnspan=2, pady=10)
+        ctk.CTkLabel(left, text="Слов в H3").grid(row=5, column=0, padx=5, pady=(5, 0), sticky="w")
+        ctk.CTkEntry(left, textvariable=self.h3_var).grid(
+            row=5, column=1, padx=5, pady=(5, 0), sticky="ew"
+        )
+
+        button_row = ctk.CTkFrame(left)
+        button_row.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        button_row.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(button_row, text="Настройки", command=self.open_settings).grid(
+            row=0, column=0, padx=(0, 4), sticky="ew"
+        )
+        ctk.CTkButton(button_row, text="Старт", command=self.start).grid(
+            row=0, column=1, padx=(4, 0), sticky="ew"
+        )
 
         self.log_box = ctk.CTkTextbox(left)
-        self.log_box.grid(row=7, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.log_box.grid(row=7, column=0, columnspan=2, sticky="nsew", padx=5, pady=(0, 5))
         self.log_box.configure(state="disabled")
 
         right = ctk.CTkFrame(self)
@@ -564,56 +585,19 @@ class App(ctk.CTk):
         self.text_widget.bind("<<Redo>>", lambda e: self.text_widget.edit_redo())
         self._updating_placeholders = False
 
-        ctk.CTkButton(right, text="Сохранить", command=self.save_plan_file).grid(row=1, column=0, pady=5)
+        ctk.CTkButton(right, text="Сохранить", command=self.save_plan_file).grid(
+            row=1, column=0, pady=5, sticky="ew"
+        )
 
         self.load_plan_file()
 
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
     # ───── UI/вспомогательные методы ─────
 
-    def center_window(self, win=None):
-        target = win or self
-        target.update_idletasks()
-        width = target.winfo_width()
-        height = target.winfo_height()
-        if width <= 1 or height <= 1:
-            geom = target.geometry()
-            m = re.match(r"(\d+)x(\d+)", geom)
-            if m:
-                width = int(m.group(1))
-                height = int(m.group(2))
-        x = (target.winfo_screenwidth() - width) // 2
-        y = (target.winfo_screenheight() - height) // 2
-        target.geometry(f"{width}x{height}+{x}+{y}")
-
-    def _bind_clipboard_shortcuts(self):
-        """Горячие клавиши Ctrl на любой раскладке (Windows)."""
-        def is_english_layout():
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0)
-            hkl = ctypes.windll.user32.GetKeyboardLayout(thread_id)
-            langid = hkl & 0xFFFF
-            return langid & 0x3FF == 0x09
-
-        def _handle_ctrl(event):
-            if is_english_layout():
-                return
-            if event.state & 0x4:
-                kc = event.keycode
-                if kc == 67:
-                    event.widget.event_generate('<<Copy>>');  return 'break'
-                if kc == 88:
-                    event.widget.event_generate('<<Cut>>');   return 'break'
-                if kc == 86:
-                    event.widget.event_generate('<<Paste>>'); return 'break'
-                if kc == 65:
-                    event.widget.event_generate('<<SelectAll>>'); return 'break'
-                if kc == 90:
-                    event.widget.event_generate('<<Undo>>');  return 'break'
-                if kc == 89:
-                    event.widget.event_generate('<<Redo>>');  return 'break'
-        self.bind_all('<Control-KeyPress>', _handle_ctrl)
+    def _update_chat_title(self, suffix: str = ""):
+        base = f"Чат {self.tab_id}"
+        title = base if not suffix else f"{base} • {suffix}"
+        self.chat_label_var.set(title)
+        self.app.rename_tab(self, title)
 
     def select_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
@@ -748,24 +732,29 @@ class App(ctk.CTk):
     # ───── Работа с чекпоинтом ─────
 
     def _checkpoint_path(self, folder):
+        session = self._session_id or "pending"
+        return os.path.join(folder, f".generator_checkpoint_{session}.json")
+
+    def _legacy_checkpoint_path(self, folder):
         return os.path.join(folder, ".generator_checkpoint.json")
 
-    def _load_checkpoint(self, folder):
-        path = self._checkpoint_path(folder)
-        if os.path.exists(path):
+    def _cleanup_legacy_checkpoint(self, folder):
+        legacy = self._legacy_checkpoint_path(folder)
+        if os.path.exists(legacy):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and "idx" in data and "html_parts" in data:
-                    self._progress = {"idx": int(data["idx"]), "html_parts": list(data["html_parts"])}
-                    self.log(f"Обнаружен чекпоинт. Продолжаем с части {self._progress['idx']}.")
-                    return True
+                os.remove(legacy)
+                logger.debug("Удален устаревший чекпоинт %s", legacy)
             except Exception as e:
-                logger.warning("Не удалось загрузить чекпоинт: %s", e)
+                logger.debug("Не удалось удалить устаревший чекпоинт %s: %s", legacy, e)
+
+    def _load_checkpoint(self, folder):
+        # Для нового чата прогресс всегда начинается заново.
         self._progress = {"idx": 1, "html_parts": []}
         return False
 
     def _save_checkpoint(self, folder):
+        if not self._session_id:
+            return
         path = self._checkpoint_path(folder)
         data = {"idx": self._progress.get("idx", 1), "html_parts": self._progress.get("html_parts", [])}
         try:
@@ -775,6 +764,8 @@ class App(ctk.CTk):
             logger.debug("Не удалось сохранить чекпоинт: %s", e)
 
     def _clear_checkpoint(self, folder):
+        if not self._session_id:
+            return
         path = self._checkpoint_path(folder)
         try:
             if os.path.exists(path):
@@ -797,16 +788,18 @@ class App(ctk.CTk):
             messagebox.showerror("Ошибка", "Не заполнены настройки: " + ", ".join(missing))
             return
         self._running = True
+        self._session_id = None
+        self._progress = {"idx": 1, "html_parts": []}
         threading.Thread(target=self.run_generation, daemon=True).start()
 
     def open_settings(self):
-        win = ctk.CTkToplevel(self)
+        win = ctk.CTkToplevel(self.app)
         win.title("Settings")
         win.geometry("560x300")
         win.resizable(False, False)
-        win.transient(self)
+        win.transient(self.app)
         win.grab_set()
-        self.center_window(win)
+        self.app.center_window(win)
 
         win.grid_columnconfigure(1, weight=1)
 
@@ -868,7 +861,7 @@ class App(ctk.CTk):
 
     def on_close(self):
         self.save_settings()
-        self.destroy()
+        self._running = False
 
     # ───── Генерация с учётом анти‑429 и резюма ─────
 
@@ -983,11 +976,16 @@ class App(ctk.CTk):
         return filename
 
     def run_generation(self):
-        # лог-файл на запуск
-        self.log_file = LOG_TEMPLATE.format(int(time.time()))
+        session_uuid = uuid.uuid4().hex
+        session_label = session_uuid[:8].upper()
+        self._session_id = session_uuid
+        self._update_chat_title(session_label)
+
+        self.log_file = LOG_TEMPLATE.format(f"{int(time.time())}_{session_label}")
         open(self.log_file, "a", encoding="utf-8").close()
-        logger.info("Run log file: %s", self.log_file)
+        logger.info("Run log file: %s (chat %s)", self.log_file, session_label)
         prune_logs()
+        self.log(f"Новый чат запущен: {session_label}")
 
         plan_file = self.plan_path_var.get()
         if not plan_file:
@@ -1011,6 +1009,8 @@ class App(ctk.CTk):
         if not os.path.exists(folder):
             os.makedirs(folder, exist_ok=True)
 
+        self._cleanup_legacy_checkpoint(folder)
+
         if not os.path.exists(plan_file):
             open(plan_file, "a", encoding="utf-8").close()
             self.log(f"Создан файл плана: {plan_file}")
@@ -1023,11 +1023,8 @@ class App(ctk.CTk):
             self._running = False
             return
 
-        # Загружаем чекпоинт, если есть
-        self._load_checkpoint(folder)
-
         self.log("Загрузка API ключей...")
-        logger.info("Loading API keys")
+        logger.info("Loading API keys for chat %s", session_label)
         keys = load_api_keys()
         if not keys:
             self.after(0, lambda: messagebox.showerror("Ошибка", "Нет API ключей"))
@@ -1048,7 +1045,7 @@ class App(ctk.CTk):
                     return
 
                 self.log("Проверка ключей...")
-                logger.info("Validating API keys")
+                logger.info("Validating API keys for chat %s", session_label)
                 key, bad = validate_api_keys(keys, log_fn=self.log)
                 for b in bad:
                     update_bad_api_key(b, API_FILE)
@@ -1058,12 +1055,11 @@ class App(ctk.CTk):
                     logger.info("Bad key %s moved to %s", b[:8] + "…", BAD_API_FILE)
 
                 if not key:
-                    # все ключи некорректны/закончилась квота
                     continue
 
                 current_key = key
                 self.log(f"Используется ключ: {current_key[:8]}…")
-                logger.info("Using API key %s", current_key[:8] + "…")
+                logger.info("Using API key %s for chat %s", current_key[:8] + "…", session_label)
 
             try:
                 filename = self._generate_with_key(current_key, parts, folder)
@@ -1072,9 +1068,8 @@ class App(ctk.CTk):
                     self._running = False
                     return
 
-                # Нефатальная ошибка внутри — попробуем ещё раз с этим же ключом
                 self.log("Ошибка при генерации, повторяем с тем же ключом…")
-                logger.info("Retrying generation with the same key %s", current_key[:8] + "…")
+                logger.info("Retrying generation with the same key %s for chat %s", current_key[:8] + "…", session_label)
                 continue
 
             except InvalidAPIKeyError:
@@ -1096,11 +1091,138 @@ class App(ctk.CTk):
                 continue
 
             except Exception as e:
-                # Непредвиденное — завершаем
                 self.after(0, lambda: messagebox.showerror("Ошибка", f"Критическая ошибка: {e}"))
-                logger.exception("Critical error: %s", e)
+                logger.exception("Critical error in chat %s: %s", session_label, e)
                 self._running = False
                 return
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Generator")
+        self.minsize(800, 500)
+        self._bind_clipboard_shortcuts()
+        self.after(0, lambda: self.state("zoomed"))
+
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.tab_bar = ctk.CTkFrame(self)
+        self.tab_bar.grid(row=0, column=0, sticky="ew")
+
+        self.tab_container = ctk.CTkFrame(self)
+        self.tab_container.grid(row=1, column=0, sticky="nsew")
+        self.tab_container.grid_rowconfigure(0, weight=1)
+        self.tab_container.grid_columnconfigure(0, weight=1)
+
+        self.tabs = []
+        self.tab_buttons = []
+        self.active_index = None
+        self._next_tab_id = 1
+
+        self.add_tab_button = ctk.CTkButton(self.tab_bar, text="+", width=40, command=self.add_tab)
+        self.add_tab_button.pack(side="right", padx=6, pady=6)
+
+        self.add_tab()
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def add_tab(self):
+        tab = GenerationTab(self.tab_container, self, self._next_tab_id)
+        index = len(self.tabs)
+        self.tabs.append(tab)
+        button = ctk.CTkButton(
+            self.tab_bar,
+            text=f"Чат {tab.tab_id}",
+            width=140,
+            command=lambda i=index: self.show_tab(i),
+        )
+        button.pack(side="left", padx=(6 if index == 0 else 2, 2), pady=6)
+        self.tab_buttons.append(button)
+        tab.grid(row=0, column=0, sticky="nsew")
+        tab.grid_remove()
+        self._next_tab_id += 1
+        self.show_tab(index)
+        return tab
+
+    def show_tab(self, index: int):
+        if self.active_index == index:
+            return
+        if self.active_index is not None:
+            self.tabs[self.active_index].grid_remove()
+            self._style_tab_button(self.active_index, active=False)
+        self.active_index = index
+        tab = self.tabs[index]
+        tab.grid(row=0, column=0, sticky="nsew")
+        self._style_tab_button(index, active=True)
+
+    def _style_tab_button(self, index: int, active: bool):
+        button = self.tab_buttons[index]
+        if active:
+            button.configure(fg_color=("gray75", "gray30"), state="disabled")
+        else:
+            button.configure(fg_color="transparent", state="normal")
+
+    def rename_tab(self, tab: GenerationTab, title: str):
+        try:
+            idx = self.tabs.index(tab)
+        except ValueError:
+            return
+        self.tab_buttons[idx].configure(text=title)
+
+    def center_window(self, win=None):
+        target = win or self
+        target.update_idletasks()
+        width = target.winfo_width()
+        height = target.winfo_height()
+        if width <= 1 or height <= 1:
+            geom = target.geometry()
+            m = re.match(r"(\d+)x(\d+)", geom)
+            if m:
+                width = int(m.group(1))
+                height = int(m.group(2))
+        x = (target.winfo_screenwidth() - width) // 2
+        y = (target.winfo_screenheight() - height) // 2
+        target.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _bind_clipboard_shortcuts(self):
+        """Горячие клавиши Ctrl на любой раскладке (Windows)."""
+
+        def is_english_layout():
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0)
+            hkl = ctypes.windll.user32.GetKeyboardLayout(thread_id)
+            langid = hkl & 0xFFFF
+            return langid & 0x3FF == 0x09
+
+        def _handle_ctrl(event):
+            if is_english_layout():
+                return
+            if event.state & 0x4:
+                kc = event.keycode
+                if kc == 67:
+                    event.widget.event_generate('<<Copy>>');  return 'break'
+                if kc == 88:
+                    event.widget.event_generate('<<Cut>>');   return 'break'
+                if kc == 86:
+                    event.widget.event_generate('<<Paste>>'); return 'break'
+                if kc == 65:
+                    event.widget.event_generate('<<SelectAll>>'); return 'break'
+                if kc == 90:
+                    event.widget.event_generate('<<Undo>>');  return 'break'
+                if kc == 89:
+                    event.widget.event_generate('<<Redo>>');  return 'break'
+
+        self.bind_all('<Control-KeyPress>', _handle_ctrl)
+
+    def on_close(self):
+        for tab in self.tabs:
+            tab.on_close()
+        self.destroy()
 
 
 def main():
