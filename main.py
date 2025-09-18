@@ -1873,7 +1873,121 @@ def _validate_markers_in_plain_doc(doc: Document) -> List[str]:
 
     return errors
 
-def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]:
+
+def _normalize_for_keyword_search(text: str) -> str:
+    cleaned = strip_invisible(text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.casefold()
+
+
+def _collect_mk_keywords_and_plain_text(doc: Document) -> Tuple[List[str], str]:
+    mk_chunks: List[str] = []
+    body_chunks: List[str] = []
+    state: Optional[str] = None
+
+    for block in iter_block_items(doc):
+        lvl = get_heading_level(block) if isinstance(block, Paragraph) else None
+        if state == "MK" and lvl is not None:
+            state = None
+
+        if isinstance(block, Paragraph):
+            raw = (block.text or "").replace("\xa0", " ")
+            lines = re.split(r'(?:\r|\n)+', raw) or [raw]
+            for raw_line in lines:
+                s = _norm_text(raw_line)
+                if not s:
+                    continue
+                matches = list(_MARKER_RE.finditer(s))
+                if matches:
+                    pos = 0
+                    for idx, match in enumerate(matches):
+                        prefix = s[pos:match.start()].strip()
+                        if prefix:
+                            if state == "MK":
+                                mk_chunks.append(prefix)
+                            elif state in ("MT", "MD"):
+                                pass
+                            else:
+                                body_chunks.append(prefix)
+
+                        marker = match.group(1)[:-1]
+                        if marker == "MT":
+                            state = "MT"
+                        elif marker == "MD":
+                            state = "MD"
+                        elif marker == "MK":
+                            state = "MK"
+
+                        payload_start = match.end()
+                        payload_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(s)
+                        payload = s[payload_start:payload_end].strip()
+                        if payload:
+                            if marker == "MK":
+                                mk_chunks.append(payload)
+                            elif marker in ("MT", "MD"):
+                                pass
+                            else:
+                                body_chunks.append(payload)
+                        pos = payload_end
+
+                    if pos < len(s):
+                        tail = s[pos:].strip()
+                        if tail:
+                            if state == "MK":
+                                mk_chunks.append(tail)
+                            elif state in ("MT", "MD"):
+                                pass
+                            else:
+                                body_chunks.append(tail)
+                    continue
+
+                if state == "MK":
+                    mk_chunks.append(s)
+                elif state in ("MT", "MD"):
+                    pass
+                else:
+                    body_chunks.append(s)
+
+        elif isinstance(block, Table):
+            try:
+                segments: List[str] = []
+                for row in block.rows:
+                    for cell in row.cells:
+                        cell_text = _norm_text(cell.text)
+                        if cell_text:
+                            segments.append(cell_text)
+                if segments:
+                    combined = " ".join(segments).strip()
+                    if combined:
+                        if state == "MK":
+                            mk_chunks.append(combined)
+                        elif state in ("MT", "MD"):
+                            pass
+                        else:
+                            body_chunks.append(combined)
+            except Exception:
+                pass
+
+    mk_keywords: List[str] = []
+    seen: Set[str] = set()
+    for chunk in mk_chunks:
+        chunk_clean = strip_invisible(chunk or "").strip()
+        if not chunk_clean:
+            continue
+        for part in chunk_clean.split(','):
+            keyword = part.strip()
+            if not keyword:
+                continue
+            norm_kw = _normalize_for_keyword_search(keyword)
+            if not norm_kw or norm_kw in seen:
+                continue
+            seen.add(norm_kw)
+            mk_keywords.append(keyword)
+
+    body_text = " ".join(body_chunks)
+    return mk_keywords, body_text
+
+def validate_text_article(doc: Document, tag: Optional[str] = None, enforce_mk_keywords: bool = False) -> List[str]:
     errors: List[str] = []
     headings: List[Tuple[int, str]] = []
     body_texts: List[str] = []
@@ -2062,6 +2176,24 @@ def validate_text_article(doc: Document, tag: Optional[str] = None) -> List[str]
     except Exception:
         # не роняем проверку статей из-за служебной ошибки
         pass
+
+    if enforce_mk_keywords:
+        try:
+            mk_keywords, body_plain = _collect_mk_keywords_and_plain_text(doc)
+            if mk_keywords:
+                haystack = _normalize_for_keyword_search(body_plain)
+                missing: List[str] = []
+                for kw in mk_keywords:
+                    norm_kw = _normalize_for_keyword_search(kw)
+                    if not norm_kw:
+                        continue
+                    if norm_kw not in haystack:
+                        missing.append(kw)
+                if missing:
+                    formatted = ", ".join(f"«{m}»" for m in missing)
+                    errors.append(f"MK: в тексте не найдены ключевые слова: {formatted}.")
+        except Exception as ex:
+            errors.append(f"MK: не удалось проверить ключевые слова: {ex}")
 
     return errors
 
@@ -2473,7 +2605,7 @@ def _open_doc_safe(path: str) -> Document:
     patched = patch_docx_for_python_docx(path)
     return Document(patched)
 
-def validate_article_from_url(tag: str, url: str, tmpdir: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+def validate_article_from_url(tag: str, url: str, tmpdir: Optional[str] = None, enforce_mk_keywords: bool = False) -> Tuple[bool, str, Optional[str]]:
     own_tmp = False
     if tmpdir is None:
         tmpdir = tempfile.mkdtemp(prefix="docxv_"); own_tmp = True
@@ -2489,7 +2621,7 @@ def validate_article_from_url(tag: str, url: str, tmpdir: Optional[str] = None) 
 
         try:
             doc = _open_doc_safe(orig_path)
-            errors = validate_text_article(doc, tag)
+            errors = validate_text_article(doc, tag, enforce_mk_keywords=enforce_mk_keywords)
             if errors:
                 ok = False
                 lines.append(f"🛑 [{tag}] ОШИБКИ:")
@@ -2556,11 +2688,13 @@ def validate_eeat_from_url(url: str, tmpdir: Optional[str] = None) -> Tuple[bool
 async def run_full_validation_async(project: str,
                                     articles: List[Tuple[str, str]],
                                     eeat_link: Optional[str] = None,
+                                    auto_generated_tags: Optional[Set[str]] = None,
                                     progress_cb: Optional[Callable[[str], Awaitable[None]]] = None) -> Tuple[bool, str, List[Tuple[str, str]], Optional[str]]:
     tmpdir = tempfile.mkdtemp(prefix="docxv_")
     sem = asyncio.Semaphore(max(1, VALIDATOR_CONCURRENCY))
     per_item_logs: List[Tuple[str, str]] = []
     zip_items: List[Tuple[str, str]] = []
+    auto_tag_set: Set[str] = set(auto_generated_tags or ())
 
     async def _emit_stage(stage: str) -> None:
         if not progress_cb:
@@ -2573,9 +2707,12 @@ async def run_full_validation_async(project: str,
             pass
 
     async def run_article(tag: str, url: str):
+        enforce_keywords = bool(auto_tag_set and tag in auto_tag_set)
         async with sem:
             if ARTICLE_VALIDATION_TIMEOUT_SEC > 0:
-                worker = asyncio.create_task(asyncio.to_thread(validate_article_from_url, tag, url, tmpdir))
+                worker = asyncio.create_task(asyncio.to_thread(
+                    validate_article_from_url, tag, url, tmpdir, enforce_keywords
+                ))
                 try:
                     return await asyncio.wait_for(worker, ARTICLE_VALIDATION_TIMEOUT_SEC)
                 except asyncio.TimeoutError:
@@ -2586,7 +2723,7 @@ async def run_full_validation_async(project: str,
                         f"Таймаут проверки статьи «{clip(tag, 80)}» спустя {ARTICLE_VALIDATION_TIMEOUT_SEC:.1f} с."
                     )
                     raise ValidationTimeoutError("article", tag, ARTICLE_VALIDATION_TIMEOUT_SEC)
-            return await asyncio.to_thread(validate_article_from_url, tag, url, tmpdir)
+            return await asyncio.to_thread(validate_article_from_url, tag, url, tmpdir, enforce_keywords)
 
     async def run_eeat(url: str):
         async with sem:
@@ -2882,7 +3019,7 @@ def _ensure_unique_auto_tag(tag: str, used: Set[str]) -> str:
     return unique
 
 
-def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str], List[str]]:
+def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str], List[str], Set[str]]:
     """
     Форматы:
       1) 'название<пробел/таб>URL_или_путь'  — в одну строку
@@ -2894,6 +3031,7 @@ def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str
     errors: List[str] = []
     used_tags: Set[str] = set()
     auto_counter = 0
+    auto_tags: Set[str] = set()
 
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
     i = 0
@@ -2922,6 +3060,7 @@ def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str
             auto_tag = _ensure_unique_auto_tag(auto_tag, used_tags)
             used_tags.add(auto_tag)
             articles.append((auto_tag, ln))
+            auto_tags.add(auto_tag)
             i += 1
             continue
 
@@ -2939,7 +3078,7 @@ def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str
         errors.append(f"Строка {i+1}: не распознана пара 'название\\tссылка' → «{ln}»")
         i += 1
 
-    return articles, eeat_link, errors
+    return articles, eeat_link, errors, auto_tags
 
 @dp.message(CommandStart())
 async def on_start(message: Message):
@@ -3037,7 +3176,7 @@ async def on_text(message: Message):
             return
 
         raw = message.text or ""
-        articles, eeat_link, parse_errors = parse_lines_to_pairs(raw)
+        articles, eeat_link, parse_errors, auto_tags = parse_lines_to_pairs(raw)
         if parse_errors and not articles and not eeat_link:
             await message.answer("Не удалось распознать ни одной строки:\n• " + "\n• ".join(parse_errors))
             return
@@ -3111,7 +3250,7 @@ async def on_text(message: Message):
                 await update_stage(stage)
 
             overall_ok, _full_report, per_item_logs, zip_path = await run_full_validation_async(
-                "Project", articles, eeat_link, progress_cb=relay_stage
+                "Project", articles, eeat_link, auto_generated_tags=auto_tags, progress_cb=relay_stage
             )
 
             await update_stage("Собираем отчёт")
