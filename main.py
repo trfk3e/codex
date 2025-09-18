@@ -1036,57 +1036,63 @@ class App(ctk.CTk):
             self._running = False
             return
 
+        current_key = None
+
         while True:
-            if not keys:
-                self.after(0, lambda: messagebox.showerror("Ошибка", "Нет рабочих API ключей"))
-                self.log("Нет рабочих ключей")
-                logger.error("No working API keys")
-                self._running = False
-                return
+            if current_key is None:
+                if not keys:
+                    self.after(0, lambda: messagebox.showerror("Ошибка", "Нет рабочих API ключей"))
+                    self.log("Нет рабочих ключей")
+                    logger.error("No working API keys")
+                    self._running = False
+                    return
 
-            self.log("Проверка ключей...")
-            logger.info("Validating API keys")
-            key, bad = validate_api_keys(keys, log_fn=self.log)
-            for b in bad:
-                update_bad_api_key(b, API_FILE)
-                if b in keys:
-                    keys.remove(b)
-                self.log(f"Ключ не работает: {b[:8]}…")
-                logger.info("Bad key %s moved to %s", b[:8] + "…", BAD_API_FILE)
+                self.log("Проверка ключей...")
+                logger.info("Validating API keys")
+                key, bad = validate_api_keys(keys, log_fn=self.log)
+                for b in bad:
+                    update_bad_api_key(b, API_FILE)
+                    if b in keys:
+                        keys.remove(b)
+                    self.log(f"Ключ не работает: {b[:8]}…")
+                    logger.info("Bad key %s moved to %s", b[:8] + "…", BAD_API_FILE)
 
-            if not key:
-                # все ключи некорректны/закончилась квота
-                continue
+                if not key:
+                    # все ключи некорректны/закончилась квота
+                    continue
 
-            self.log(f"Используется ключ: {key[:8]}…")
-            logger.info("Using API key %s", key[:8] + "…")
+                current_key = key
+                self.log(f"Используется ключ: {current_key[:8]}…")
+                logger.info("Using API key %s", current_key[:8] + "…")
 
             try:
-                filename = self._generate_with_key(key, parts, folder)
+                filename = self._generate_with_key(current_key, parts, folder)
                 if filename:
                     self.after(0, lambda fname=filename: messagebox.showinfo("Готово", f"Файл сохранен: {fname}"))
                     self._running = False
                     return
-                else:
-                    # Нефатальная ошибка внутри — попробуем ещё раз с этим же ключом
-                    self.log("Ошибка при генерации, повторяем с тем же ключом…")
-                    time.sleep(1.0)
-                    continue
+
+                # Нефатальная ошибка внутри — попробуем ещё раз с этим же ключом
+                self.log("Ошибка при генерации, повторяем с тем же ключом…")
+                logger.info("Retrying generation with the same key %s", current_key[:8] + "…")
+                continue
 
             except InvalidAPIKeyError:
-                self.log(f"Ключ недействителен: {key[:8]}…")
-                logger.warning("API key %s is invalid during generation", key[:8] + "…")
-                update_bad_api_key(key, API_FILE)
-                if key in keys:
-                    keys.remove(key)
+                self.log(f"Ключ недействителен: {current_key[:8]}…")
+                logger.warning("API key %s is invalid during generation", current_key[:8] + "…")
+                update_bad_api_key(current_key, API_FILE)
+                if current_key in keys:
+                    keys.remove(current_key)
+                current_key = None
                 continue
 
             except QuotaExceededError:
-                self.log(f"Квота исчерпана у ключа: {key[:8]}… Пытаемся другим ключом.")
-                logger.warning("Quota exceeded for key %s, switching", key[:8] + "…")
-                update_bad_api_key(key, API_FILE)
-                if key in keys:
-                    keys.remove(key)
+                self.log(f"Квота исчерпана у ключа: {current_key[:8]}… Пытаемся другим ключом.")
+                logger.warning("Quota exceeded for key %s, switching", current_key[:8] + "…")
+                update_bad_api_key(current_key, API_FILE)
+                if current_key in keys:
+                    keys.remove(current_key)
+                current_key = None
                 continue
 
             except Exception as e:
