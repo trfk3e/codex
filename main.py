@@ -48,6 +48,8 @@ PROMO_IGNORE_CODES = {
 }
 EEAT_LANGUAGE_IGNORE_CODES = {"MK", "MT"}
 VALIDATOR_CONCURRENCY  = int(os.environ.get("VALIDATOR_CONCURRENCY", "8"))
+ARTICLE_VALIDATION_TIMEOUT_SEC = float(os.environ.get("ARTICLE_VALIDATION_TIMEOUT_SEC", "480"))
+EEAT_VALIDATION_TIMEOUT_SEC    = float(os.environ.get("EEAT_VALIDATION_TIMEOUT_SEC", "480"))
 
 # --- Новые параметры (Zoho OAuth: кеш и задержки) ---
 ZOHO_OAUTH_MAX_RETRIES       = int(os.environ.get("ZOHO_OAUTH_MAX_RETRIES", "3"))
@@ -76,6 +78,7 @@ import asyncio
 import random
 import threading
 from typing import List, Tuple, Dict, Optional, Callable, Any, Sequence, Union, Awaitable, Set
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aiogram import Bot, Dispatcher, F
@@ -371,6 +374,15 @@ import contextlib
 
 class KeysExhaustedError(RuntimeError):
     pass
+
+
+class ValidationTimeoutError(RuntimeError):
+    def __init__(self, kind: str, tag: Optional[str], timeout: float):
+        self.kind = kind
+        self.tag = tag
+        self.timeout = float(timeout)
+        label = tag or kind
+        super().__init__(f"{label}: превышено время ожидания ({self.timeout:.1f} с)")
 
 def _httpx_client():
     return httpx.Client(
@@ -2562,10 +2574,34 @@ async def run_full_validation_async(project: str,
 
     async def run_article(tag: str, url: str):
         async with sem:
+            if ARTICLE_VALIDATION_TIMEOUT_SEC > 0:
+                worker = asyncio.create_task(asyncio.to_thread(validate_article_from_url, tag, url, tmpdir))
+                try:
+                    return await asyncio.wait_for(worker, ARTICLE_VALIDATION_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    worker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await worker
+                    admin_debug_log(
+                        f"Таймаут проверки статьи «{clip(tag, 80)}» спустя {ARTICLE_VALIDATION_TIMEOUT_SEC:.1f} с."
+                    )
+                    raise ValidationTimeoutError("article", tag, ARTICLE_VALIDATION_TIMEOUT_SEC)
             return await asyncio.to_thread(validate_article_from_url, tag, url, tmpdir)
 
     async def run_eeat(url: str):
         async with sem:
+            if EEAT_VALIDATION_TIMEOUT_SEC > 0:
+                worker = asyncio.create_task(asyncio.to_thread(validate_eeat_from_url, url, tmpdir))
+                try:
+                    return await asyncio.wait_for(worker, EEAT_VALIDATION_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    worker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await worker
+                    admin_debug_log(
+                        f"Таймаут EEAT-проверки спустя {EEAT_VALIDATION_TIMEOUT_SEC:.1f} с."
+                    )
+                    raise ValidationTimeoutError("eeat", "EEAT", EEAT_VALIDATION_TIMEOUT_SEC)
             return await asyncio.to_thread(validate_eeat_from_url, url, tmpdir)
 
     try:
@@ -2621,6 +2657,13 @@ async def run_full_validation_async(project: str,
 
         for idx, (tag, _url) in enumerate(articles):
             res = article_results[idx]
+            if isinstance(res, ValidationTimeoutError):
+                seconds = int(round(max(1.0, res.timeout)))
+                per_item_logs.append(
+                    (tag, f"🛑 [{tag}] Проверка прервана по лимиту времени ({seconds} сек). Попробуйте повторить позже.")
+                )
+                overall_ok = False
+                continue
             if isinstance(res, Exception):
                 per_item_logs.append((tag, f"🛑 Ошибка выполнения: {res!r}"))
                 overall_ok = False
@@ -2643,10 +2686,19 @@ async def run_full_validation_async(project: str,
             if isinstance(er, Exception):
                 if isinstance(er, KeysExhaustedError):
                     raise er
-                eeat_log = f"🛑 EEAT: ошибка выполнения — {er!r}"
-                per_item_logs.append(("EEAT", eeat_log))
-                report_lines.append(eeat_log)
-                overall_ok = False
+                elif isinstance(er, ValidationTimeoutError):
+                    seconds = int(round(max(1.0, er.timeout)))
+                    eeat_log = (
+                        f"🛑 EEAT: проверка прервана по лимиту времени ({seconds} сек). Попробуйте повторить позже."
+                    )
+                    per_item_logs.append(("EEAT", eeat_log))
+                    report_lines.append(eeat_log)
+                    overall_ok = False
+                else:
+                    eeat_log = f"🛑 EEAT: ошибка выполнения — {er!r}"
+                    per_item_logs.append(("EEAT", eeat_log))
+                    report_lines.append(eeat_log)
+                    overall_ok = False
             else:
                 ok, eeat_log, eeat_zip_src = er if er is not None else (False, "EEAT: результат не получен", None)
                 overall_ok = overall_ok and ok
@@ -2791,6 +2843,45 @@ async def setup_menu_commands(bot: Bot, chat_id: Optional[int] = None):
         except Exception:
             pass
 
+
+def _auto_tag_from_source(src: str, index: int) -> str:
+    base = ""
+    cleaned = strip_invisible((src or "")).strip()
+    if re.match(r"^https?://", cleaned, flags=re.I):
+        try:
+            parsed = urlparse(cleaned)
+        except Exception:
+            parsed = None
+        if parsed:
+            candidate = (parsed.path or "").strip("/")
+            if candidate:
+                base = candidate.split("/")[-1]
+            if not base:
+                base = parsed.netloc or ""
+    else:
+        base = os.path.splitext(os.path.basename(cleaned))[0]
+
+    base = strip_invisible(base or "").strip()
+    if not base:
+        base = f"Ссылка {index}"
+    base = re.sub(r"[\s_]+", " ", base)
+    base = re.sub(r"[\\/:*?\"<>|]+", "", base)
+    base = base.strip() or f"Ссылка {index}"
+    return clip(base, 60)
+
+
+def _ensure_unique_auto_tag(tag: str, used: Set[str]) -> str:
+    candidate = tag or "Материал"
+    if candidate.lower() == "eeat":
+        candidate = f"{candidate}-auto"
+    unique = candidate
+    suffix = 2
+    while unique in used or unique.lower() == "eeat":
+        unique = clip(f"{candidate} ({suffix})", 60)
+        suffix += 1
+    return unique
+
+
 def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str], List[str]]:
     """
     Форматы:
@@ -2801,6 +2892,8 @@ def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str
     articles: List[Tuple[str, str]] = []
     eeat_link: Optional[str] = None
     errors: List[str] = []
+    used_tags: Set[str] = set()
+    auto_counter = 0
 
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
     i = 0
@@ -2813,22 +2906,33 @@ def parse_lines_to_pairs(text: str) -> Tuple[List[Tuple[str, str]], Optional[str
 
         m = re.match(r'^(\S+)\s+(.+)$', ln)
         if m and is_url_or_path(m.group(2).strip()):
-            tag = m.group(1).strip()
+            tag = strip_invisible(m.group(1) or "").strip()
             url = m.group(2).strip()
             if tag.lower() == "eeat":
                 eeat_link = url
             else:
                 articles.append((tag, url))
+                used_tags.add(tag)
+            i += 1
+            continue
+
+        if is_url_or_path(ln):
+            auto_counter += 1
+            auto_tag = _auto_tag_from_source(ln, auto_counter)
+            auto_tag = _ensure_unique_auto_tag(auto_tag, used_tags)
+            used_tags.add(auto_tag)
+            articles.append((auto_tag, ln))
             i += 1
             continue
 
         if i + 1 < len(lines) and is_url_or_path(lines[i + 1].strip()):
-            tag = ln
+            tag = strip_invisible(ln).strip()
             url = lines[i + 1].strip()
             if tag.lower() == "eeat":
                 eeat_link = url
             else:
                 articles.append((tag, url))
+                used_tags.add(tag)
             i += 2
             continue
 
@@ -2846,6 +2950,7 @@ async def on_start(message: Message):
         await message.answer(
             "Привет! Я валидатор DOCX (Zoho Writer) с нейро‑проверками.\n\n"
             "Отправьте построчно пары `название<TAB/пробел>ссылка/путь`.\n"
+            "Можно просто отправить ссылку — название придумаю автоматически.\n"
             "`eeat <ссылка/путь>` — EEAT‑проверка.\n"
             "Ссылки: `https://writer.zoho.{dc}/writer/open/<id>` или локальные пути к .docx."
         )
@@ -2856,13 +2961,14 @@ async def on_start(message: Message):
         "— /keys_add — добавить ключи (многострочный ввод)\n"
         "— /keys_list — просмотр списка (замаскировано)\n"
         "— /keys_clear — удалить все ключи\n\n"
-        "Для запуска проверок просто пришлите пары `название  ссылка` (строка на файл/Zoho)."
+        "Для запуска проверок просто пришлите пары `название  ссылка` или одну ссылку на строку."
     )
 
 @dp.message(Command("help"))
 async def on_help(message: Message):
     await message.answer(
         "Отправьте построчно пары `название<TAB/пробел>ссылка/путь`.\n"
+        "Можно просто отправить ссылку — название подставится автоматически.\n"
         "`eeat <ссылка/путь>` — EEAT‑проверка.\n"
         "Ссылки: `https://writer.zoho.{dc}/writer/open/<id>` или локальные пути к .docx.\n\n"
         "Администратор управляет ключами OpenAI через меню команд возле строки ввода."
