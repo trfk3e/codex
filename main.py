@@ -265,12 +265,96 @@ async def paraphrase(text: str) -> str:
         openai_client.chat.completions.create,
         model=MODEL_NAME,
         messages=[
-            {"role": "system",
-             "content": "Ты русскоязычный SEO-журналист. Перепиши текст лёгким рерайтом, сохрани факты."},
+            {
+                "role": "system",
+                "content": (
+                    "Ты русскоязычный SEO-журналист. Перепиши текст лёгким "
+                    "рерайтом, сохрани факты."
+                ),
+            },
             {"role": "user", "content": text.strip()},
         ],
     )
     return rsp.choices[0].message.content.strip()
+
+
+async def build_digest_payload(text: str) -> dict:
+    """Сформировать компактную выжимку поста через OpenAI."""
+
+    instruction = (
+        "Ты работаешь редактором Telegram-канала про SEO и маркетинг. "
+        "Проанализируй оригинальную публикацию и составь короткий анонс "
+        "в деловом стиле. Выдели главную мысль и конкретные полезные факты. "
+        "Ответ верни в строгом JSON-формате со следующими полями: "
+        "emoji (один подходящий эмодзи), title (до 100 символов), "
+        "summary (2–3 предложения с ключевыми фактами), "
+        "highlights (список из 0–4 коротких выводов или рекомендаций). "
+        "Не добавляй никакого текста вне JSON."
+    )
+
+    rsp = await openai_call(
+        openai_client.chat.completions.create,
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": text.strip()},
+        ],
+    )
+    raw = rsp.choices[0].message.content.strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.warning("Не удалось разобрать JSON от OpenAI, используем запасной формат")
+        data = {
+            "emoji": "📝",
+            "title": raw.splitlines()[0][:100] if raw else "Новая публикация",
+            "summary": raw,
+            "highlights": [],
+        }
+
+    if not isinstance(data, dict):
+        data = {
+            "emoji": "📝",
+            "title": "Новая публикация",
+            "summary": raw,
+            "highlights": [],
+        }
+
+    data.setdefault("emoji", "📝")
+    data.setdefault("title", "Новая публикация")
+    data.setdefault("summary", "")
+    hl = data.get("highlights")
+    if not isinstance(hl, list):
+        hl = []
+    data["highlights"] = [str(item) for item in hl[:4]]
+    return data
+
+
+def render_digest(data: dict, source: str, link: str) -> str:
+    emoji = html.escape(str(data.get("emoji", "📝")))
+    title = html.escape(str(data.get("title", "Новая публикация")))
+    summary = html.escape(str(data.get("summary", "")))
+    highlights = [html.escape(str(item)) for item in data.get("highlights", []) if item]
+
+    parts: list[str] = []
+    parts.append(f"{emoji} <b>{title}</b>")
+    if summary:
+        parts.append("")
+        parts.append(summary)
+    if highlights:
+        parts.append("")
+        parts.append("\n".join(f"• {item}" for item in highlights))
+
+    src = html.escape(source)
+    if link:
+        link_attr = html.escape(link)
+        source_line = f"Источник: <a href='{link_attr}'>{src}</a>"
+    else:
+        source_line = f"Источник: {src}"
+    parts.append("")
+    parts.append(source_line)
+    body = "\n".join(part for part in parts if part is not None)
+    return body[:4090]
 
 # ────────────── TELETHON helpers ───────────────────────────────────────────
 def quick_score(m: Message) -> int:
@@ -321,6 +405,9 @@ async def process_and_send(
     ctx: ContextTypes.DEFAULT_TYPE,
     msg: Message,
     chan: str,
+    *,
+    mode: str | None = None,
+    notify: bool = True,
 ):
     if ctx.chat_data.get("stop"):
         return False
@@ -343,40 +430,56 @@ async def process_and_send(
         return False
     if ctx.chat_data.get("stop"):
         return False
-    await log(ctx, f"Перефразируем пост {msg.id}")
-    rewritten = html.escape(await paraphrase(msg.text))
-    if ctx.chat_data.get("stop"):
-        return False
+    mode = mode or ctx.chat_data.get("output_mode", "rewrite")
     username = getattr(msg.chat, "username", None) or chan.lstrip("@")
     link = (
         f"https://t.me/{username}/{msg.id}" if username and not username.lstrip("-").isdigit() else ""
     )
-    footer = (
-        f"\n\n<b>Дата публикации:</b> {msg.date.strftime('%d.%m.%Y %H:%M')} "
-        f"| <b>Просмотров:</b> {msg.views or 0}"
-    )
-    src = f"@{username}" if username and not username.lstrip("-").isdigit() else chan
-    src = html.escape(src)
-    link_attr = f" href='{html.escape(link)}'" if link else ""
-    body = (
-        f"<b>Источник:</b> <a{link_attr}>{src}</a>\n\n"
-        f"{rewritten}{footer}"
-    )[:4090]
+    raw_src = f"@{username}" if username and not username.lstrip("-").isdigit() else chan
+    escaped_src = html.escape(raw_src)
+    parse_mode = tg_const.ParseMode.HTML
+    disable_preview = True
+
+    if mode == "digest":
+        await log(ctx, f"Формируем выжимку для поста {msg.id}")
+        if ctx.chat_data.get("stop"):
+            return False
+        digest = await build_digest_payload(msg.text)
+        if ctx.chat_data.get("stop"):
+            return False
+        body = render_digest(digest, raw_src, link)
+    else:
+        await log(ctx, f"Перефразируем пост {msg.id}")
+        if ctx.chat_data.get("stop"):
+            return False
+        rewritten = html.escape(await paraphrase(msg.text))
+        if ctx.chat_data.get("stop"):
+            return False
+        footer = (
+            f"\n\n<b>Дата публикации:</b> {msg.date.strftime('%d.%m.%Y %H:%M')} "
+            f"| <b>Просмотров:</b> {msg.views or 0}"
+        )
+        link_attr = f" href='{html.escape(link)}'" if link else ""
+        body = (
+            f"<b>Источник:</b> <a{link_attr}>{escaped_src}</a>\n\n"
+            f"{rewritten}{footer}"
+        )[:4090]
     await ctx.bot.send_message(
         chat_id=ctx.chat_data["target_chat"],
         text=body,
-        parse_mode=tg_const.ParseMode.HTML,
-        disable_web_page_preview=True,
+        parse_mode=parse_mode,
+        disable_web_page_preview=disable_preview,
     )
     await log(ctx, f"Отправлено сообщение {msg.id}")
     if ctx.chat_data.get("stop"):
         return True
     log_count = ctx.chat_data.get("sent", 0) + 1
     ctx.chat_data["sent"] = log_count
-    await ctx.bot.send_message(
-        chat_id=ctx.chat_data["target_chat"],
-        text=f"✅ Сообщение {log_count} из канала {chan} отправлено",
-    )
+    if notify:
+        await ctx.bot.send_message(
+            chat_id=ctx.chat_data["target_chat"],
+            text=f"✅ Сообщение {log_count} из канала {chan} отправлено",
+        )
     seen.append(msg.id)
     save_all()
     return True
@@ -387,6 +490,9 @@ async def send_filtered_posts(
     chan: str,
     posts: list[Message],
     need: int,
+    *,
+    mode: str | None = None,
+    notify: bool = True,
 ) -> tuple[int, int]:
     """Send posts that pass the AI filter until ``need`` is reached.
 
@@ -398,6 +504,8 @@ async def send_filtered_posts(
     cfg = get_cfg(ctx)
     key = chan.lstrip("@")
     seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+    if mode is None:
+        mode = ctx.chat_data.get("output_mode", "rewrite")
     await log(ctx, f"Начинаю проверку {len(posts)} постов из {chan}")
     sem = asyncio.Semaphore(CONCURRENCY)
     async def worker(m: Message):
@@ -408,7 +516,7 @@ async def send_filtered_posts(
             return
         async with sem:
             attempts += 1
-            if await process_and_send(ctx, m, chan):
+            if await process_and_send(ctx, m, chan, mode=mode, notify=notify):
                 sent += 1
     tasks = [asyncio.create_task(worker(m)) for m in posts]
     for t in asyncio.as_completed(tasks):
@@ -431,6 +539,7 @@ MAIN_KB = ReplyKeyboardMarkup(
         ["Поиск постов за последние дни во всех каналах"],
         ["📅 Диапазон дат (канал)", "📅 Диапазон дат (все)"],
         ["➕ Добавить каналы", "➖ Удалить каналы"],
+        ["📰 Выжимка всех каналов", "🤖 Авто-мониторинг"],
         ["Настройки"],
         ["Очистить чат"],
         ["⏹ Остановить"],
@@ -499,6 +608,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "⏹ Остановить":
         ctx.chat_data["stop"] = True
+        ctx.chat_data["auto_stop"] = True
         await update.message.reply_text(
             "Парсинг будет остановлен", reply_markup=MAIN_KB
         )
@@ -527,9 +637,51 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "8. Меню <b>Настройки</b> позволяет очистить историю ID, заменить фильтр-промпт и включить или выключить лог (по умолчанию лог отключён).\n"
             "9. <b>Очистить чат</b> — бот удалит все сообщения в этом диалоге.\n"
             "10. Кнопка ⏹ <b>Остановить</b> прерывает любой текущий парсинг.\n"
+            "11. <b>📰 Выжимка всех каналов</b> — соберёт короткие анонсы по тем же правилам фильтрации без рерайта.\n"
+            "12. <b>🤖 Авто-мониторинг</b> — бот раз в час ищет новые публикации, отправляет их в выжимке на апрув и останавливается кнопкой повторного нажатия или ⏹.\n"
         )
         await update.message.reply_text(
             instruction, reply_markup=MAIN_KB, parse_mode=tg_const.ParseMode.HTML
+        )
+        return
+
+    auto_task = ctx.chat_data.get("auto_task")
+    auto_running = bool(auto_task) and not auto_task.done()
+
+    if text == "🤖 Авто-мониторинг":
+        if auto_running:
+            ctx.chat_data["auto_stop"] = True
+            ctx.chat_data["stop"] = True
+            await update.message.reply_text(
+                "Останавливаю автоматический мониторинг…", reply_markup=MAIN_KB
+            )
+        else:
+            if not cfg.channels:
+                await update.message.reply_text("Список каналов пуст.", reply_markup=MAIN_KB)
+                return
+            if task_running(ctx):
+                await update.message.reply_text(
+                    "Уже выполняется задача. Нажмите ⏹ Остановить",
+                    reply_markup=MAIN_KB,
+                )
+                return
+            ctx.user_data.clear()
+            ctx.chat_data["auto_stop"] = False
+            task = ctx.application.create_task(auto_monitor(ctx))
+            ctx.chat_data["auto_task"] = task
+            await update.message.reply_text(
+                "Автоматический мониторинг запущен. Проверяю каналы каждый час.",
+                reply_markup=MAIN_KB,
+            )
+        return
+
+    auto_task = ctx.chat_data.get("auto_task")
+    auto_running = bool(auto_task) and not auto_task.done()
+
+    if auto_running and text not in {"⏹ Остановить"}:
+        await update.message.reply_text(
+            "Сейчас работает автоматический мониторинг. Остановите его через кнопку 🤖 Авто-мониторинг, чтобы выполнить другие действия.",
+            reply_markup=MAIN_KB,
         )
         return
 
@@ -621,6 +773,13 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = "add_channels"
         await update.message.reply_text(
             "Введите каналы через запятую:", reply_markup=ReplyKeyboardRemove()
+        )
+        return
+    if text == "📰 Выжимка всех каналов":
+        ctx.user_data.clear()
+        ctx.user_data["mode"] = "digest_seq_count"
+        await update.message.reply_text(
+            "Сколько постов собрать в выжимку?", reply_markup=ReplyKeyboardRemove()
         )
         return
     if text == "➖ Удалить каналы":
@@ -1007,6 +1166,20 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
         launch_task(ctx, run_recent_all(ctx, days))
         return
+    if mode == "digest_seq_count":
+        if not text.isdigit():
+            await update.message.reply_text("Нужно число")
+            return
+        if task_running(ctx):
+            await update.message.reply_text(
+                "Уже выполняется задача. Нажмите ⏹ Остановить",
+                reply_markup=MAIN_KB,
+            )
+            return
+        limit = int(text)
+        await update.message.reply_text("Готовлю выжимку…", reply_markup=MAIN_KB)
+        launch_task(ctx, run_seq_all_digest(ctx, limit))
+        return
 
     if mode:
         await update.message.reply_text("Не понимаю ответ, начните заново", reply_markup=MAIN_KB)
@@ -1016,6 +1189,91 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------- задачи -----------------------------------------------------
+
+
+async def run_seq_all_digest(ctx, limit: int | None = None) -> bool:
+    prev_mode = ctx.chat_data.get("output_mode")
+    ctx.chat_data["output_mode"] = "digest"
+    try:
+        return await run_seq_all(ctx, None, None, limit)
+    finally:
+        if prev_mode is None:
+            ctx.chat_data.pop("output_mode", None)
+        else:
+            ctx.chat_data["output_mode"] = prev_mode
+
+
+async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg = get_cfg(ctx)
+    if not cfg.channels:
+        return 0
+
+    total_sent = 0
+    await tg_client.start()
+    ctx.chat_data["stop"] = False
+    ctx.chat_data["sent"] = 0
+    try:
+        for chan in cfg.channels:
+            if ctx.chat_data.get("auto_stop"):
+                break
+            posts = await fetch_posts(chan, None, None, 50)
+            if not posts:
+                continue
+            key = chan.lstrip("@")
+            seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+            fresh = [m for m in posts if m.id not in seen]
+            if not fresh:
+                continue
+            sent, _ = await send_filtered_posts(
+                ctx,
+                chan,
+                fresh,
+                0,
+                mode="digest",
+                notify=False,
+            )
+            total_sent += sent
+    finally:
+        await tg_client.disconnect()
+    return total_sent
+
+
+async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = ctx.chat_data.get("target_chat")
+    if chat_id is None:
+        return
+    await ctx.bot.send_message(
+        chat_id,
+        "Автоматический мониторинг активирован. Буду присылать новые релевантные публикации каждый час.",
+    )
+    try:
+        while not ctx.chat_data.get("auto_stop"):
+            total = await auto_cycle(ctx)
+            if ctx.chat_data.get("auto_stop"):
+                break
+            if total:
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"Автоматический мониторинг: прислано {total} новостей на апрув.",
+                )
+            for _ in range(60):
+                if ctx.chat_data.get("auto_stop"):
+                    break
+                await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Ошибка в автоматическом мониторинге")
+        await ctx.bot.send_message(
+            chat_id,
+            "Автоматический мониторинг остановлен из-за ошибки. Проверьте логи.",
+        )
+    finally:
+        ctx.chat_data.pop("auto_stop", None)
+        ctx.chat_data.pop("auto_task", None)
+        await ctx.bot.send_message(chat_id, "Автоматический мониторинг остановлен.")
+
+
 async def run_seq_all(ctx, from_d: str | None = None, to_d: str | None = None, limit: int | None = None) -> bool:
     await tg_client.start()
     await log(ctx, "Запускаю обход всех каналов")
