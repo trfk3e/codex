@@ -398,7 +398,7 @@ async def fetch_posts(
     else:
         msgs.sort(key=lambda m: m.date)
     if limit:
-        msgs = msgs[:limit]
+        msgs = msgs[-limit:]
     return msgs
 
 async def process_and_send(
@@ -1263,19 +1263,16 @@ async def prime_auto_seen(ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await tg_client.start()
     try:
         for chan in cfg.channels:
-            posts = await fetch_posts(chan, None, None, 50)
+            posts = await fetch_posts(chan, None, None, 1)
             if not posts:
                 continue
             key = chan.lstrip("@")
             seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
-            added = 0
-            for msg in posts:
-                if msg.id not in seen:
-                    seen.append(msg.id)
-                    added += 1
-            if added:
-                await log(ctx, f"Зафиксировал {added} последних постов {chan}")
-            added_total += added
+            latest = posts[-1]
+            if latest.id not in seen:
+                seen.append(latest.id)
+                added_total += 1
+                await log(ctx, f"Зафиксировал последний пост {chan}: {latest.id}")
     finally:
         await tg_client.disconnect()
 
