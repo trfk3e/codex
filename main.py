@@ -96,6 +96,7 @@ DEFAULT_PROMPT_NO = "реклама, эфир, подкаст, мерч, вак�
 class ChatConfig:
     channels: list[str] = field(default_factory=list)
     ids: dict[str, deque] = field(default_factory=dict)
+    auto_last: dict[str, int] = field(default_factory=dict)
     prompt_yes: str = DEFAULT_PROMPT_YES
     prompt_no: str = DEFAULT_PROMPT_NO
     log_enabled: bool = False
@@ -152,11 +153,30 @@ def load_data() -> dict[str, ChatConfig]:
         if not isinstance(cfg, dict):
             continue
         chs = [str(c).split(":")[0].lstrip("@") for c in cfg.get("channels", [])]
-        ids = {c: deque(map(int, v), maxlen=PROCESSED_LIMIT) for c, v in cfg.get("ids", {}).items()}
+        ids = {
+            c: deque(map(int, v), maxlen=PROCESSED_LIMIT)
+            for c, v in cfg.get("ids", {}).items()
+        }
+        raw_auto = cfg.get("auto_last", {})
+        auto_last: dict[str, int] = {}
+        if isinstance(raw_auto, dict):
+            for c, v in raw_auto.items():
+                key = str(c).split(":")[0].lstrip("@")
+                try:
+                    auto_last[key] = int(v)
+                except (TypeError, ValueError):
+                    continue
         p_yes = cfg.get("prompt_if_yes", DEFAULT_PROMPT_YES)
         p_no = cfg.get("prompt_if_no", DEFAULT_PROMPT_NO)
         log_en = bool(cfg.get("log_enabled", False))
-        data[str(chat_id)] = ChatConfig(chs, ids, p_yes, p_no, log_en)
+        data[str(chat_id)] = ChatConfig(
+            channels=chs,
+            ids=ids,
+            auto_last=auto_last,
+            prompt_yes=p_yes,
+            prompt_no=p_no,
+            log_enabled=log_en,
+        )
 
     return data
 
@@ -173,9 +193,18 @@ def save_all() -> None:
                 seen.add(c)
                 uniq.append(c)
         cfg.channels = uniq
+        auto_last = {}
+        for c in cfg.auto_last:
+            key = str(c).split(":")[0].lstrip("@")
+            if key in cfg.channels:
+                try:
+                    auto_last[key] = int(cfg.auto_last[c])
+                except (TypeError, ValueError):
+                    continue
         data[cid] = {
             "channels": cfg.channels,
             "ids": {c: list(v) for c, v in cfg.ids.items()},
+            "auto_last": auto_last,
             "prompt_if_yes": cfg.prompt_yes,
             "prompt_if_no": cfg.prompt_no,
             "log_enabled": cfg.log_enabled,
@@ -194,6 +223,25 @@ def get_cfg(ctx: ContextTypes.DEFAULT_TYPE) -> ChatConfig:
     if chat_id not in ALL_CHATS:
         ALL_CHATS[chat_id] = ChatConfig()
     return ALL_CHATS[chat_id]
+
+
+def mark_processed(cfg: ChatConfig, key: str, msg_id: int) -> bool:
+    """Запомнить ID обработанного поста и обновить последний авто-порог."""
+
+    seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+    already = msg_id in seen
+    changed = False
+    if not already:
+        seen.append(msg_id)
+        changed = True
+    try:
+        numeric_id = int(msg_id)
+    except (TypeError, ValueError):
+        numeric_id = 0
+    if numeric_id and numeric_id > cfg.auto_last.get(key, 0):
+        cfg.auto_last[key] = numeric_id
+        changed = True
+    return changed
 
 
 def task_running(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -400,37 +448,47 @@ async def fetch_posts(
     limit: int | None = None,
     by_popularity: bool = False,
 ) -> list[Message]:
+    async def collect(target) -> list[Message]:
+        collected: list[Message] = []
+        iter_kwargs: dict[str, int] = {}
+        if limit:
+            # Берём небольшой запас, чтобы после фильтрации по дате осталось
+            # достаточно сообщений.
+            iter_kwargs["limit"] = max(limit * 2, 50)
+        try:
+            async for msg in tg_client.iter_messages(target, **iter_kwargs):
+                if not msg.text:
+                    continue
+                dt = msg.date.replace(tzinfo=None)
+                if to_dt and dt > to_dt:
+                    continue
+                if from_dt and dt < from_dt:
+                    # iter_messages возвращает посты от новых к старым, поэтому
+                    # можно остановиться, когда ушли ниже диапазона.
+                    break
+                collected.append(msg)
+                if limit and len(collected) >= limit:
+                    break
+        except Exception:
+            raise
+        return collected
+
     try:
-        msgs = [
-            m
-            async for m in tg_client.iter_messages(channel)
-            if m.text
-        ]
+        msgs = await collect(channel)
     except ValueError:
         if isinstance(channel, str) and channel.lstrip("-").isdigit():
-            msgs = [
-                m
-                async for m in tg_client.iter_messages(int(channel))
-                if m.text
-            ]
+            msgs = await collect(int(channel))
         else:
             raise
     except Exception:
         logging.exception("Failed to fetch posts")
         return []
-    if from_dt or to_dt:
-        msgs = [
-            m
-            for m in msgs
-            if (from_dt or datetime.min)
-            <= m.date.replace(tzinfo=None)
-            <= (to_dt or datetime.max)
-        ]
+
     if by_popularity:
         msgs.sort(key=quick_score, reverse=True)
     else:
         msgs.sort(key=lambda m: m.date)
-    if limit:
+    if limit and not by_popularity:
         msgs = msgs[-limit:]
     return msgs
 
@@ -458,7 +516,7 @@ async def process_and_send(
     except Exception:
         logging.exception("AI filter failed")
         await log(ctx, f"AI ошибка при обработке {msg.id}")
-        seen.append(msg.id)
+        mark_processed(cfg, key, msg.id)
         save_all()
         return False
     if ctx.chat_data.get("stop"):
@@ -467,7 +525,7 @@ async def process_and_send(
     if not ai_ok:
         if reason:
             await log(ctx, reason)
-        seen.append(msg.id)
+        mark_processed(cfg, key, msg.id)
         save_all()
         return False
     if ctx.chat_data.get("stop"):
@@ -493,6 +551,8 @@ async def process_and_send(
         except Exception:
             logging.exception("Failed to build digest")
             await log(ctx, f"Не удалось построить выжимку для {msg.id}")
+            mark_processed(cfg, key, msg.id)
+            save_all()
             return False
         if ctx.chat_data.get("stop"):
             return False
@@ -508,6 +568,8 @@ async def process_and_send(
         except Exception:
             logging.exception("Failed to paraphrase message")
             await log(ctx, f"Не удалось перефразировать {msg.id}")
+            mark_processed(cfg, key, msg.id)
+            save_all()
             return False
         if ctx.chat_data.get("stop"):
             return False
@@ -530,6 +592,8 @@ async def process_and_send(
     except Exception:
         logging.exception("Failed to send processed message to target chat")
         await log(ctx, f"Отправка сообщения {msg.id} завершилась ошибкой")
+        mark_processed(cfg, key, msg.id)
+        save_all()
         return False
     await log(ctx, f"Отправлено сообщение {msg.id}")
     if ctx.chat_data.get("stop"):
@@ -544,7 +608,7 @@ async def process_and_send(
             )
         except Exception:
             logging.exception("Failed to send confirmation message")
-    seen.append(msg.id)
+    mark_processed(cfg, key, msg.id)
     save_all()
     return True
 
@@ -1262,7 +1326,17 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 continue
             key = chan.lstrip("@")
             seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
-            fresh = [m for m in posts if m.id not in seen]
+            last_seen = cfg.auto_last.get(key, 0)
+            if not last_seen:
+                baseline_added = False
+                for msg in posts:
+                    if mark_processed(cfg, key, msg.id):
+                        baseline_added = True
+                if baseline_added:
+                    save_all()
+                    await log(ctx, f"Синхронизировал стартовую точку для {chan}")
+                continue
+            fresh = [m for m in posts if m.id not in seen and m.id > last_seen]
             if not fresh:
                 continue
             try:
@@ -1296,22 +1370,24 @@ async def prime_auto_seen(ctx: ContextTypes.DEFAULT_TYPE) -> int:
     added_total = 0
     await tg_client.start()
     try:
+        modified = False
         for chan in cfg.channels:
-            posts = await fetch_posts(chan, None, None, 1)
+            posts = await fetch_posts(chan, None, None, 50)
             if not posts:
                 continue
             key = chan.lstrip("@")
-            seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
-            latest = posts[-1]
-            if latest.id not in seen:
-                seen.append(latest.id)
-                added_total += 1
-                await log(ctx, f"Зафиксировал последний пост {chan}: {latest.id}")
+            added_here = 0
+            for msg in posts:
+                if mark_processed(cfg, key, msg.id):
+                    added_here += 1
+            if added_here:
+                modified = True
+                added_total += added_here
+                await log(ctx, f"Зафиксировал последние {added_here} постов из {chan}")
+        if modified:
+            save_all()
     finally:
         await tg_client.disconnect()
-
-    if added_total:
-        save_all()
 
     return added_total
 
