@@ -425,6 +425,8 @@ async def process_and_send(
     except Exception:
         logging.exception("AI filter failed")
         await log(ctx, f"AI ошибка при обработке {msg.id}")
+        seen.append(msg.id)
+        save_all()
         return False
     if ctx.chat_data.get("stop"):
         return False
@@ -1250,14 +1252,59 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return total_sent
 
 
+async def prime_auto_seen(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Зафиксировать текущие посты, чтобы авто-выжимка начинала только с новых."""
+
+    cfg = get_cfg(ctx)
+    if not cfg.channels:
+        return 0
+
+    added_total = 0
+    await tg_client.start()
+    try:
+        for chan in cfg.channels:
+            posts = await fetch_posts(chan, None, None, 50)
+            if not posts:
+                continue
+            key = chan.lstrip("@")
+            seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+            added = 0
+            for msg in posts:
+                if msg.id not in seen:
+                    seen.append(msg.id)
+                    added += 1
+            if added:
+                await log(ctx, f"Зафиксировал {added} последних постов {chan}")
+            added_total += added
+    finally:
+        await tg_client.disconnect()
+
+    if added_total:
+        save_all()
+
+    return added_total
+
+
 async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = ctx.chat_data.get("target_chat")
     if chat_id is None:
         return
+    try:
+        primed = await prime_auto_seen(ctx)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Не удалось подготовить авто-выжимку")
+        primed = 0
     await ctx.bot.send_message(
         chat_id,
         "Авто-выжимка активирована. Буду присылать новые релевантные публикации каждый час.",
     )
+    if primed:
+        await ctx.bot.send_message(
+            chat_id,
+            "Текущие публикации помечены как просмотренные, начну с новых постов.",
+        )
     try:
         while not ctx.chat_data.get("auto_stop"):
             total = await auto_cycle(ctx)
