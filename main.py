@@ -464,22 +464,29 @@ async def process_and_send(
             f"<b>Источник:</b> <a{link_attr}>{escaped_src}</a>\n\n"
             f"{rewritten}{footer}"
         )[:4090]
-    await ctx.bot.send_message(
-        chat_id=ctx.chat_data["target_chat"],
-        text=body,
-        parse_mode=parse_mode,
-        disable_web_page_preview=disable_preview,
-    )
+    try:
+        await ctx.bot.send_message(
+            chat_id=ctx.chat_data["target_chat"],
+            text=body,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_preview,
+        )
+    except Exception:
+        logging.exception("Failed to send processed message to target chat")
+        return False
     await log(ctx, f"Отправлено сообщение {msg.id}")
     if ctx.chat_data.get("stop"):
         return True
     log_count = ctx.chat_data.get("sent", 0) + 1
     ctx.chat_data["sent"] = log_count
     if notify:
-        await ctx.bot.send_message(
-            chat_id=ctx.chat_data["target_chat"],
-            text=f"✅ Сообщение {log_count} из канала {chan} отправлено",
-        )
+        try:
+            await ctx.bot.send_message(
+                chat_id=ctx.chat_data["target_chat"],
+                text=f"✅ Сообщение {log_count} из канала {chan} отправлено",
+            )
+        except Exception:
+            logging.exception("Failed to send confirmation message")
     seen.append(msg.id)
     save_all()
     return True
@@ -539,7 +546,7 @@ MAIN_KB = ReplyKeyboardMarkup(
         ["Поиск постов за последние дни во всех каналах"],
         ["📅 Диапазон дат (канал)", "📅 Диапазон дат (все)"],
         ["➕ Добавить каналы", "➖ Удалить каналы"],
-        ["📰 Выжимка всех каналов", "🤖 Авто-мониторинг"],
+        ["📰 Авто-выжимка"],
         ["Настройки"],
         ["Очистить чат"],
         ["⏹ Остановить"],
@@ -637,8 +644,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "8. Меню <b>Настройки</b> позволяет очистить историю ID, заменить фильтр-промпт и включить или выключить лог (по умолчанию лог отключён).\n"
             "9. <b>Очистить чат</b> — бот удалит все сообщения в этом диалоге.\n"
             "10. Кнопка ⏹ <b>Остановить</b> прерывает любой текущий парсинг.\n"
-            "11. <b>📰 Выжимка всех каналов</b> — соберёт короткие анонсы по тем же правилам фильтрации без рерайта.\n"
-            "12. <b>🤖 Авто-мониторинг</b> — бот раз в час ищет новые публикации, отправляет их в выжимке на апрув и останавливается кнопкой повторного нажатия или ⏹.\n"
+            "11. <b>📰 Авто-выжимка</b> — бот раз в час ищет новые публикации, сразу делает по ним выжимки и присылает на апрув. Повторное нажатие останавливает мониторинг, также его можно прервать кнопкой ⏹.\n"
         )
         await update.message.reply_text(
             instruction, reply_markup=MAIN_KB, parse_mode=tg_const.ParseMode.HTML
@@ -648,12 +654,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     auto_task = ctx.chat_data.get("auto_task")
     auto_running = bool(auto_task) and not auto_task.done()
 
-    if text == "🤖 Авто-мониторинг":
+    if text == "📰 Авто-выжимка":
         if auto_running:
             ctx.chat_data["auto_stop"] = True
             ctx.chat_data["stop"] = True
             await update.message.reply_text(
-                "Останавливаю автоматический мониторинг…", reply_markup=MAIN_KB
+                "Останавливаю авто-выжимку…", reply_markup=MAIN_KB
             )
         else:
             if not cfg.channels:
@@ -670,7 +676,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             task = ctx.application.create_task(auto_monitor(ctx))
             ctx.chat_data["auto_task"] = task
             await update.message.reply_text(
-                "Автоматический мониторинг запущен. Проверяю каналы каждый час.",
+                "Авто-выжимка запущена. Проверяю каналы каждый час.",
                 reply_markup=MAIN_KB,
             )
         return
@@ -680,7 +686,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if auto_running and text not in {"⏹ Остановить"}:
         await update.message.reply_text(
-            "Сейчас работает автоматический мониторинг. Остановите его через кнопку 🤖 Авто-мониторинг, чтобы выполнить другие действия.",
+            "Сейчас работает авто-выжимка. Остановите её через кнопку 📰 Авто-выжимка, чтобы выполнить другие действия.",
             reply_markup=MAIN_KB,
         )
         return
@@ -773,13 +779,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = "add_channels"
         await update.message.reply_text(
             "Введите каналы через запятую:", reply_markup=ReplyKeyboardRemove()
-        )
-        return
-    if text == "📰 Выжимка всех каналов":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "digest_seq_count"
-        await update.message.reply_text(
-            "Сколько постов собрать в выжимку?", reply_markup=ReplyKeyboardRemove()
         )
         return
     if text == "➖ Удалить каналы":
@@ -1166,21 +1165,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
         launch_task(ctx, run_recent_all(ctx, days))
         return
-    if mode == "digest_seq_count":
-        if not text.isdigit():
-            await update.message.reply_text("Нужно число")
-            return
-        if task_running(ctx):
-            await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить",
-                reply_markup=MAIN_KB,
-            )
-            return
-        limit = int(text)
-        await update.message.reply_text("Готовлю выжимку…", reply_markup=MAIN_KB)
-        launch_task(ctx, run_seq_all_digest(ctx, limit))
-        return
-
     if mode:
         await update.message.reply_text("Не понимаю ответ, начните заново", reply_markup=MAIN_KB)
         ctx.user_data.clear()
@@ -1189,18 +1173,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------- задачи -----------------------------------------------------
-
-
-async def run_seq_all_digest(ctx, limit: int | None = None) -> bool:
-    prev_mode = ctx.chat_data.get("output_mode")
-    ctx.chat_data["output_mode"] = "digest"
-    try:
-        return await run_seq_all(ctx, None, None, limit)
-    finally:
-        if prev_mode is None:
-            ctx.chat_data.pop("output_mode", None)
-        else:
-            ctx.chat_data["output_mode"] = prev_mode
 
 
 async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1244,7 +1216,7 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await ctx.bot.send_message(
         chat_id,
-        "Автоматический мониторинг активирован. Буду присылать новые релевантные публикации каждый час.",
+        "Авто-выжимка активирована. Буду присылать новые релевантные публикации каждый час.",
     )
     try:
         while not ctx.chat_data.get("auto_stop"):
@@ -1254,7 +1226,7 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if total:
                 await ctx.bot.send_message(
                     chat_id,
-                    f"Автоматический мониторинг: прислано {total} новостей на апрув.",
+                    f"Авто-выжимка: прислано {total} новостей на апрув.",
                 )
             for _ in range(60):
                 if ctx.chat_data.get("auto_stop"):
@@ -1266,12 +1238,12 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logging.exception("Ошибка в автоматическом мониторинге")
         await ctx.bot.send_message(
             chat_id,
-            "Автоматический мониторинг остановлен из-за ошибки. Проверьте логи.",
+            "Авто-выжимка остановлена из-за ошибки. Проверьте логи.",
         )
     finally:
         ctx.chat_data.pop("auto_stop", None)
         ctx.chat_data.pop("auto_task", None)
-        await ctx.bot.send_message(chat_id, "Автоматический мониторинг остановлен.")
+        await ctx.bot.send_message(chat_id, "Авто-выжимка остановлена.")
 
 
 async def run_seq_all(ctx, from_d: str | None = None, to_d: str | None = None, limit: int | None = None) -> bool:
