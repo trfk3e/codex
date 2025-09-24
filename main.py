@@ -526,13 +526,18 @@ async def send_filtered_posts(
             if await process_and_send(ctx, m, chan, mode=mode, notify=notify):
                 sent += 1
     tasks = [asyncio.create_task(worker(m)) for m in posts]
-    for t in asyncio.as_completed(tasks):
-        await t
-        if ctx.chat_data.get("stop") or (sent >= need and need) or (attempts >= ATTEMPT_LIMIT and sent == 0):
-            for x in tasks:
-                x.cancel()
-            break
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if tasks:
+        for t in asyncio.as_completed(tasks):
+            await t
+            if ctx.chat_data.get("stop") or (
+                sent >= need and need
+            ) or (attempts >= ATTEMPT_LIMIT and sent == 0):
+                for x in tasks:
+                    x.cancel()
+                break
+        await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        await log(ctx, f"Нет новых постов для обработки в {chan}")
     await log(ctx, f"Закончена проверка {chan}: отправлено {sent} из {attempts}")
     return sent, attempts
 
