@@ -23,7 +23,7 @@ import threading
 import os
 import time
 import re
-from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
+from groq import Groq, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
 
 import random
@@ -48,7 +48,7 @@ def app_path(name: str) -> str:
     return os.path.join(APP_DIR, name)
 
 DEFAULT_CONFIG_FILE = "settings.ini"
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 MAX_FILENAME_LENGTH = 100
 MAX_RETRY_PASSES = 3
 # Количество попыток генерации для одного ключевого слова
@@ -151,9 +151,9 @@ def check_first_run_password():
 
 
 HELP_TEXT = (
-    "Программа генерирует статьи с использованием ChatGPT.\n\n"
+    "Программа генерирует статьи с использованием Groq (Llama 3.3 70B Versatile).\n\n"
 
-    "1. В поле API ключей внесите ваши ключи OpenAI, каждый с новой строкой.\n\n"
+    "1. В поле API ключей внесите ваши ключи Groq, каждый с новой строкой.\n\n"
 
     "2. Укажите папку для сохранения файлов.\n\n"
 
@@ -162,7 +162,7 @@ HELP_TEXT = (
     "   - '!==+ ссылка' — URL, куда будет вести ссылка.\n"
     "   - '!===+ язык' — язык создаваемых текстов.\n"
     "   - '!====+ тема' — например '!====+ Краш игра'. Добавляется перед каждой\n"
-    "     ключевой фразой, если ChatGPT не знает игру.\n\n"
+    "     ключевой фразой, если модель не знает игру.\n\n"
 
     "4. Если ключевая фраза отсутствует в ответе, она вставляется случайно\n"
     "   в один из абзацев до конца текста.\n\n"
@@ -785,7 +785,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
         api_frame = ctk.CTkFrame(main_frame)
         api_frame.pack(pady=(10, 5), padx=10, fill="x")
-        ctk.CTkLabel(api_frame, text="API Ключи ChatGPT (каждый с новой строки):").pack(anchor="w", pady=(0, 5))
+        ctk.CTkLabel(api_frame, text="API ключи Groq (каждый с новой строки):").pack(anchor="w", pady=(0, 5))
         self.api_keys_textbox = ctk.CTkTextbox(api_frame, height=80)
         self.api_keys_textbox.pack(fill="x", expand=True)
         if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
@@ -1350,7 +1350,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         return True
         return False
 
-    def call_openai_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
+    def call_groq_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
         for attempt in range(retries):
             if self.stop_event.is_set():
                 self.log_message("API вызов прерван сигналом остановки.", "WARNING")
@@ -1361,8 +1361,11 @@ class TextGeneratorApp(ctk.CTkFrame):
             if to_wait > 0:
                 time.sleep(to_wait)
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
+                raw_response = client_instance.chat.completions.with_raw_response.create(
+                    model=DEFAULT_MODEL,
+                    messages=messages,
+                    timeout=300,
+                )
                 completion = raw_response.parse()
                 if hasattr(raw_response, 'headers'):
                     self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
@@ -1371,7 +1374,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                 return completion.choices[0].message.content.strip()
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
+                self.log_message(f"Groq API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
                 if hasattr(rle, 'response') and rle.response is not None and hasattr(rle.response, 'headers'):
                     self._update_api_key_status_from_headers(api_key_used_for_call, rle.response.headers, is_error=True,
                                                              status_code=429)
@@ -1398,7 +1401,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             except APIStatusError as ase:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(
-                    f"OpenAI API StatusError: {ase}. Status Code: {ase.status_code}. Попытка {attempt + 1}/{retries}.",
+                    f"Groq API StatusError: {ase}. Status Code: {ase.status_code}. Попытка {attempt + 1}/{retries}.",
                     log_level)
                 if hasattr(ase, 'response') and ase.response is not None and hasattr(ase.response, 'headers'):
                     self._update_api_key_status_from_headers(api_key_used_for_call, ase.response.headers, is_error=True,
@@ -1437,7 +1440,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     return None
             except APIConnectionError as ace:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(f"OpenAI API ConnectionError: {ace}. Попытка {attempt + 1}/{retries}.", log_level)
+                self.log_message(f"Groq API ConnectionError: {ace}. Попытка {attempt + 1}/{retries}.", log_level)
                 current_delay = delay_seconds * (attempt + 1)
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
@@ -1446,7 +1449,7 @@ class TextGeneratorApp(ctk.CTkFrame):
             except Exception as e:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(
-                    f"Неожиданная ошибка OpenAI API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
+                    f"Неожиданная ошибка Groq API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
                     log_level)
                 current_delay = delay_seconds * (attempt + 1)
                 if attempt + 1 < retries:
@@ -1582,7 +1585,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         if self.stop_event.is_set(): return False
 
         retrieved_api_key_str = None
-        openai_client = None
+        groq_client = None
         key_marked_as_bad_in_this_task = False
         key_went_to_cooldown_in_this_task = False
 
@@ -1604,15 +1607,15 @@ class TextGeneratorApp(ctk.CTkFrame):
             key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(
                 retrieved_api_key_str) > 5 else retrieved_api_key_str
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
-            openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-            if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
+            groq_client = Groq(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
+            if groq_client is None: raise ValueError("Клиент Groq не был инициализирован.")
         except Empty:
             self.log_message(f"{log_prefix_base} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
             self._initial_check_and_revive_keys()
             return False
         except Exception as e_init:
             self.log_message(
-                f"{log_prefix_base} Ошибка инициализации клиента OpenAI ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
+                f"{log_prefix_base} Ошибка инициализации клиента Groq ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
                 "ERROR")
             if retrieved_api_key_str:
                 with self.api_key_statuses_lock:
@@ -1651,7 +1654,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "content": f"Сделай так, чтобы главный первый заголовок не был похож вообще на этот, проработай тщательно начало и конец, чтобы не было повторений: \"{self.previous_h1_text}\". ОБЗЯТАТЕЛЬНО НАЧАЛО НЕ ДОЛЖНО СОВПАДАТЬ!!!"
                     })
 
-            original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            original_h1_text_raw = self.call_groq_api(groq_client, base_h1_prompt, retrieved_api_key_str)
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -1797,7 +1800,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
-            article_body_raw_from_api = self.call_openai_api(openai_client,
+            article_body_raw_from_api = self.call_groq_api(groq_client,
                                                              [{"role": "system", "content": body_prompt_system},
                                                               # Теперь body_prompt_system определена
                                                               {"role": "user", "content": body_prompt_user}],
@@ -2458,7 +2461,7 @@ class ApiKeyStatusWindow(ctk.CTkToplevel):
         self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.main_frame.pack(padx=10, pady=10, fill="both", expand=True)
 
-        ctk.CTkLabel(self.main_frame, text="Состояние API ключей OpenAI:",
+        ctk.CTkLabel(self.main_frame, text="Состояние API ключей Groq:",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(0, 10))
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self.main_frame)
