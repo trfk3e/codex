@@ -201,6 +201,39 @@ def task_running(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(t) and not t.done()
 
 
+async def stop_auto_cycle(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    wait: bool = False,
+    timeout: float = 5.0,
+) -> None:
+    """Request graceful shutdown of the авто-выжимка loop.
+
+    The helper sets the common stop flags and optionally waits for the
+    background task to finish after sending it a cancellation signal.
+    """
+
+    ctx.chat_data["stop"] = True
+    ctx.chat_data["auto_stop"] = True
+
+    task = ctx.chat_data.get("auto_task")
+    if not task or task.done():
+        return
+
+    task.cancel()
+
+    if not wait:
+        return
+
+    try:
+        await asyncio.wait_for(task, timeout)
+    except asyncio.TimeoutError:
+        logging.warning("Не удалось остановить авто-выжимку за %s сек", timeout)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logging.exception("Ошибка при ожидании остановки авто-выжимки")
+
 def launch_task(ctx: ContextTypes.DEFAULT_TYPE, coro) -> None:
     task = ctx.application.create_task(coro)
     ctx.chat_data["task"] = task
@@ -649,8 +682,10 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "⏹ Остановить":
-        ctx.chat_data["stop"] = True
-        ctx.chat_data["auto_stop"] = True
+        await stop_auto_cycle(ctx)
+        task = ctx.chat_data.get("task")
+        if task and not task.done():
+            task.cancel()
         await update.message.reply_text(
             "Парсинг будет остановлен", reply_markup=MAIN_KB
         )
@@ -691,8 +726,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "📰 Авто-выжимка":
         if auto_running:
-            ctx.chat_data["auto_stop"] = True
-            ctx.chat_data["stop"] = True
+            await stop_auto_cycle(ctx)
             await update.message.reply_text(
                 "Останавливаю авто-выжимку…", reply_markup=MAIN_KB
             )
@@ -1317,7 +1351,7 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     break
                 await asyncio.sleep(60)
     except asyncio.CancelledError:
-        raise
+        logging.info("Авто-выжимка принудительно остановлена")
     except Exception:
         logging.exception("Ошибка в автоматическом мониторинге")
         await ctx.bot.send_message(
@@ -1327,7 +1361,14 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         ctx.chat_data.pop("auto_stop", None)
         ctx.chat_data.pop("auto_task", None)
-        await ctx.bot.send_message(chat_id, "Авто-выжимка остановлена.")
+        try:
+            await asyncio.shield(
+                ctx.bot.send_message(chat_id, "Авто-выжимка остановлена.")
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось отправить уведомление об остановке авто-выжимки"
+            )
 
 
 async def run_seq_all(ctx, from_d: str | None = None, to_d: str | None = None, limit: int | None = None) -> bool:
