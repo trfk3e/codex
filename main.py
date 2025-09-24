@@ -418,7 +418,14 @@ async def process_and_send(
         await log(ctx, f"Пропускаю {msg.id}: уже обработан")
         return False
     await log(ctx, f"Проверяю пост {msg.id} из {chan}")
-    ai_ok, reason = await ai_check(cfg, msg.text)
+    try:
+        ai_ok, reason = await ai_check(cfg, msg.text)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("AI filter failed")
+        await log(ctx, f"AI ошибка при обработке {msg.id}")
+        return False
     if ctx.chat_data.get("stop"):
         return False
     await log(ctx, f"AI ответ для {msg.id}: {'YES' if ai_ok else 'NO'}")
@@ -444,7 +451,14 @@ async def process_and_send(
         await log(ctx, f"Формируем выжимку для поста {msg.id}")
         if ctx.chat_data.get("stop"):
             return False
-        digest = await build_digest_payload(msg.text)
+        try:
+            digest = await build_digest_payload(msg.text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Failed to build digest")
+            await log(ctx, f"Не удалось построить выжимку для {msg.id}")
+            return False
         if ctx.chat_data.get("stop"):
             return False
         body = render_digest(digest, raw_src, link)
@@ -452,7 +466,14 @@ async def process_and_send(
         await log(ctx, f"Перефразируем пост {msg.id}")
         if ctx.chat_data.get("stop"):
             return False
-        rewritten = html.escape(await paraphrase(msg.text))
+        try:
+            rewritten = html.escape(await paraphrase(msg.text))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Failed to paraphrase message")
+            await log(ctx, f"Не удалось перефразировать {msg.id}")
+            return False
         if ctx.chat_data.get("stop"):
             return False
         footer = (
@@ -473,6 +494,7 @@ async def process_and_send(
         )
     except Exception:
         logging.exception("Failed to send processed message to target chat")
+        await log(ctx, f"Отправка сообщения {msg.id} завершилась ошибкой")
         return False
     await log(ctx, f"Отправлено сообщение {msg.id}")
     if ctx.chat_data.get("stop"):
@@ -528,7 +550,13 @@ async def send_filtered_posts(
     tasks = [asyncio.create_task(worker(m)) for m in posts]
     if tasks:
         for t in asyncio.as_completed(tasks):
-            await t
+            try:
+                await t
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("send_filtered_posts worker failed")
+                await log(ctx, "Ошибка в рабочем таске, продолжаю")
             if ctx.chat_data.get("stop") or (
                 sent >= need and need
             ) or (attempts >= ATTEMPT_LIMIT and sent == 0):
@@ -1201,14 +1229,21 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
             fresh = [m for m in posts if m.id not in seen]
             if not fresh:
                 continue
-            sent, _ = await send_filtered_posts(
-                ctx,
-                chan,
-                fresh,
-                0,
-                mode="digest",
-                notify=False,
-            )
+            try:
+                sent, _ = await send_filtered_posts(
+                    ctx,
+                    chan,
+                    fresh,
+                    0,
+                    mode="digest",
+                    notify=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Auto cycle failed for channel")
+                await log(ctx, f"Ошибка при обработке канала {chan}")
+                continue
             total_sent += sent
     finally:
         await tg_client.disconnect()
