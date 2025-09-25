@@ -88,8 +88,10 @@ PER_KEY_CALL_INTERVAL = 0.05
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
 
 # Batch API tuning
-BATCH_MAX_REQUESTS = 200
-BATCH_FLUSH_INTERVAL = 1.5  # seconds to wait for additional tasks before dispatching
+# Allow submitting very large groups of requests so massive keyword lists can ship in
+# a single batch without being fragmented into small portions.
+BATCH_MAX_REQUESTS = 10000
+BATCH_FLUSH_INTERVAL = 3.0  # seconds to wait for additional tasks before dispatching
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -188,6 +190,7 @@ class BatchBucket:
         self.pending_requests = []
         self.condition = threading.Condition()
         self.shutdown = False
+        self._wait_log_active = False
         self.worker_thread = threading.Thread(
             target=self._run,
             name=f"BatchBucket-{api_key[-6:]}",
@@ -215,8 +218,10 @@ class BatchBucket:
                 if self.shutdown and not self.pending_requests:
                     return
                 flush_deadline = time.time() + self.dispatcher.flush_interval
+                self._wait_log_active = False
                 while (
-                    len(self.pending_requests) < self.dispatcher.max_batch_size
+                    self.dispatcher.max_batch_size
+                    and len(self.pending_requests) < self.dispatcher.max_batch_size
                     and not self.shutdown
                 ):
                     remaining = flush_deadline - time.time()
@@ -224,8 +229,21 @@ class BatchBucket:
                         break
                     if self.dispatcher.app.stop_event.is_set():
                         break
+                    if not self._wait_log_active:
+                        key_short = (
+                            f"...{self.api_key[-5:]}" if len(self.api_key) > 5 else self.api_key
+                        )
+                        self.dispatcher.app.log_message(
+                            f"Batch ключа {key_short}: копим запросы {len(self.pending_requests)}/"
+                            f"{self.dispatcher.max_batch_size} перед отправкой.",
+                            "DEBUG",
+                        )
+                        self._wait_log_active = True
                     self.condition.wait(timeout=remaining)
-                batch = self.pending_requests[: self.dispatcher.max_batch_size]
+                if self.dispatcher.max_batch_size:
+                    batch = self.pending_requests[: self.dispatcher.max_batch_size]
+                else:
+                    batch = list(self.pending_requests)
                 del self.pending_requests[: len(batch)]
             if batch:
                 self.dispatcher._execute_batch(self, batch)
