@@ -1,5 +1,6 @@
 # bot.py ────────────────────────────────────────────────────────────────────
 import json, re, html
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 import asyncio
@@ -29,10 +30,12 @@ from telegram.ext import (
 
 from telethon import TelegramClient
 from telethon.tl.types import Message
-from openai import OpenAI
+from openai import OpenAI, AuthenticationError
 
 # ────────────── КОНФИГ ─────────────────────────────────────────────────────
-OPENAI_API_KEY = "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"
+logging.basicConfig(level=logging.INFO)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN   = "7621000604:AAHrWFyNx8JCrPkCtmtC4MWAV2Ri5-EpOQo"
 TG_API_ID     = "28511990"
 TG_API_HASH = "f51873d6f1402467b6188a37100754ae"
@@ -49,16 +52,47 @@ ATTEMPT_MSG    = (
 )
 
 # ────────────── ГЛОБАЛЬНЫЕ КЛИЕНТЫ ─────────────────────────────────────────
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+class OpenAIConfigError(RuntimeError):
+    """Raised when OpenAI configuration is missing or invalid."""
+
+
+if OPENAI_API_KEY:
+    try:
+        openai_client: OpenAI | None = OpenAI(api_key=OPENAI_API_KEY)
+    except AuthenticationError as exc:
+        logging.error("OpenAI authentication failed during client setup: %s", exc.__class__.__name__)
+        openai_client = None
+else:
+    logging.warning(
+        "OPENAI_API_KEY is not set. OpenAI-powered features will be disabled until the"
+        " variable is configured."
+    )
+    openai_client = None
+
+
+def get_openai_client() -> OpenAI:
+    if openai_client is None:
+        raise OpenAIConfigError(
+            "OpenAI API ключ не задан или недействителен. Установите переменную"
+            " окружения OPENAI_API_KEY и перезапустите бота."
+        )
+    return openai_client
 tg_client     = TelegramClient(
     "seo_news_session", TG_API_ID, TG_API_HASH, timeout=10
 )
 
 async def openai_call(method, *args, timeout=60, **kwargs):
     loop = asyncio.get_running_loop()
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, lambda: method(*args, **kwargs)), timeout
-    )
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: method(*args, **kwargs)), timeout
+        )
+    except AuthenticationError as exc:
+        global openai_client
+        openai_client = None
+        raise OpenAIConfigError(
+            "OpenAI отклонил запрос: проверьте значение OPENAI_API_KEY."
+        ) from exc
 
 @contextmanager
 def file_lock():
@@ -81,8 +115,6 @@ def file_lock():
                     msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
                 except OSError:
                     pass
-
-logging.basicConfig(level=logging.INFO)
 
 # Defaults for the filter prompt are defined before the dataclass so the
 # attributes can use them directly without a NameError.
@@ -318,18 +350,20 @@ async def ai_check(cfg: ChatConfig, text: str) -> tuple[bool, str | None]:
     disabled, the additional request is skipped to save tokens.
     """
 
+    client = get_openai_client()
+
     base = [
         {"role": "system", "content": cfg.filter_prompt()},
         {"role": "user", "content": text[:4000]},
     ]
-    rsp = await openai_call(openai_client.chat.completions.create, model=MODEL_NAME, messages=base)
+    rsp = await openai_call(client.chat.completions.create, model=MODEL_NAME, messages=base)
     answer = rsp.choices[0].message.content.strip()
     ok = answer.lower().startswith("y")
     reason = None
 
     if not ok and cfg.log_enabled:
         rsp2 = await openai_call(
-            openai_client.chat.completions.create,
+            client.chat.completions.create,
             model=MODEL_NAME,
             messages=base
             + [
@@ -342,8 +376,10 @@ async def ai_check(cfg: ChatConfig, text: str) -> tuple[bool, str | None]:
     return ok, reason
 
 async def paraphrase(text: str) -> str:
+    client = get_openai_client()
+
     rsp = await openai_call(
-        openai_client.chat.completions.create,
+        client.chat.completions.create,
         model=MODEL_NAME,
         messages=[
             {
@@ -373,8 +409,10 @@ async def build_digest_payload(text: str) -> dict:
         "Не добавляй никакого текста вне JSON."
     )
 
+    client = get_openai_client()
+
     rsp = await openai_call(
-        openai_client.chat.completions.create,
+        client.chat.completions.create,
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": instruction},
@@ -513,6 +551,11 @@ async def process_and_send(
         ai_ok, reason = await ai_check(cfg, msg.text)
     except asyncio.CancelledError:
         raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return False
     except Exception:
         logging.exception("AI filter failed")
         await log(ctx, f"AI ошибка при обработке {msg.id}")
@@ -548,6 +591,11 @@ async def process_and_send(
             digest = await build_digest_payload(msg.text)
         except asyncio.CancelledError:
             raise
+        except OpenAIConfigError as exc:
+            await log(ctx, str(exc))
+            mark_processed(cfg, key, msg.id)
+            save_all()
+            return False
         except Exception:
             logging.exception("Failed to build digest")
             await log(ctx, f"Не удалось построить выжимку для {msg.id}")
@@ -565,6 +613,11 @@ async def process_and_send(
             rewritten = html.escape(await paraphrase(msg.text))
         except asyncio.CancelledError:
             raise
+        except OpenAIConfigError as exc:
+            await log(ctx, str(exc))
+            mark_processed(cfg, key, msg.id)
+            save_all()
+            return False
         except Exception:
             logging.exception("Failed to paraphrase message")
             await log(ctx, f"Не удалось перефразировать {msg.id}")
