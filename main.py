@@ -1508,6 +1508,29 @@ class TextGeneratorApp(ctk.CTkFrame):
                         output_bytes = str(output_bytes).encode("utf-8")
 
                     decoded_output = output_bytes.decode("utf-8")
+
+                    def _collect_text_values(value, accumulator):
+                        """Recursively collect textual fields from a responses payload structure."""
+
+                        if value is None:
+                            return
+                        if isinstance(value, str):
+                            if value.strip():
+                                accumulator.append(value)
+                            return
+                        if isinstance(value, dict):
+                            # Direct text container
+                            if "text" in value:
+                                _collect_text_values(value.get("text"), accumulator)
+                            # Nested content/message/output/choices structures
+                            for key in ("content", "output", "message", "messages", "choices", "items", "data"):
+                                if key in value:
+                                    _collect_text_values(value.get(key), accumulator)
+                            return
+                        if isinstance(value, (list, tuple)):
+                            for item in value:
+                                _collect_text_values(item, accumulator)
+
                     collected_chunks = []
                     parsed_text = None
                     for line in decoded_output.splitlines():
@@ -1526,23 +1549,32 @@ class TextGeneratorApp(ctk.CTkFrame):
                                 f"Batch {batch_id} вернул ошибку: {record['error']}"
                             )
                         response_payload = record.get("response") or {}
-                        if response_payload.get("output_text"):
+                        if isinstance(response_payload, dict) and response_payload.get("output_text"):
                             parsed_text = response_payload["output_text"].strip()
-                            break
-                        output_blocks = response_payload.get("output") or []
-                        for block in output_blocks:
-                            for content_piece in block.get("content", []) or []:
-                                text_value = content_piece.get("text")
-                                if text_value:
-                                    collected_chunks.append(text_value)
-                    if parsed_text is None and collected_chunks:
-                        parsed_text = "\n".join(collected_chunks).strip()
+                            if parsed_text:
+                                break
+                        _collect_text_values(response_payload.get("output"), collected_chunks)
+                        if not collected_chunks:
+                            # Some responses might place textual data directly under response/content/message
+                            _collect_text_values(response_payload.get("content"), collected_chunks)
+                            _collect_text_values(response_payload.get("message"), collected_chunks)
+
+                    if (parsed_text is None or not parsed_text.strip()) and collected_chunks:
+                        parsed_text = "\n".join(chunk.strip() for chunk in collected_chunks if isinstance(chunk, str)).strip()
+
+                    if parsed_text and parsed_text.strip():
+                        parsed_text = parsed_text.strip()
 
                     if parsed_text:
                         with api_key_last_call_time_lock:
                             api_key_last_call_time[api_key_used_for_call] = time.time()
                         self._mark_api_key_batch_success(api_key_used_for_call)
                         return parsed_text
+                    preview = decoded_output[:200].replace("\n", " ")
+                    self.log_message(
+                        f"Batch {batch_id} не содержит текстового ответа. Сырой вывод (обрезано): {preview}...",
+                        "WARNING",
+                    )
                     return None
                 finally:
                     if output_file_id:
