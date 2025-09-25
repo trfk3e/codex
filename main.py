@@ -30,6 +30,10 @@ import random
 import traceback
 import json  # НОВОВВЕДЕНИЕ: Для работы с файлом статусов API ключей
 import datetime  # НОВОВВЕДЕНИЕ: Для работы со временем сброса лимитов
+import io
+import uuid
+import tempfile
+from pathlib import Path
 from dateutil.parser import parse as parse_datetime  # Для парсинга ISO дат, если понадобится при чтении
 from dateutil.relativedelta import relativedelta  # Для парсинга "1m", "60s"
 # Utilities for HTML parsing and shutdown handling
@@ -49,6 +53,10 @@ def app_path(name: str) -> str:
 
 DEFAULT_CONFIG_FILE = "settings.ini"
 DEFAULT_MODEL = "gpt-5-nano"
+USE_BATCH_API = True
+BATCH_COMPLETION_WINDOW = "24h"
+BATCH_POLL_INTERVAL = 5.0
+BATCH_MAX_POLL_SECONDS = 60 * 60 * 24
 MAX_FILENAME_LENGTH = 100
 MAX_RETRY_PASSES = 3
 # Количество попыток генерации для одного ключевого слова
@@ -495,6 +503,482 @@ class TextGeneratorApp(ctk.CTkFrame):
                     f"После {MAX_RETRY_PASSES} проходов не удалось сгенерировать {remaining_tasks_count} из {len(self.all_task_definitions)} статей.",
                     "WARNING")
 
+    def _compose_messages_for_article(self, keyword_phrase: str, selected_lang: str, topic_word: str, prev_h1: str | None):
+        """Сформировать сообщения для Chat Completions в формате JSON-ответа."""
+
+        h1_hint_user_variants = [
+            (
+                f"Язык: {selected_lang}. Тема: {topic_word} — придумай НЕШТАМПОВАННЫЙ SEO H1 по {keyword_phrase}. "
+                f"Ключевое '{keyword_phrase}' вставь естественно В СЕРЕДИНУ, не в начало/конец. Одно предложение, без кавычек."
+            )
+        ]
+        h1_hint_user = random.choice(h1_hint_user_variants)
+
+        sys_preamble = (
+            f"Ты опытный SEO-копирайтер. Пиши строго на языке {selected_lang}. "
+            f"Генерируй ОЧЕНЬ подробный HTML-текст в теме казино/{topic_word} (не употребляй слово 'I‑Gaming'). "
+            f"НУЖНО ВЕРНУТЬ СТРОГО JSON с 2 полями: "
+            f"  h1: строка (уникальный H1), "
+            f"  html_body: строка с ЧИСТЫМ HTML-контентом БЕЗ H1, БЕЗ ToC, БЕЗ <!DOCTYPE>/<html>/<head>/<body> и БЕЗ markdown‑фенсов. "
+            f"Требования к HTML: используем <h2>/<h3>, абзацы <p>, списки <ul>/<ol>/<li>, "
+            f"таблицы <table><thead>...<tbody>... Минимум 1‑2 таблицы и по одному маркированному и нумерованному списку, "
+            f"интегрированные ВНУТРИ разделов H2/H3 (НЕ после итогов). "
+            f"Абзацы по 3–5 предложений. Для жирного — <strong>, для курсива — <em>."
+        )
+
+        if prev_h1:
+            sys_preamble += (
+                f" Новый H1 не должен быть похож на предыдущий: «{prev_h1}». Измени начало и конец, избегай повторов."
+            )
+
+        user_block = (
+            f"{h1_hint_user}\n\n"
+            f"Далее сгенерируй html_body: вступление 150–300 слов (несколько абзацев), "
+            f"6–9 разделов H2 (каждый ~150–250 слов) с 2–4 H3 внутри, и краткие итоги (100–150 слов) "
+            f"БЕЗ слова 'Заключение'. В html_body НЕ должно быть H1 и ToC. "
+            f"Ключевая фраза «{keyword_phrase}» встреть 1–2 раза естественно в <p>. "
+            f"Не нумеруй заголовки цифрами, только текст. "
+            f"Ответ отдай СТРОГО как JSON без лишних символов и без markdown."
+        )
+
+        messages = [
+            {"role": "system", "content": sys_preamble},
+            {"role": "user", "content": user_block},
+        ]
+        return messages
+
+    def _build_jsonl_for_batch(self, tasks, selected_lang: str):
+        """Собрать временный JSONL с запросами для Batch API."""
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        tmp_path = Path(tmp.name)
+        tmp.close()
+
+        with self.previous_h1_lock:
+            prev_h1 = self.previous_h1_text
+
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            for task in tasks:
+                keyword_value = task["keyword"]
+                custom_id = task["id"]
+                messages = self._compose_messages_for_article(
+                    keyword_phrase=keyword_value,
+                    selected_lang=selected_lang,
+                    topic_word=self.topic_word,
+                    prev_h1=prev_h1,
+                )
+                body = {
+                    "model": DEFAULT_MODEL,
+                    "temperature": 0.7,
+                    "messages": messages,
+                }
+                payload = {
+                    "custom_id": custom_id,
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": body,
+                }
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        return tmp_path
+
+    def _run_single_batch(self, api_key: str, jsonl_path: Path):
+        """Запустить batch и вернуть результаты (custom_id -> текст)."""
+
+        client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
+        upload_file_id = None
+        output_file_id = None
+        batch_job = None
+        try:
+            with open(jsonl_path, "rb") as handle:
+                uploaded = client.files.create(file=handle, purpose="batch")
+            upload_file_id = getattr(uploaded, "id", None)
+            if not upload_file_id:
+                raise RuntimeError("Не удалось получить идентификатор загруженного файла batch")
+
+            batch_job = client.batches.create(
+                input_file_id=upload_file_id,
+                endpoint="/v1/chat/completions",
+                completion_window=BATCH_COMPLETION_WINDOW,
+            )
+
+            batch_id = getattr(batch_job, "id", None)
+            if not batch_id:
+                raise RuntimeError("Не удалось получить идентификатор созданного batch-задания")
+
+            self.log_message(f"[BATCH] Создан batch: {batch_id}. Ждём выполнение...")
+
+            waited = 0.0
+            last_status = None
+            while True:
+                if self.stop_event.is_set():
+                    self.log_message(f"[BATCH] Принудительная остановка batch {batch_id}", "WARNING")
+                    break
+                time.sleep(BATCH_POLL_INTERVAL)
+                waited += BATCH_POLL_INTERVAL
+                batch_job = client.batches.retrieve(batch_id)
+                status = getattr(batch_job, "status", None)
+                if status != last_status:
+                    self.log_message(f"[BATCH] Статус batch {batch_id}: {status}")
+                    last_status = status
+                if status in {"completed", "failed", "cancelled", "expired"}:
+                    break
+                if waited >= BATCH_MAX_POLL_SECONDS:
+                    self.log_message(f"[BATCH] Превышено время ожидания batch {batch_id}", "ERROR")
+                    break
+
+            results = {}
+
+            final_status = getattr(batch_job, "status", None)
+            if final_status not in {"completed"}:
+                if getattr(batch_job, "error_file_id", None):
+                    try:
+                        error_text = client.files.content(batch_job.error_file_id).text
+                        self.log_message(f"[BATCH] Ошибка batch:\n{error_text}", "ERROR")
+                    except Exception:
+                        pass
+                if final_status and final_status != "completed":
+                    raise RuntimeError(f"Batch {batch_id} завершился со статусом '{final_status}'")
+                raise RuntimeError(f"Batch {batch_id} не завершён успешно")
+
+            if getattr(batch_job, "output_file_id", None):
+                output_file_id = batch_job.output_file_id
+                output_text = client.files.content(output_file_id).text
+                for line in output_text.splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except Exception as parse_err:
+                        self.log_message(f"[BATCH] Ошибка парсинга строки результата: {parse_err}", "WARNING")
+                        continue
+                    custom_id = record.get("custom_id")
+                    body = (record.get("response") or {}).get("body") or {}
+                    content = None
+                    if isinstance(body, dict):
+                        choices = body.get("choices") or []
+                        if choices:
+                            message = choices[0].get("message", {})
+                            content = message.get("content")
+                            if isinstance(content, list):
+                                fragments = []
+                                for piece in content:
+                                    if isinstance(piece, dict) and piece.get("type") == "text" and piece.get("text"):
+                                        fragments.append(piece["text"])
+                                    elif isinstance(piece, str):
+                                        fragments.append(piece)
+                                content = "\n".join(fragments)
+                            elif content is None and isinstance(message, dict):
+                                content = message.get("text")
+                        if content is None and body.get("message"):
+                            content = body.get("message")
+                    if content is None and record.get("error"):
+                        self.log_message(f"[BATCH] Ответ с ошибкой: {record['error']}", "ERROR")
+                        continue
+                    if content is None:
+                        continue
+                    if isinstance(content, dict):
+                        content = json.dumps(content, ensure_ascii=False)
+                    results[custom_id] = content
+            else:
+                if getattr(batch_job, "error_file_id", None):
+                    error_text = client.files.content(batch_job.error_file_id).text
+                    self.log_message(f"[BATCH] Ошибка batch:\n{error_text}", "ERROR")
+
+            self._mark_api_key_batch_success(api_key)
+            self._save_api_key_statuses()
+            return results
+        except Exception as exc:
+            self._mark_api_key_batch_error(api_key, exc)
+            self._save_api_key_statuses()
+            raise
+        finally:
+            if output_file_id:
+                try:
+                    client.files.delete(output_file_id)
+                except Exception:
+                    pass
+            if upload_file_id:
+                try:
+                    client.files.delete(upload_file_id)
+                except Exception:
+                    pass
+            try:
+                jsonl_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _postprocess_and_save_from_json(self, task_id: str, keyword_phrase: str, selected_lang: str, raw_json_or_text: str):
+        log_prefix = f"[{task_id} ('{keyword_phrase}', {selected_lang})]"
+        try:
+            payload = json.loads(raw_json_or_text)
+            original_h1_text = str(payload.get("h1", "")).strip().replace('"', "").replace("'", "")
+            article_body_raw = str(payload.get("html_body", "")).strip()
+        except Exception as exc:
+            self.log_message(f"{log_prefix} Невалидный JSON от модели, пытаемся распарсить: {exc}", "WARNING")
+            original_h1_text = keyword_phrase
+            article_body_raw = raw_json_or_text.strip()
+
+        if not original_h1_text:
+            original_h1_text = keyword_phrase
+
+        self.log_message(f"{log_prefix} H1: '{original_h1_text}'")
+        filepath_to_save = self.get_unique_filepath(original_h1_text)
+
+        body = re.sub(r'^\s*```html\s*', '', article_body_raw, flags=re.IGNORECASE)
+        body = re.sub(r'\s*```\s*$', '', body, flags=re.IGNORECASE).strip()
+
+        cleaned_body = self._clean_html_structure(body, log_prefix)
+        soup_container = BeautifulSoup(f"<div>{cleaned_body}</div>", 'html.parser')
+        root = soup_container.div
+
+        h1_tag = root.find('h1') if root else None
+        if h1_tag:
+            self.log_message(f"{log_prefix} Обнаружен H1 в теле — удаляем.")
+            h1_tag.extract()
+
+        toc_items = []
+        heading_id_counter = 1
+        main_h1_id = f"t{heading_id_counter}"; heading_id_counter += 1
+        toc_items.append({"level": 1, "text": original_h1_text, "id": main_h1_id})
+        if root:
+            for heading in root.find_all(['h2', 'h3']):
+                text = heading.get_text(strip=True) or "Подзаголовок"
+                heading_id = f"t{heading_id_counter}"; heading_id_counter += 1
+                heading['id'] = heading_id
+                level = int(heading.name[1:])
+                toc_items.append({"level": level, "text": text, "id": heading_id})
+
+        link = self.target_link_var.get().strip()
+        link_inserted = False
+        if link and root:
+            before_h2 = []
+            for child in root.children:
+                name = getattr(child, "name", None)
+                if name == 'h2':
+                    break
+                if name in ("p", "li"):
+                    before_h2.append(child)
+            if before_h2:
+                random.shuffle(before_h2)
+                for candidate in before_h2:
+                    if link_inserted:
+                        break
+                    existing = False
+                    for anchor in candidate.find_all('a', recursive=True):
+                        if anchor.get('href') == link and re.search(re.escape(keyword_phrase), anchor.get_text(), flags=re.IGNORECASE):
+                            existing = True
+                            break
+                    if existing:
+                        link_inserted = True
+                        break
+                    for text_node in candidate.find_all(string=True, recursive=True):
+                        if text_node.parent.name == 'a':
+                            continue
+                        match = re.search(rf'(?i)\b({re.escape(keyword_phrase)})\b', str(text_node))
+                        if not match:
+                            continue
+                        before, hit, after = str(text_node)[:match.start()], match.group(1), str(text_node)[match.end():]
+                        anchor_tag = soup_container.new_tag('a', href=link)
+                        anchor_tag.string = hit
+                        text_node.replace_with(NavigableString(before), anchor_tag, NavigableString(after))
+                        link_inserted = True
+                        break
+                if not link_inserted:
+                    forced_target = random.choice(before_h2)
+                    forced_anchor = soup_container.new_tag('a', href=link)
+                    forced_anchor.string = keyword_phrase
+                    forced_target.insert(0, forced_anchor)
+                    forced_target.insert(1, NavigableString(" "))
+                    link_inserted = True
+
+        if not self._has_text_under_h1(root):
+            self.log_message(f"{log_prefix} Нет текста под H1 — задача помечена как неуспешная.", "WARNING")
+            return False
+
+        total_toc_len = sum(len(item["text"]) for item in toc_items)
+        if any(len(item["text"]) > MAX_TOC_ITEM_CHARS for item in toc_items) or total_toc_len > MAX_TOC_TOTAL_CHARS:
+            self.log_message(f"{log_prefix} Пункты оглавления слишком длинные — задача помечена как неуспешная.", "WARNING")
+            return False
+
+        toc_li = "".join([f'<li><a href="#{item["id"]}">{item["text"]}</a></li>' for item in toc_items])
+        toc_div = (
+            f'<div id="texter" style="background: {random.choice(self.article_toc_background_colors)};'
+            f'border:1px solid #aaa;display:table;margin-bottom:1em;padding:1em;width:350px;">'
+            f'<p class="toctitle" style="font-weight:700;text-align:center"></p>'
+            f'<ul class="toc_list">{toc_li}</ul></div>'
+        )
+        h1_html = f'<h1 id="{main_h1_id}">{original_h1_text}</h1>'
+        final_body = "".join(str(child) for child in (root.contents if root else []))
+        final_html = "\n".join([toc_div, h1_html, final_body])
+
+        plain_text = BeautifulSoup(final_html, 'html.parser').get_text(" ")
+        if re.search(r'\b(\w+)\b(?:\s+\1\b){2,}', plain_text, flags=re.IGNORECASE):
+            self.log_message(f"{log_prefix} Найдены повторы слов подряд — задача помечена как неуспешная.", "WARNING")
+            return False
+
+        try:
+            with open(filepath_to_save, "w", encoding="utf-8") as handle:
+                handle.write(final_html)
+            size = os.path.getsize(filepath_to_save)
+            if size < MIN_ARTICLE_SIZE or size > MAX_ARTICLE_SIZE:
+                os.remove(filepath_to_save)
+                self.log_message(f"{log_prefix} Неподходящий размер файла ({size} байт) — задача неуспешна.", "WARNING")
+                return False
+        except Exception as exc:
+            self.log_message(f"{log_prefix} Ошибка записи файла: {exc}", "ERROR")
+            return False
+
+        with self.success_lock:
+            self.successful_task_ids.add(task_id)
+        with self.output_count_lock:
+            self.output_file_counter += 1
+        self.update_progress(task_id, keyword_phrase, 1)
+        with self.previous_h1_lock:
+            self.previous_h1_text = original_h1_text
+
+        self.log_message(f"{log_prefix} Сохранено: {os.path.basename(filepath_to_save)}")
+        if link and not link_inserted:
+            self.log_message(f"{log_prefix} ВНИМАНИЕ: Ссылка не вставлена.", "WARNING")
+        return True
+
+    def process_all_keywords_batch(self):
+        """Запуск генерации статей через Batch API."""
+
+        keywords_input = []
+        total_expected = 0
+        try:
+            with open(self.keywords_file_path.get(), "r", encoding="utf-8") as handle:
+                for line_num, line in enumerate(handle, 1):
+                    if self.stop_event.is_set():
+                        break
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if stripped.startswith("!===+"):
+                        lang = stripped[len("!===+"):].strip()
+                        if lang:
+                            self.generation_language_var.set(lang)
+                            self.log_message(f"Автообнаружен язык: {lang}")
+                        continue
+                    if stripped.startswith("!==+"):
+                        link = stripped[len("!==+"):].strip()
+                        if link:
+                            self.target_link_var.set(link)
+                            self.log_message(f"Автообнаружена ссылка: {link}")
+                        continue
+                    if stripped.startswith("!====+"):
+                        topic_val = stripped.split("+", 1)[-1].strip()
+                        if topic_val:
+                            self.topic_word = topic_val
+                            self.log_message(f"Автообнаружена тема: {topic_val}")
+                        continue
+                    parts = stripped.split("\t")
+                    if len(parts) == 2:
+                        keyword_value = parts[0].strip()
+                        quantity_part = parts[1].strip()
+                        if not keyword_value:
+                            self.log_message(f"Пустое ключевое слово в строке {line_num}. Пропуск.", "WARNING")
+                            continue
+                        try:
+                            quantity = int(quantity_part)
+                        except ValueError:
+                            self.log_message(f"Некорректное количество в строке {line_num}: {quantity_part}", "ERROR")
+                            continue
+                        if quantity > 0:
+                            keywords_input.append({"keyword": keyword_value, "quantity": quantity})
+                            total_expected += quantity
+        except Exception as exc:
+            self.log_message(f"Ошибка чтения keywords файла: {exc}", "ERROR")
+            self.after(0, self.set_ui_for_generation, False)
+            if self.project_slot_acquired:
+                GLOBAL_PROJECT_SEMAPHORE.release()
+                self.project_slot_acquired = False
+            return
+
+        if self.stop_event.is_set() or not keywords_input:
+            self.after(0, self.set_ui_for_generation, False)
+            if self.project_slot_acquired:
+                GLOBAL_PROJECT_SEMAPHORE.release()
+                self.project_slot_acquired = False
+            return
+
+        self.send_telegram_notification(f"Генерируем (Batch) статей: {total_expected}")
+        self.output_file_counter = self._ensure_output_file_count(force=True)
+
+        tasks = []
+        for keyword_info in keywords_input:
+            keyword_value = keyword_info["keyword"]
+            for idx in range(keyword_info["quantity"]):
+                base = re.sub(r'[^a-zA-Z0-9\-_]', '', keyword_value.replace(" ", "_"))
+                tasks.append({"id": f"{base}__{idx + 1}", "keyword": keyword_value})
+
+        if not tasks:
+            self.after(0, self.set_ui_for_generation, False)
+            if self.project_slot_acquired:
+                GLOBAL_PROJECT_SEMAPHORE.release()
+                self.project_slot_acquired = False
+            return
+
+        self.all_task_definitions = tasks[:]
+        self.successful_task_ids.clear()
+
+        if self.api_key_queue.empty():
+            self.log_message("Нет доступных API-ключей для Batch.", "ERROR")
+            self.after(0, self.set_ui_for_generation, False)
+            if self.project_slot_acquired:
+                GLOBAL_PROJECT_SEMAPHORE.release()
+                self.project_slot_acquired = False
+            return
+
+        try:
+            api_key = self.api_key_queue.get(timeout=10)
+        except Empty:
+            self.log_message("Не удалось получить ключ из очереди для Batch.", "ERROR")
+            self.after(0, self.set_ui_for_generation, False)
+            if self.project_slot_acquired:
+                GLOBAL_PROJECT_SEMAPHORE.release()
+                self.project_slot_acquired = False
+            return
+
+        try:
+            jsonl_path = self._build_jsonl_for_batch(tasks, self.generation_language_var.get())
+            try:
+                results_map = self._run_single_batch(api_key, jsonl_path)
+            except Exception as exc:
+                self.log_message(f"Batch завершился с ошибкой: {exc}", "ERROR")
+                results_map = {}
+            else:
+                if results_map is None:
+                    results_map = {}
+
+            done = 0
+            for task in tasks:
+                if self.stop_event.is_set():
+                    break
+                custom_id = task["id"]
+                keyword_value = task["keyword"]
+                raw_content = results_map.get(custom_id)
+                if not raw_content:
+                    self.log_message(f"[{custom_id}] Нет ответа от Batch — пропуск.", "WARNING")
+                    continue
+                if self._postprocess_and_save_from_json(custom_id, keyword_value, self.generation_language_var.get(), raw_content):
+                    done += 1
+
+            self.output_file_counter = self._ensure_output_file_count(force=True)
+            self.log_message(f"Batch завершён. Готово файлов: {done}/{total_expected}")
+            self.send_telegram_notification(f"Batch готов: {done}/{total_expected}")
+        finally:
+            with self.api_key_statuses_lock:
+                status = self.api_key_statuses.get(api_key, {}).get("status", "active")
+            if status == "active":
+                self.api_key_queue.put(api_key)
+
+            self.after(0, self.set_ui_for_generation, False)
+            if self.project_slot_acquired:
+                GLOBAL_PROJECT_SEMAPHORE.release()
+                self.project_slot_acquired = False
+
     def log_message(self, message, level="INFO"):
         if getattr(self, 'silent_stop', False) and self.stop_event.is_set():
             allowed = [
@@ -779,6 +1263,26 @@ class TextGeneratorApp(ctk.CTkFrame):
             if status_entry["status"] != "active" and was_active:
                 self.log_message(f"Ключ {api_key[:7]}... более не активен. Обновление очереди...", "INFO")
                 self._repopulate_available_api_key_queue()
+
+    def _mark_api_key_batch_success(self, api_key):
+        if not api_key:
+            return
+        with self.api_key_statuses_lock:
+            status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
+            status_entry["status"] = "active"
+            status_entry["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            status_entry["error_message"] = ""
+            self.api_key_statuses[api_key] = status_entry
+
+    def _mark_api_key_batch_error(self, api_key, message):
+        if not api_key:
+            return
+        with self.api_key_statuses_lock:
+            status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
+            status_entry["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            status_entry["status"] = "error"
+            status_entry["error_message"] = str(message)[:500]
+            self.api_key_statuses[api_key] = status_entry
 
     def create_widgets(self):
         main_frame = ctk.CTkFrame(self)
@@ -1240,7 +1744,10 @@ class TextGeneratorApp(ctk.CTkFrame):
         )
         self.successful_task_ids.clear()
         self.all_task_definitions.clear()
-        threading.Thread(target=self.process_all_keywords, daemon=True).start()
+        if USE_BATCH_API:
+            threading.Thread(target=self.process_all_keywords_batch, daemon=True).start()
+        else:
+            threading.Thread(target=self.process_all_keywords, daemon=True).start()
 
     def stop_generation(self):
         if self.generation_active or self.waiting_for_project_slot:
@@ -1361,14 +1868,207 @@ class TextGeneratorApp(ctk.CTkFrame):
             if to_wait > 0:
                 time.sleep(to_wait)
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
-                with api_key_last_call_time_lock:
-                    api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
+                def _normalize_message_content(role, content):
+                    """Normalize chat content to the Batch Responses schema."""
+
+                    desired_text_type = "output_text" if role == "assistant" else "input_text"
+                    
+                    def _normalized_piece(piece):
+                        if isinstance(piece, str):
+                            return {"type": desired_text_type, "text": piece}
+                        if not isinstance(piece, dict):
+                            return piece
+                        piece_type = piece.get("type")
+                        if piece_type in (None, "text"):
+                            piece = {**piece, "type": desired_text_type}
+                        elif piece_type in ("input_text", "output_text") and piece_type != desired_text_type:
+                            piece = {**piece, "type": desired_text_type}
+                        return piece
+
+                    if isinstance(content, str):
+                        return [{"type": desired_text_type, "text": content}]
+                    if isinstance(content, list):
+                        normalized_list = []
+                        for piece in content:
+                            normalized_list.append(_normalized_piece(piece))
+                        return normalized_list
+                    return content
+
+                formatted_messages = []
+                for message in messages:
+                    if not isinstance(message, dict):
+                        formatted_messages.append(message)
+                        continue
+                    role = message.get("role")
+                    normalized_message = {k: v for k, v in message.items() if k != "content"}
+                    normalized_message["role"] = role
+                    normalized_message["content"] = _normalize_message_content(role, message.get("content"))
+                    formatted_messages.append(normalized_message)
+
+                batch_custom_id = f"req-{uuid.uuid4()}"
+                batch_request = {
+                    "custom_id": batch_custom_id,
+                    "method": "POST",
+                    "url": "/v1/responses",
+                    "body": {
+                        "model": DEFAULT_MODEL,
+                        "input": formatted_messages,
+                    },
+                }
+
+                jsonl_payload = json.dumps(batch_request, ensure_ascii=False) + "\n"
+                input_file_id = None
+                output_file_id = None
+                try:
+                    upload_response = client_instance.files.create(
+                        purpose="batch",
+                        file=(
+                            f"batch-{batch_custom_id}.jsonl",
+                            io.BytesIO(jsonl_payload.encode("utf-8")),
+                        ),
+                    )
+                    input_file_id = getattr(upload_response, "id", None)
+                    if not input_file_id:
+                        raise RuntimeError("Не удалось получить идентификатор загруженного batch-файла")
+
+                    batch_job = client_instance.batches.create(
+                        input_file_id=input_file_id,
+                        endpoint="/v1/responses",
+                        completion_window=BATCH_COMPLETION_WINDOW,
+                    )
+
+                    batch_id = getattr(batch_job, "id", None)
+                    if not batch_id:
+                        raise RuntimeError("Не удалось получить идентификатор созданного batch-задания")
+
+                    poll_started_at = time.time()
+                    last_status = None
+                    while True:
+                        if self.stop_event.is_set():
+                            self.log_message(
+                                f"Batch {batch_id} прерван из-за остановки приложения.",
+                                "WARNING",
+                            )
+                            return None
+
+                        if time.time() - poll_started_at > BATCH_MAX_POLL_SECONDS:
+                            raise TimeoutError(
+                                f"Batch {batch_id} не завершен в течение {BATCH_MAX_POLL_SECONDS} секунд"
+                            )
+
+                        current_batch = client_instance.batches.retrieve(batch_id)
+                        status = getattr(current_batch, "status", None)
+                        if status != last_status:
+                            self.log_message(
+                                f"Batch {batch_id} статус: {status}",
+                                "DEBUG",
+                            )
+                            last_status = status
+
+                        if status == "completed":
+                            output_file_id = getattr(current_batch, "output_file_id", None)
+                            break
+                        if status in {"failed", "cancelled", "expired"}:
+                            raise RuntimeError(f"Batch {batch_id} завершился со статусом '{status}'")
+
+                        time.sleep(BATCH_POLL_INTERVAL)
+
+                    if not output_file_id:
+                        raise RuntimeError(f"Batch {batch_id} не вернул output_file_id")
+
+                    output_stream = client_instance.files.content(output_file_id)
+                    try:
+                        output_bytes = output_stream.read()
+                    finally:
+                        close_method = getattr(output_stream, "close", None)
+                        if callable(close_method):
+                            try:
+                                close_method()
+                            except Exception:
+                                pass
+                    if not isinstance(output_bytes, (bytes, bytearray)):
+                        output_bytes = str(output_bytes).encode("utf-8")
+
+                    decoded_output = output_bytes.decode("utf-8")
+
+                    def _collect_text_values(value, accumulator):
+                        """Recursively collect textual fields from a responses payload structure."""
+
+                        if value is None:
+                            return
+                        if isinstance(value, str):
+                            if value.strip():
+                                accumulator.append(value)
+                            return
+                        if isinstance(value, dict):
+                            # Direct text container
+                            if "text" in value:
+                                _collect_text_values(value.get("text"), accumulator)
+                            # Nested content/message/output/choices structures
+                            for key in ("content", "output", "message", "messages", "choices", "items", "data"):
+                                if key in value:
+                                    _collect_text_values(value.get(key), accumulator)
+                            return
+                        if isinstance(value, (list, tuple)):
+                            for item in value:
+                                _collect_text_values(item, accumulator)
+
+                    collected_chunks = []
+                    parsed_text = None
+                    for line in decoded_output.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError as decode_err:
+                            self.log_message(
+                                f"Batch {batch_id} не удалось распарсить строку JSON: {decode_err} | {line[:120]}",
+                                "ERROR",
+                            )
+                            continue
+                        if record.get("error"):
+                            raise RuntimeError(
+                                f"Batch {batch_id} вернул ошибку: {record['error']}"
+                            )
+                        response_payload = record.get("response") or {}
+                        if isinstance(response_payload, dict) and response_payload.get("output_text"):
+                            parsed_text = response_payload["output_text"].strip()
+                            if parsed_text:
+                                break
+                        _collect_text_values(response_payload.get("output"), collected_chunks)
+                        if not collected_chunks:
+                            # Some responses might place textual data directly under response/content/message
+                            _collect_text_values(response_payload.get("content"), collected_chunks)
+                            _collect_text_values(response_payload.get("message"), collected_chunks)
+
+                    if (parsed_text is None or not parsed_text.strip()) and collected_chunks:
+                        parsed_text = "\n".join(chunk.strip() for chunk in collected_chunks if isinstance(chunk, str)).strip()
+
+                    if parsed_text and parsed_text.strip():
+                        parsed_text = parsed_text.strip()
+
+                    if parsed_text:
+                        with api_key_last_call_time_lock:
+                            api_key_last_call_time[api_key_used_for_call] = time.time()
+                        self._mark_api_key_batch_success(api_key_used_for_call)
+                        return parsed_text
+                    preview = decoded_output[:200].replace("\n", " ")
+                    self.log_message(
+                        f"Batch {batch_id} не содержит текстового ответа. Сырой вывод (обрезано): {preview}...",
+                        "WARNING",
+                    )
+                    return None
+                finally:
+                    if output_file_id:
+                        try:
+                            client_instance.files.delete(output_file_id)
+                        except Exception:
+                            pass
+                    if input_file_id:
+                        try:
+                            client_instance.files.delete(input_file_id)
+                        except Exception:
+                            pass
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
@@ -1394,6 +2094,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.log_message(f"Ожидание {current_delay} секунд перед следующей попыткой...",
                                      "INFO"); time.sleep(current_delay)
                 else:
+                    self._mark_api_key_batch_error(api_key_used_for_call, rle)
                     return None
             except APIStatusError as ase:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
@@ -1434,6 +2135,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.log_message(f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
                                      "INFO"); time.sleep(current_delay)
                 else:
+                    self._mark_api_key_batch_error(api_key_used_for_call, ase)
                     return None
             except APIConnectionError as ace:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
@@ -1442,12 +2144,14 @@ class TextGeneratorApp(ctk.CTkFrame):
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
                 else:
+                    self._mark_api_key_batch_error(api_key_used_for_call, ace)
                     return None
             except Exception as e:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(
                     f"Неожиданная ошибка OpenAI API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
                     log_level)
+                self._mark_api_key_batch_error(api_key_used_for_call, e)
                 current_delay = delay_seconds * (attempt + 1)
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
