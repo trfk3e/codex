@@ -1361,27 +1361,42 @@ class TextGeneratorApp(ctk.CTkFrame):
             if to_wait > 0:
                 time.sleep(to_wait)
             try:
+                def _normalize_message_content(role, content):
+                    """Normalize chat content to the Batch Responses schema."""
+
+                    desired_text_type = "output_text" if role == "assistant" else "input_text"
+                    
+                    def _normalized_piece(piece):
+                        if isinstance(piece, str):
+                            return {"type": desired_text_type, "text": piece}
+                        if not isinstance(piece, dict):
+                            return piece
+                        piece_type = piece.get("type")
+                        if piece_type in (None, "text"):
+                            piece = {**piece, "type": desired_text_type}
+                        elif piece_type in ("input_text", "output_text") and piece_type != desired_text_type:
+                            piece = {**piece, "type": desired_text_type}
+                        return piece
+
+                    if isinstance(content, str):
+                        return [{"type": desired_text_type, "text": content}]
+                    if isinstance(content, list):
+                        normalized_list = []
+                        for piece in content:
+                            normalized_list.append(_normalized_piece(piece))
+                        return normalized_list
+                    return content
+
                 formatted_messages = []
                 for message in messages:
                     if not isinstance(message, dict):
                         formatted_messages.append(message)
                         continue
                     role = message.get("role")
-                    content_value = message.get("content")
-                    if isinstance(content_value, str):
-                        formatted_messages.append(
-                            {
-                                "role": role,
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": content_value,
-                                    }
-                                ],
-                            }
-                        )
-                    else:
-                        formatted_messages.append(message)
+                    normalized_message = {k: v for k, v in message.items() if k != "content"}
+                    normalized_message["role"] = role
+                    normalized_message["content"] = _normalize_message_content(role, message.get("content"))
+                    formatted_messages.append(normalized_message)
 
                 raw_response = client_instance.responses.with_raw_response.create(
                     model=DEFAULT_MODEL,
