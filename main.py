@@ -30,6 +30,8 @@ import random
 import traceback
 import json  # НОВОВВЕДЕНИЕ: Для работы с файлом статусов API ключей
 import datetime  # НОВОВВЕДЕНИЕ: Для работы со временем сброса лимитов
+import tempfile
+import uuid
 from dateutil.parser import parse as parse_datetime  # Для парсинга ISO дат, если понадобится при чтении
 from dateutil.relativedelta import relativedelta  # Для парсинга "1m", "60s"
 # Utilities for HTML parsing and shutdown handling
@@ -1350,6 +1352,143 @@ class TextGeneratorApp(ctk.CTkFrame):
                         return True
         return False
 
+    def _execute_batch_chat_completion(self, client_instance, messages, api_key_used_for_call):
+        custom_id = f"batch-request-{uuid.uuid4()}"
+        request_line = json.dumps({
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": DEFAULT_MODEL,
+                "messages": messages,
+            },
+        }, ensure_ascii=False)
+
+        tmp_file_path = None
+        uploaded_file = None
+        output_file_id = None
+        error_file_id = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as tmp_file:
+                tmp_file.write(request_line + "\n")
+                tmp_file_path = tmp_file.name
+
+            self.log_message(
+                f"Отправка запроса в Batch API (custom_id={custom_id[:12]}..., ключ={api_key_used_for_call[:7]}...).",
+                "DEBUG",
+            )
+
+            with open(tmp_file_path, "rb") as f:
+                uploaded_file = client_instance.files.create(file=f, purpose="batch")
+
+            batch = client_instance.batches.create(
+                input_file_id=uploaded_file.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h",
+                metadata={"source": "text-generator-app"},
+            )
+
+            batch_id = batch.id
+            poll_interval = 2.0
+            max_wait_seconds = 600.0
+            waited = 0.0
+
+            while True:
+                if self.stop_event.is_set():
+                    raise RuntimeError("Batch API вызов прерван сигналом остановки.")
+
+                current_batch = client_instance.batches.retrieve(batch_id)
+                status = getattr(current_batch, "status", None)
+
+                if status == "completed":
+                    output_file_id = current_batch.output_file_id
+                    error_file_id = current_batch.error_file_id
+                    break
+
+                if status in {"failed", "cancelled", "expired"}:
+                    error_file_id = current_batch.error_file_id
+                    error_details = None
+                    if error_file_id:
+                        try:
+                            error_response = client_instance.files.content(error_file_id)
+                            if hasattr(error_response, "text"):
+                                error_details = error_response.text
+                            else:
+                                error_details = error_response.read().decode("utf-8", "ignore")
+                        except Exception as error_fetch_exc:
+                            self.log_message(
+                                f"Не удалось получить файл ошибок Batch API {error_file_id}: {error_fetch_exc}",
+                                "DEBUG",
+                            )
+                    error_message = f"Batch API завершился со статусом '{status}'."
+                    if error_details:
+                        error_message += f" Детали: {error_details.strip()}"
+                    raise RuntimeError(error_message)
+
+                time.sleep(poll_interval)
+                waited += poll_interval
+                if waited >= max_wait_seconds:
+                    raise TimeoutError("Batch API превысил допустимое время ожидания.")
+
+            if not output_file_id:
+                raise RuntimeError("Batch API завершился без выходного файла.")
+
+            file_response = client_instance.files.content(output_file_id)
+            if hasattr(file_response, "text"):
+                file_content = file_response.text
+            else:
+                file_content = file_response.read().decode("utf-8", "ignore")
+
+            for line in file_content.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("custom_id") != custom_id:
+                    continue
+                if data.get("error"):
+                    raise RuntimeError(f"Batch API вернул ошибку: {data['error']}")
+                response_body = data.get("response", {}).get("body", {})
+                choices = response_body.get("choices") or []
+                if not choices:
+                    raise RuntimeError("Batch API ответ не содержит вариантов (choices).")
+                message = choices[0].get("message") or {}
+                content = message.get("content", "")
+                return content.strip()
+
+            raise RuntimeError("Batch API не вернул ожидаемый ответ для custom_id.")
+        finally:
+            if tmp_file_path and os.path.exists(tmp_file_path):
+                try:
+                    os.remove(tmp_file_path)
+                except Exception as cleanup_exc:
+                    self.log_message(
+                        f"Не удалось удалить временный файл Batch API {tmp_file_path}: {cleanup_exc}", "DEBUG"
+                    )
+            if uploaded_file is not None:
+                try:
+                    client_instance.files.delete(uploaded_file.id)
+                except Exception as cleanup_exc:
+                    self.log_message(
+                        f"Не удалось удалить входной файл Batch API {uploaded_file.id}: {cleanup_exc}", "DEBUG"
+                    )
+            if output_file_id:
+                try:
+                    client_instance.files.delete(output_file_id)
+                except Exception as cleanup_exc:
+                    self.log_message(
+                        f"Не удалось удалить выходной файл Batch API {output_file_id}: {cleanup_exc}", "DEBUG"
+                    )
+            if error_file_id:
+                try:
+                    client_instance.files.delete(error_file_id)
+                except Exception as cleanup_exc:
+                    self.log_message(
+                        f"Не удалось удалить файл ошибок Batch API {error_file_id}: {cleanup_exc}", "DEBUG"
+                    )
+
     def call_openai_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
         for attempt in range(retries):
             if self.stop_event.is_set():
@@ -1361,14 +1500,10 @@ class TextGeneratorApp(ctk.CTkFrame):
             if to_wait > 0:
                 time.sleep(to_wait)
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
+                response_text = self._execute_batch_chat_completion(client_instance, messages, api_key_used_for_call)
                 with api_key_last_call_time_lock:
                     api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
+                return response_text
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
