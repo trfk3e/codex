@@ -23,7 +23,7 @@ import threading
 import os
 import time
 import re
-from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
+from openai import OpenAI, APIStatusError
 from queue import Queue, Empty
 
 import random
@@ -37,6 +37,11 @@ from bs4 import BeautifulSoup, NavigableString
 import sys
 import atexit
 import signal
+# Дополнительные утилиты для Batch API
+import uuid
+import tempfile
+from typing import Callable, Dict, List, Optional, Any
+import contextlib
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 
 if getattr(sys, "frozen", False):
@@ -81,9 +86,18 @@ MAX_TOC_ITEM_CHARS = 200
 # Максимальная суммарная длина всех заголовков в оглавлении
 MAX_TOC_TOTAL_CHARS = 2000
 # Минимальный интервал между запросами одним и тем же API ключом (секунды)
-PER_KEY_CALL_INTERVAL = 0.05
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
+
+# Параметры Batch API
+BATCH_MAX_REQUESTS_PER_JOB = 1000  # Безопасный размер батча для запросов
+BATCH_FLUSH_INTERVAL_SECONDS = 15.0  # Максимальное ожидание накопления запросов перед отправкой
+BATCH_REQUEST_TIMEOUT_SECONDS = 1800  # 30 минут ожидания результата конкретного запроса
+BATCH_COMPLETION_TIMEOUT_SECONDS = 4 * 3600  # 4 часа на завершение батча
+BATCH_STATUS_POLL_INTERVAL_SECONDS = 5.0  # Интервал опроса статуса батча
+
+# Формат custom_id: используем UUID для уникальности
+BATCH_CUSTOM_ID_PREFIX = "req"
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -104,6 +118,364 @@ GLOBAL_API_KEY_STATUSES_LOADED = False
 # Telegram integration settings file
 TELEGRAM_SETTINGS_FILE = "telegram_settings.json"
 AUTH_FILE = "auth.lock"
+
+
+class BatchAPIError(Exception):
+    """Базовое исключение для проблем Batch API."""
+
+
+class BatchInvalidAPIKeyError(BatchAPIError):
+    """Исключение для невалидного API ключа."""
+
+
+class BatchRequestTimeoutError(BatchAPIError):
+    """Исключение, если ожидание результата запроса превысило лимит."""
+
+
+class BatchRequestRecord:
+    """Объект-обертка для отслеживания состояния отдельного запроса в батче."""
+
+    def __init__(self, messages: List[Dict[str, Any]],
+                 body_overrides: Optional[Dict[str, Any]] = None,
+                 log_callback: Optional[Callable[[str, str], None]] = None,
+                 log_context: Optional[str] = None):
+        self.messages = messages
+        self.body_overrides = body_overrides or {}
+        self.log_callback = log_callback
+        self.log_context = log_context
+        self.custom_id = f"{BATCH_CUSTOM_ID_PREFIX}-{uuid.uuid4()}"
+        self.created_at = time.time()
+        self.event = threading.Event()
+        self.response: Optional[str] = None
+        self.error: Optional[Exception] = None
+
+
+class BatchAPIManager:
+    """Менеджер, который накапливает запросы и выполняет их через Batch API."""
+
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL,
+                 default_logger: Optional[Callable[[str, str], None]] = None):
+        self.api_key = api_key
+        self.model = model
+        self.default_logger = default_logger
+        self.client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
+        self.pending_requests: List[BatchRequestRecord] = []
+        self.condition = threading.Condition()
+        self.shutdown_flag = False
+        self._worker_thread = threading.Thread(target=self._worker_loop,
+                                               name=f"BatchManager-{api_key[:6]}",
+                                               daemon=True)
+        self._worker_thread.start()
+
+    def _log(self, message: str, level: str = "INFO"):
+        if self.default_logger:
+            try:
+                self.default_logger(message, level)
+            except Exception:
+                pass
+
+    def submit_request(self, messages: List[Dict[str, Any]],
+                       body_overrides: Optional[Dict[str, Any]] = None,
+                       timeout: float = BATCH_REQUEST_TIMEOUT_SECONDS,
+                       log_callback: Optional[Callable[[str, str], None]] = None,
+                       log_context: Optional[str] = None) -> str:
+        record = BatchRequestRecord(messages, body_overrides, log_callback, log_context)
+        with self.condition:
+            if self.shutdown_flag:
+                raise BatchAPIError("BatchAPIManager остановлен и не принимает запросы.")
+            self.pending_requests.append(record)
+            self.condition.notify_all()
+        if not record.event.wait(timeout):
+            record.error = BatchRequestTimeoutError(
+                f"Ожидание результата запроса {record.custom_id} превысило {timeout} секунд.")
+        if record.error:
+            if isinstance(record.error, BatchInvalidAPIKeyError):
+                raise record.error
+            raise record.error if isinstance(record.error, BatchAPIError) else BatchAPIError(str(record.error))
+        return record.response or ""
+
+    def shutdown(self, wait: bool = False):
+        with self.condition:
+            self.shutdown_flag = True
+            self.condition.notify_all()
+        if wait and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5.0)
+
+    def _worker_loop(self):
+        while True:
+            with self.condition:
+                while not self.pending_requests and not self.shutdown_flag:
+                    self.condition.wait()
+                if self.shutdown_flag and not self.pending_requests:
+                    return
+                batch_requests = self._collect_batch_requests_locked()
+            if not batch_requests:
+                if self.shutdown_flag:
+                    return
+                continue
+            try:
+                self._process_batch(batch_requests)
+            except BatchInvalidAPIKeyError as invalid_exc:
+                self._log(f"Batch API: ключ {self.api_key[:7]}... признан невалидным: {invalid_exc}", "ERROR")
+                for req in batch_requests:
+                    req.error = invalid_exc
+                    req.event.set()
+                with self.condition:
+                    self.shutdown_flag = True
+                    self.pending_requests.clear()
+                return
+            except Exception as exc:
+                self._log(f"Batch API: ошибка обработки батча ({self.api_key[:7]}...): {exc}", "ERROR")
+                for req in batch_requests:
+                    req.error = BatchAPIError(str(exc))
+                    req.event.set()
+
+    def _collect_batch_requests_locked(self) -> List[BatchRequestRecord]:
+        if not self.pending_requests:
+            return []
+        now = time.time()
+        first_created = self.pending_requests[0].created_at
+        if len(self.pending_requests) >= BATCH_MAX_REQUESTS_PER_JOB or \
+                (now - first_created) >= BATCH_FLUSH_INTERVAL_SECONDS or self.shutdown_flag:
+            batch_size = min(len(self.pending_requests), BATCH_MAX_REQUESTS_PER_JOB)
+            batch = self.pending_requests[:batch_size]
+            self.pending_requests = self.pending_requests[batch_size:]
+            return batch
+        # Иначе ждем оставшееся время
+        wait_time = max(0.0, BATCH_FLUSH_INTERVAL_SECONDS - (now - first_created))
+        self.condition.wait(timeout=wait_time)
+        if not self.pending_requests:
+            return []
+        batch_size = min(len(self.pending_requests), BATCH_MAX_REQUESTS_PER_JOB)
+        batch = self.pending_requests[:batch_size]
+        self.pending_requests = self.pending_requests[batch_size:]
+        return batch
+
+    def _process_batch(self, batch_requests: List[BatchRequestRecord]):
+        callback_entries = [(req.log_callback, req.log_context) for req in batch_requests if req.log_callback]
+
+        def broadcast(message: str, level: str = "INFO"):
+            seen = set()
+            for cb, ctx in callback_entries:
+                if not cb:
+                    continue
+                key = (id(cb), ctx)
+                if key in seen:
+                    continue
+                seen.add(key)
+                formatted_message = f"{ctx} {message}" if ctx else message
+                try:
+                    cb(formatted_message, level)
+                except Exception:
+                    continue
+
+        broadcast(f"Batch API: подготовка батча на {len(batch_requests)} запросов.", "DEBUG")
+        temp_file_path = None
+        input_file_id = None
+        output_file_id = None
+        error_file_id = None
+        try:
+            temp_file = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+            temp_file_path = temp_file.name
+            try:
+                for req in batch_requests:
+                    body_payload = {"model": self.model, "messages": req.messages}
+                    if req.body_overrides:
+                        body_payload.update(req.body_overrides)
+                    payload = {
+                        "custom_id": req.custom_id,
+                        "method": "POST",
+                        "url": "/v1/chat/completions",
+                        "body": body_payload
+                    }
+                    temp_file.write(json.dumps(payload, ensure_ascii=False))
+                    temp_file.write("\n")
+            finally:
+                temp_file.close()
+
+            try:
+                with open(temp_file_path, "rb") as f:
+                    upload = self.client.files.create(file=f, purpose="batch")
+                input_file_id = upload.id
+            except APIStatusError as ase:
+                if ase.status_code == 401:
+                    raise BatchInvalidAPIKeyError("Невозможно загрузить файл для Batch API: недействительный ключ.")
+                raise
+
+            batch_job = self.client.batches.create(
+                input_file_id=input_file_id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h"
+            )
+            broadcast(f"Batch API: создан батч {batch_job.id} ({len(batch_requests)} запросов).", "INFO")
+
+            start_wait = time.time()
+            current_status = batch_job.status
+            while current_status not in {"completed", "failed", "cancelled", "expired"}:
+                if (time.time() - start_wait) > BATCH_COMPLETION_TIMEOUT_SECONDS:
+                    raise BatchAPIError(
+                        f"Батч {batch_job.id} не завершился за {BATCH_COMPLETION_TIMEOUT_SECONDS} секунд.")
+                time.sleep(BATCH_STATUS_POLL_INTERVAL_SECONDS)
+                batch_job = self.client.batches.retrieve(batch_job.id)
+                current_status = batch_job.status
+
+            if current_status != "completed":
+                error_file_id = getattr(batch_job, "error_file_id", None)
+                if current_status == "failed" and error_file_id:
+                    error_details = self._read_file_contents(error_file_id)
+                    broadcast(f"Batch API: батч {batch_job.id} завершился с ошибкой: {error_details[:400]}", "ERROR")
+                raise BatchAPIError(f"Батч {batch_job.id} завершился со статусом {current_status}.")
+
+            output_file_id = getattr(batch_job, "output_file_id", None)
+            if not output_file_id:
+                raise BatchAPIError(f"Батч {batch_job.id} завершен, но отсутствует output_file_id.")
+
+            output_contents = self._read_file_contents(output_file_id)
+            responses_map: Dict[str, Dict[str, Any]] = {}
+            for line in output_contents.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    responses_map[data.get("custom_id", "")] = data
+                except json.JSONDecodeError as exc:
+                    broadcast(f"Batch API: не удалось распарсить строку ответа: {exc}", "ERROR")
+
+            for req in batch_requests:
+                record_data = responses_map.get(req.custom_id)
+                if not record_data:
+                    req.error = BatchAPIError("Результат для запроса не найден в выходном файле батча.")
+                    req.event.set()
+                    continue
+                if record_data.get("error"):
+                    error_info = record_data["error"]
+                    err_msg = error_info.get("message", "Ошибка выполнения запроса в батче.")
+                    err_code = error_info.get("code")
+                    if err_code in {"invalid_api_key", "insufficient_quota", "billing_not_active"}:
+                        req.error = BatchInvalidAPIKeyError(err_msg)
+                    else:
+                        req.error = BatchAPIError(err_msg)
+                    req.event.set()
+                    continue
+                response_body = record_data.get("response", {}).get("body")
+                if not response_body:
+                    req.error = BatchAPIError("Пустой ответ от Batch API.")
+                    req.event.set()
+                    continue
+                choices = response_body.get("choices") or []
+                if not choices:
+                    req.error = BatchAPIError("Ответ не содержит поля choices.")
+                    req.event.set()
+                    continue
+                message_content = choices[0].get("message", {}).get("content")
+                if isinstance(message_content, list):
+                    combined = []
+                    for block in message_content:
+                        if isinstance(block, dict):
+                            combined.append(block.get("text", ""))
+                        elif isinstance(block, str):
+                            combined.append(block)
+                    message_content = "".join(combined)
+                if not isinstance(message_content, str):
+                    req.error = BatchAPIError("Неподдерживаемый формат контента в ответе.")
+                    req.event.set()
+                    continue
+                req.response = message_content.strip()
+                req.event.set()
+            broadcast(f"Batch API: батч {batch_job.id} успешно обработан.", "INFO")
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
+                    pass
+            if input_file_id:
+                with contextlib.suppress(Exception):
+                    self.client.files.delete(input_file_id)
+            if output_file_id:
+                with contextlib.suppress(Exception):
+                    self.client.files.delete(output_file_id)
+            if error_file_id:
+                with contextlib.suppress(Exception):
+                    self.client.files.delete(error_file_id)
+
+    def _read_file_contents(self, file_id: str) -> str:
+        file_response = self.client.files.content(file_id)
+        if hasattr(file_response, "text"):
+            return file_response.text
+        if hasattr(file_response, "read"):
+            data = file_response.read()
+            if isinstance(data, bytes):
+                return data.decode("utf-8", "ignore")
+            return str(data)
+        return str(file_response)
+
+
+class GlobalBatchDispatcher:
+    """Глобальный диспетчер, выдающий менеджеры для каждого API ключа."""
+
+    def __init__(self):
+        self._managers: Dict[str, BatchAPIManager] = {}
+        self._lock = threading.RLock()
+
+    def submit(self, api_key: str, messages: List[Dict[str, Any]],
+               body_overrides: Optional[Dict[str, Any]] = None,
+               timeout: float = BATCH_REQUEST_TIMEOUT_SECONDS,
+               log_callback: Optional[Callable[[str, str], None]] = None,
+               log_context: Optional[str] = None) -> str:
+        manager = self._get_or_create_manager(api_key, log_callback)
+        try:
+            return manager.submit_request(messages, body_overrides, timeout, log_callback, log_context)
+        except BatchInvalidAPIKeyError:
+            self._invalidate_manager(api_key)
+            raise
+        except BatchAPIError:
+            raise
+
+    def _get_or_create_manager(self, api_key: str,
+                               log_callback: Optional[Callable[[str, str], None]] = None) -> BatchAPIManager:
+        with self._lock:
+            manager = self._managers.get(api_key)
+            if manager is None or manager.shutdown_flag:
+                manager = BatchAPIManager(api_key, DEFAULT_MODEL, log_callback)
+                self._managers[api_key] = manager
+            return manager
+
+    def _invalidate_manager(self, api_key: str):
+        with self._lock:
+            manager = self._managers.pop(api_key, None)
+        if manager:
+            manager.shutdown(wait=False)
+
+    def shutdown(self):
+        with self._lock:
+            managers = list(self._managers.values())
+            self._managers.clear()
+        for manager in managers:
+            manager.shutdown(wait=False)
+
+
+GLOBAL_BATCH_DISPATCHER: Optional[GlobalBatchDispatcher] = None
+GLOBAL_BATCH_DISPATCHER_LOCK = threading.Lock()
+
+
+def get_global_batch_dispatcher() -> GlobalBatchDispatcher:
+    global GLOBAL_BATCH_DISPATCHER
+    if GLOBAL_BATCH_DISPATCHER is None:
+        with GLOBAL_BATCH_DISPATCHER_LOCK:
+            if GLOBAL_BATCH_DISPATCHER is None:
+                GLOBAL_BATCH_DISPATCHER = GlobalBatchDispatcher()
+    return GLOBAL_BATCH_DISPATCHER
+
+
+def shutdown_global_batch_dispatcher():
+    global GLOBAL_BATCH_DISPATCHER
+    if GLOBAL_BATCH_DISPATCHER is not None:
+        GLOBAL_BATCH_DISPATCHER.shutdown()
+        GLOBAL_BATCH_DISPATCHER = None
+
+
+atexit.register(shutdown_global_batch_dispatcher)
 
 def _get_system_fingerprint() -> str:
     """Return a hash representing the current machine."""
@@ -780,6 +1152,23 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ключ {api_key[:7]}... более не активен. Обновление очереди...", "INFO")
                 self._repopulate_available_api_key_queue()
 
+    def _mark_api_key_success(self, api_key):
+        if not api_key:
+            return
+        changed = False
+        with self.api_key_statuses_lock:
+            status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
+            if status_entry.get("status") != "active":
+                status_entry["status"] = "active"
+                changed = True
+            if status_entry.get("error_message"):
+                status_entry["error_message"] = None
+                changed = True
+            status_entry["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            self.api_key_statuses[api_key] = status_entry
+        if changed:
+            self._save_api_key_statuses()
+
     def create_widgets(self):
         main_frame = ctk.CTkFrame(self)
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
@@ -1350,110 +1739,45 @@ class TextGeneratorApp(ctk.CTkFrame):
                         return True
         return False
 
-    def call_openai_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
-        for attempt in range(retries):
-            if self.stop_event.is_set():
-                self.log_message("API вызов прерван сигналом остановки.", "WARNING")
-                return None
+    def call_openai_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5,
+                        log_context=None):
+        if self.stop_event.is_set():
+            self.log_message("API вызов прерван сигналом остановки.", "WARNING")
+            return None
+
+        dispatcher = get_global_batch_dispatcher()
+
+        def log_callback(message: str, level: str = "INFO"):
+            self.log_message(message, level)
+
+        try:
+            response_text = dispatcher.submit(
+                api_key=api_key_used_for_call,
+                messages=messages,
+                timeout=BATCH_REQUEST_TIMEOUT_SECONDS,
+                log_callback=log_callback,
+                log_context=log_context,
+            )
+            self._mark_api_key_success(api_key_used_for_call)
             with api_key_last_call_time_lock:
-                last_ts = api_key_last_call_time.get(api_key_used_for_call, 0.0)
-            to_wait = PER_KEY_CALL_INTERVAL - (time.time() - last_ts)
-            if to_wait > 0:
-                time.sleep(to_wait)
-            try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
-                with api_key_last_call_time_lock:
-                    api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
-            except RateLimitError as rle:
-                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
-                if hasattr(rle, 'response') and rle.response is not None and hasattr(rle.response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, rle.response.headers, is_error=True,
-                                                             status_code=429)
-                specific_error_type = None
-                try:
-                    if hasattr(rle, 'response') and rle.response is not None:
-                        error_details = rle.response.json().get("error", {}); specific_error_type = error_details.get(
-                            "type")
-                    elif hasattr(rle, 'body') and rle.body is not None and 'error' in rle.body:
-                        specific_error_type = rle.body.get('error', {}).get('type')
-                except Exception as e_parse:
-                    self.log_message(f"Не удалось извлечь specific_error_type из RateLimitError: {e_parse}", "DEBUG")
-                if specific_error_type in ['billing_not_active', 'insufficient_quota']:
-                    self.log_message(
-                        f"RateLimitError тип '{specific_error_type}'. Ключ {api_key_used_for_call[:7]}... будет обработан как невалидный.",
-                        "ERROR")
-                    return "INVALID_API_KEY_ERROR"
-                current_delay = delay_seconds * (2 ** attempt)
-                if attempt + 1 < retries:
-                    self.log_message(f"Ожидание {current_delay} секунд перед следующей попыткой...",
-                                     "INFO"); time.sleep(current_delay)
-                else:
-                    return None
-            except APIStatusError as ase:
-                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(
-                    f"OpenAI API StatusError: {ase}. Status Code: {ase.status_code}. Попытка {attempt + 1}/{retries}.",
-                    log_level)
-                if hasattr(ase, 'response') and ase.response is not None and hasattr(ase.response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, ase.response.headers, is_error=True,
-                                                             status_code=ase.status_code)
-                if ase.status_code == 401:
-                    self.log_message(
-                        f"Ошибка 401: Недействительный API ключ {api_key_used_for_call[:7]}.... Ключ будет обработан как невалидный.",
-                        "ERROR")
-                    return "INVALID_API_KEY_ERROR"
-                if ase.status_code == 429:
-                    specific_error_type_ase = None
-                    try:
-                        if hasattr(ase, 'response') and ase.response is not None:
-                            error_details_ase = ase.response.json().get("error",
-                                                                        {}); specific_error_type_ase = error_details_ase.get(
-                                "type")
-                        elif hasattr(ase, 'body') and ase.body is not None and 'error' in ase.body:
-                            specific_error_type_ase = ase.body.get('error', {}).get('type')
-                    except Exception as e_parse_ase:
-                        self.log_message(f"Не удалось извлечь specific_error_type из APIStatusError 429: {e_parse_ase}",
-                                         "DEBUG")
-                    if specific_error_type_ase in ['billing_not_active', 'insufficient_quota']:
-                        self.log_message(
-                            f"APIStatusError 429 тип '{specific_error_type_ase}'. Ключ {api_key_used_for_call[:7]}... будет обработан как невалидный.",
-                            "ERROR")
-                        return "INVALID_API_KEY_ERROR"
-                    self.log_message(f"Получен статус 429 (Rate Limit) как APIStatusError. Увеличенная задержка.",
-                                     "WARNING")
-                    current_delay = delay_seconds * (2 ** attempt) * 1.5
-                else:
-                    current_delay = delay_seconds * (2 ** attempt)
-                if attempt + 1 < retries:
-                    self.log_message(f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
-                                     "INFO"); time.sleep(current_delay)
-                else:
-                    return None
-            except APIConnectionError as ace:
-                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(f"OpenAI API ConnectionError: {ace}. Попытка {attempt + 1}/{retries}.", log_level)
-                current_delay = delay_seconds * (attempt + 1)
-                if attempt + 1 < retries:
-                    time.sleep(current_delay)
-                else:
-                    return None
-            except Exception as e:
-                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(
-                    f"Неожиданная ошибка OpenAI API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
-                    log_level)
-                current_delay = delay_seconds * (attempt + 1)
-                if attempt + 1 < retries:
-                    time.sleep(current_delay)
-                else:
-                    return None
-        return None
+                api_key_last_call_time[api_key_used_for_call] = time.time()
+            return response_text.strip() if response_text else ""
+        except BatchInvalidAPIKeyError as invalid_exc:
+            prefix = f"{log_context} " if log_context else ""
+            self.log_message(f"{prefix}Batch API сообщил о невалидном ключе: {invalid_exc}", "ERROR")
+            return "INVALID_API_KEY_ERROR"
+        except BatchRequestTimeoutError as timeout_exc:
+            prefix = f"{log_context} " if log_context else ""
+            self.log_message(f"{prefix}{timeout_exc}", "ERROR")
+            return None
+        except BatchAPIError as api_exc:
+            prefix = f"{log_context} " if log_context else ""
+            self.log_message(f"{prefix}Batch API ошибка: {api_exc}", "ERROR")
+            return None
+        except Exception as exc:
+            prefix = f"{log_context} " if log_context else ""
+            self.log_message(f"{prefix}Непредвиденная ошибка Batch API: {exc}", "ERROR")
+            return None
 
     # ================================================================================
     # НОВЫЙ МЕТОД ДЛЯ ОЧИСТКИ HTML (УБЕДИТЕСЬ, ЧТО ОН ВНУТРИ КЛАССА TextGeneratorApp)
@@ -1582,7 +1906,6 @@ class TextGeneratorApp(ctk.CTkFrame):
         if self.stop_event.is_set(): return False
 
         retrieved_api_key_str = None
-        openai_client = None
         key_marked_as_bad_in_this_task = False
         key_went_to_cooldown_in_this_task = False
 
@@ -1604,15 +1927,13 @@ class TextGeneratorApp(ctk.CTkFrame):
             key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(
                 retrieved_api_key_str) > 5 else retrieved_api_key_str
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
-            openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-            if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
         except Empty:
             self.log_message(f"{log_prefix_base} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
             self._initial_check_and_revive_keys()
             return False
         except Exception as e_init:
             self.log_message(
-                f"{log_prefix_base} Ошибка инициализации клиента OpenAI ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
+                f"{log_prefix_base} Ошибка подготовки к работе с ключом ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
                 "ERROR")
             if retrieved_api_key_str:
                 with self.api_key_statuses_lock:
@@ -1651,7 +1972,8 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "content": f"Сделай так, чтобы главный первый заголовок не был похож вообще на этот, проработай тщательно начало и конец, чтобы не было повторений: \"{self.previous_h1_text}\". ОБЗЯТАТЕЛЬНО НАЧАЛО НЕ ДОЛЖНО СОВПАДАТЬ!!!"
                     })
 
-            original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            original_h1_text_raw = self.call_openai_api(None, base_h1_prompt, retrieved_api_key_str,
+                                                       log_context=log_prefix)
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -1797,12 +2119,13 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
-            article_body_raw_from_api = self.call_openai_api(openai_client,
+            article_body_raw_from_api = self.call_openai_api(None,
                                                              [{"role": "system", "content": body_prompt_system},
                                                               # Теперь body_prompt_system определена
                                                               {"role": "user", "content": body_prompt_user}],
                                                              # Теперь body_prompt_user определена
-                                                             retrieved_api_key_str)
+                                                             retrieved_api_key_str,
+                                                             log_context=log_prefix)
 
             # ... (остальной код вашего метода)
 
