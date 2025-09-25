@@ -92,6 +92,14 @@ API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
 # a single batch without being fragmented into small portions.
 BATCH_MAX_REQUESTS = 10000
 BATCH_FLUSH_INTERVAL = 3.0  # seconds to wait for additional tasks before dispatching
+BYTES_IN_MEGABYTE = 1024 * 1024
+# Hard service limits from the Batch API documentation. Each batch JSONL file may
+# include at most 50k requests and must not exceed 200 MB. The completion window
+# is currently fixed at 24 hours.
+BATCH_API_MAX_REQUESTS_PER_FILE = 50000
+BATCH_API_MAX_FILE_BYTES = 200 * BYTES_IN_MEGABYTE
+BATCH_API_WARN_FILE_BYTES = int(BATCH_API_MAX_FILE_BYTES * 0.8)
+BATCH_API_COMPLETION_WINDOW = "24h"
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -252,7 +260,11 @@ class BatchBucket:
 class BatchDispatcher:
     def __init__(self, app, max_batch_size=BATCH_MAX_REQUESTS, flush_interval=BATCH_FLUSH_INTERVAL):
         self.app = app
-        self.max_batch_size = max_batch_size
+        if max_batch_size is None:
+            effective_batch_size = BATCH_API_MAX_REQUESTS_PER_FILE
+        else:
+            effective_batch_size = min(max_batch_size, BATCH_API_MAX_REQUESTS_PER_FILE)
+        self.max_batch_size = effective_batch_size
         self.flush_interval = flush_interval
         self._lock = threading.Lock()
         self._buckets = {}
@@ -292,6 +304,22 @@ class BatchDispatcher:
                 self._buckets[api_key] = bucket
             return bucket
 
+    def _serialize_requests(self, requests):
+        serialized_lines = []
+        total_bytes = 0
+        for req in requests:
+            payload = {
+                "custom_id": req.custom_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {"model": DEFAULT_MODEL, "messages": req.messages},
+            }
+            line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            encoded_length = len(line.encode("utf-8")) + 1  # account for newline
+            total_bytes += encoded_length
+            serialized_lines.append(line)
+        return serialized_lines, total_bytes
+
     def _mark_requests_as_failed(self, requests, message, invalid_key=False):
         for req in requests:
             if invalid_key:
@@ -316,7 +344,34 @@ class BatchDispatcher:
         app = self.app
         api_key = bucket.api_key
         key_short = f"...{api_key[-5:]}" if len(api_key) > 5 else api_key
+        serialized_payloads, estimated_bytes = self._serialize_requests(requests)
+        estimated_mb = estimated_bytes / BYTES_IN_MEGABYTE if estimated_bytes else 0
+        if estimated_bytes > BATCH_API_MAX_FILE_BYTES:
+            if len(requests) <= 1:
+                app.log_message(
+                    f"Batch ключа {key_short}: один запрос оценивается в {estimated_mb:.2f} МБ и превышает лимит Batch API (200 МБ).",
+                    "ERROR",
+                )
+                self._mark_requests_as_failed(requests, "Размер запроса превышает лимит Batch API")
+                return
+            split_index = max(1, len(requests) // 2)
+            app.log_message(
+                (
+                    f"Batch ключа {key_short}: объем JSONL ~{estimated_mb:.2f} МБ превышает лимит 200 МБ. "
+                    f"Разбиваем партию на {split_index} и {len(requests) - split_index} запросов."
+                ),
+                "WARNING",
+            )
+            self._execute_batch(bucket, list(requests[:split_index]))
+            self._execute_batch(bucket, list(requests[split_index:]))
+            return
+        if estimated_bytes >= BATCH_API_WARN_FILE_BYTES:
+            app.log_message(
+                f"Batch ключа {key_short}: объем JSONL ~{estimated_mb:.2f} МБ — приближается к лимиту 200 МБ.",
+                "DEBUG",
+            )
         attempt_counter = 0
+        enqueued_hint_logged = False
         while True:
             if app.stop_event.is_set():
                 self._mark_requests_as_failed(requests, "Генерация остановлена пользователем")
@@ -339,23 +394,33 @@ class BatchDispatcher:
             client_instance = None
             batch_id = None
             try:
-                batch_payloads = [
-                    {
-                        "custom_id": req.custom_id,
-                        "method": "POST",
-                        "url": "/v1/chat/completions",
-                        "body": {"model": DEFAULT_MODEL, "messages": req.messages},
-                    }
-                    for req in requests
-                ]
-
                 app.log_message(
-                    f"Batch ключа {key_short}: подготовка {len(batch_payloads)} запросов (попытка {current_attempt}/{requests[0].initial_retries}).",
+                    f"Batch ключа {key_short}: подготовка {len(serialized_payloads)} запросов (попытка {current_attempt}/{requests[0].initial_retries}).",
                     "DEBUG",
                 )
-                batch_input_path = app._create_batch_input_file(batch_payloads)
+                batch_input_path = app._create_batch_input_file(serialized_payloads)
                 if not batch_input_path:
                     raise RuntimeError("Не удалось создать локальный JSONL файл для batch запроса")
+
+                actual_size = None
+                actual_mb_value = None
+                try:
+                    actual_size = os.path.getsize(batch_input_path)
+                except OSError:
+                    actual_size = None
+                if actual_size is not None:
+                    actual_mb_value = actual_size / BYTES_IN_MEGABYTE
+                    app.log_message(
+                        f"Batch ключа {key_short}: входной JSONL {actual_mb_value:.2f} МБ.",
+                        "DEBUG",
+                    )
+                    if actual_size > BATCH_API_MAX_FILE_BYTES:
+                        raise RuntimeError("Размер batch файла превысил лимит 200 МБ после записи")
+                    if actual_size >= BATCH_API_WARN_FILE_BYTES:
+                        app.log_message(
+                            f"Batch ключа {key_short}: файл превысил 80% лимита ( {actual_mb_value:.2f} МБ из 200 МБ ).",
+                            "DEBUG",
+                        )
 
                 client_instance = OpenAI(api_key=api_key, timeout=30.0, max_retries=0)
                 with open(batch_input_path, "rb") as batch_file:
@@ -366,10 +431,14 @@ class BatchDispatcher:
                     "DEBUG",
                 )
 
+                metadata = {"requested": str(len(requests))}
+                if actual_mb_value is not None:
+                    metadata["jsonl_mb"] = f"{actual_mb_value:.2f}"
                 batch_job = client_instance.batches.create(
                     input_file_id=uploaded_file_id,
                     endpoint="/v1/chat/completions",
-                    completion_window="24h",
+                    completion_window=BATCH_API_COMPLETION_WINDOW,
+                    metadata=metadata,
                 )
                 batch_id = getattr(batch_job, "id", None)
                 status = getattr(batch_job, "status", "unknown")
@@ -417,6 +486,16 @@ class BatchDispatcher:
                     batch_job = client_instance.batches.retrieve(batch_id)
                     status = getattr(batch_job, "status", "unknown")
 
+                request_counts = getattr(batch_job, "request_counts", {}) or {}
+                total_requests = request_counts.get("total")
+                completed_requests = request_counts.get("completed")
+                failed_requests = request_counts.get("failed")
+                if any(v is not None for v in (total_requests, completed_requests, failed_requests)):
+                    app.log_message(
+                        f"Batch {batch_id}: выполнено {completed_requests or 0}/{total_requests or len(requests)} запросов, ошибок {failed_requests or 0}.",
+                        "INFO",
+                    )
+
                 output_file_id = getattr(batch_job, "output_file_id", None)
                 if not output_file_id:
                     raise RuntimeError(f"Batch {batch_id} завершен без output файла")
@@ -428,6 +507,10 @@ class BatchDispatcher:
 
                 output_entries = app._read_jsonl_from_openai_file(
                     client_instance, output_file_id, log_prefix="batch output"
+                )
+                app.log_message(
+                    f"Batch {batch_id}: получено {len(output_entries)} ответов.",
+                    "DEBUG",
                 )
                 output_map = {entry.get("custom_id"): entry for entry in output_entries}
 
@@ -483,6 +566,12 @@ class BatchDispatcher:
                             f"Batch {batch_id}: статус 429 для {req.custom_id}: {error_message}",
                             "WARNING",
                         )
+                        if not enqueued_hint_logged:
+                            app.log_message(
+                                "Batch API 429: возможно превышен лимит enqueued tokens. Дождитесь освобождения очереди либо уменьшите размер задания.",
+                                "INFO",
+                            )
+                            enqueued_hint_logged = True
                         req.result = None
                         req.error_message = error_message or "Статус 429"
                         req.event.set()
@@ -541,6 +630,12 @@ class BatchDispatcher:
                 )
                 if hasattr(rle, "response") and rle.response is not None and hasattr(rle.response, "headers"):
                     app._update_api_key_status_from_headers(api_key, rle.response.headers, is_error=True, status_code=429)
+                if not enqueued_hint_logged:
+                    app.log_message(
+                        "Batch API 429: проверьте лимит enqueued tokens и общие квоты проекта. Новые batch-задачи ставятся в очередь, и превышение лимитов приведёт к задержкам.",
+                        "INFO",
+                    )
+                    enqueued_hint_logged = True
                 specific_error_type = None
                 try:
                     if hasattr(rle, "response") and rle.response is not None:
@@ -577,6 +672,12 @@ class BatchDispatcher:
                     self._mark_requests_as_failed(requests, "Невалидный ключ", invalid_key=True)
                     return
                 if status_code == 429:
+                    if not enqueued_hint_logged:
+                        app.log_message(
+                            "Batch API 429: проверьте лимит enqueued tokens и общий пул квот проекта. Можно дождаться завершения текущих batch-задач или сократить размер партии.",
+                            "INFO",
+                        )
+                        enqueued_hint_logged = True
                     specific_error_type = None
                     try:
                         if hasattr(ase, "response") and ase.response is not None:
@@ -645,6 +746,14 @@ class BatchDispatcher:
                     except Exception as delete_out_exc:
                         app.log_message(
                             f"Batch ключа {key_short}: не удалось удалить файл результатов {output_file_id}: {delete_out_exc}",
+                            "DEBUG",
+                        )
+                if client_instance:
+                    try:
+                        client_instance.close()
+                    except Exception as close_exc:
+                        app.log_message(
+                            f"Batch ключа {key_short}: ошибка закрытия клиента OpenAI: {close_exc}",
                             "DEBUG",
                         )
 
@@ -1857,7 +1966,10 @@ class TextGeneratorApp(ctk.CTkFrame):
         try:
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsonl", encoding="utf-8") as tmp:
                 for payload in payloads:
-                    json.dump(payload, tmp, ensure_ascii=False)
+                    if isinstance(payload, str):
+                        tmp.write(payload)
+                    else:
+                        json.dump(payload, tmp, ensure_ascii=False, separators=(",", ":"))
                     tmp.write("\n")
                 return tmp.name
         except Exception as exc:
