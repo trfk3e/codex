@@ -778,7 +778,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "8. Меню <b>Настройки</b> позволяет очистить историю ID, заменить фильтр-промпт и включить или выключить лог (по умолчанию лог отключён).\n"
             "9. <b>Очистить чат</b> — бот удалит все сообщения в этом диалоге.\n"
             "10. Кнопка ⏹ <b>Остановить</b> прерывает любой текущий парсинг.\n"
-            "11. <b>📰 Авто-выжимка</b> — бот раз в час ищет новые публикации, сразу делает по ним выжимки и присылает на апрув. Повторное нажатие останавливает мониторинг, также его можно прервать кнопкой ⏹.\n"
+            "11. <b>📰 Авто-выжимка</b> — бот в реальном времени отслеживает появление новых публикаций, сразу делает по ним выжимки и присылает на апрув. Повторное нажатие останавливает мониторинг, также его можно прервать кнопкой ⏹.\n"
         )
         await update.message.reply_text(
             instruction, reply_markup=MAIN_KB, parse_mode=tg_const.ParseMode.HTML
@@ -809,7 +809,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             task = ctx.application.create_task(auto_monitor(ctx))
             ctx.chat_data["auto_task"] = task
             await update.message.reply_text(
-                "Авто-выжимка запущена. Проверяю каналы каждый час.",
+                "Авто-выжимка запущена. Мониторю новые посты в реальном времени.",
                 reply_markup=MAIN_KB,
             )
         return
@@ -1308,13 +1308,18 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # -------------- задачи -----------------------------------------------------
 
 
-async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def auto_cycle(
+    ctx: ContextTypes.DEFAULT_TYPE, *, client_ready: bool = False
+) -> int:
     cfg = get_cfg(ctx)
     if not cfg.channels:
         return 0
 
     total_sent = 0
-    await tg_client.start()
+    started_here = False
+    if not client_ready:
+        await tg_client.start()
+        started_here = True
     ctx.chat_data["stop"] = False
     ctx.chat_data["sent"] = 0
     try:
@@ -1356,11 +1361,14 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 continue
             total_sent += sent
     finally:
-        await tg_client.disconnect()
+        if started_here:
+            await tg_client.disconnect()
     return total_sent
 
 
-async def prime_auto_seen(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def prime_auto_seen(
+    ctx: ContextTypes.DEFAULT_TYPE, *, client_ready: bool = False
+) -> int:
     """Зафиксировать текущие посты, чтобы авто-выжимка начинала только с новых."""
 
     cfg = get_cfg(ctx)
@@ -1368,7 +1376,10 @@ async def prime_auto_seen(ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return 0
 
     added_total = 0
-    await tg_client.start()
+    started_here = False
+    if not client_ready:
+        await tg_client.start()
+        started_here = True
     try:
         modified = False
         for chan in cfg.channels:
@@ -1387,7 +1398,8 @@ async def prime_auto_seen(ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if modified:
             save_all()
     finally:
-        await tg_client.disconnect()
+        if started_here:
+            await tg_client.disconnect()
 
     return added_total
 
@@ -1397,7 +1409,16 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id is None:
         return
     try:
-        primed = await prime_auto_seen(ctx)
+        await tg_client.start()
+    except Exception:
+        logging.exception("Не удалось запустить Telethon клиент для авто-выжимки")
+        await ctx.bot.send_message(
+            chat_id,
+            "Не удалось подключиться к Telegram. Попробуйте запустить авто-выжимку позже.",
+        )
+        return
+    try:
+        primed = await prime_auto_seen(ctx, client_ready=True)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1405,7 +1426,7 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         primed = 0
     await ctx.bot.send_message(
         chat_id,
-        "Авто-выжимка активирована. Буду присылать новые релевантные публикации каждый час.",
+        "Авто-выжимка активирована. Новые релевантные публикации будут приходить сразу после выхода.",
     )
     if primed:
         await ctx.bot.send_message(
@@ -1414,7 +1435,7 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     try:
         while not ctx.chat_data.get("auto_stop"):
-            total = await auto_cycle(ctx)
+            total = await auto_cycle(ctx, client_ready=True)
             if ctx.chat_data.get("auto_stop"):
                 break
             if total:
@@ -1422,10 +1443,11 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id,
                     f"Авто-выжимка: прислано {total} новостей на апрув.",
                 )
-            for _ in range(60):
+            sleep_seconds = 5 if total else 10
+            for _ in range(sleep_seconds):
                 if ctx.chat_data.get("auto_stop"):
                     break
-                await asyncio.sleep(60)
+                await asyncio.sleep(1)
     except asyncio.CancelledError:
         logging.info("Авто-выжимка принудительно остановлена")
     except Exception:
@@ -1445,6 +1467,11 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             logging.exception(
                 "Не удалось отправить уведомление об остановке авто-выжимки"
             )
+        finally:
+            try:
+                await tg_client.disconnect()
+            except Exception:
+                logging.exception("Не удалось отключить Telethon клиент после авто-выжимки")
 
 
 async def run_seq_all(ctx, from_d: str | None = None, to_d: str | None = None, limit: int | None = None) -> bool:
