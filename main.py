@@ -30,6 +30,8 @@ import random
 import traceback
 import json  # НОВОВВЕДЕНИЕ: Для работы с файлом статусов API ключей
 import datetime  # НОВОВВЕДЕНИЕ: Для работы со временем сброса лимитов
+import io
+import uuid
 from dateutil.parser import parse as parse_datetime  # Для парсинга ISO дат, если понадобится при чтении
 from dateutil.relativedelta import relativedelta  # Для парсинга "1m", "60s"
 # Utilities for HTML parsing and shutdown handling
@@ -49,6 +51,9 @@ def app_path(name: str) -> str:
 
 DEFAULT_CONFIG_FILE = "settings.ini"
 DEFAULT_MODEL = "gpt-5-nano"
+BATCH_COMPLETION_WINDOW = "24h"
+BATCH_POLL_INTERVAL_SECONDS = 2.0
+BATCH_MAX_WAIT_SECONDS = 600
 MAX_FILENAME_LENGTH = 100
 MAX_RETRY_PASSES = 3
 # Количество попыток генерации для одного ключевого слова
@@ -780,6 +785,26 @@ class TextGeneratorApp(ctk.CTkFrame):
                 self.log_message(f"Ключ {api_key[:7]}... более не активен. Обновление очереди...", "INFO")
                 self._repopulate_available_api_key_queue()
 
+    def _mark_api_key_batch_success(self, api_key):
+        if not api_key:
+            return
+        with self.api_key_statuses_lock:
+            status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
+            status_entry["status"] = "active"
+            status_entry["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            status_entry["error_message"] = ""
+            self.api_key_statuses[api_key] = status_entry
+
+    def _mark_api_key_batch_error(self, api_key, message):
+        if not api_key:
+            return
+        with self.api_key_statuses_lock:
+            status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
+            status_entry["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            status_entry["status"] = "error"
+            status_entry["error_message"] = str(message)[:500]
+            self.api_key_statuses[api_key] = status_entry
+
     def create_widgets(self):
         main_frame = ctk.CTkFrame(self)
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
@@ -1398,31 +1423,130 @@ class TextGeneratorApp(ctk.CTkFrame):
                     normalized_message["content"] = _normalize_message_content(role, message.get("content"))
                     formatted_messages.append(normalized_message)
 
-                raw_response = client_instance.responses.with_raw_response.create(
-                    model=DEFAULT_MODEL,
-                    input=formatted_messages,
-                    timeout=300,
-                )
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
-                with api_key_last_call_time_lock:
-                    api_key_last_call_time[api_key_used_for_call] = time.time()
-                if hasattr(completion, "output_text") and completion.output_text:
-                    return completion.output_text.strip()
-                if hasattr(completion, "output") and completion.output:
-                    # Новые модели Batch API возвращают список блоков контента
+                batch_custom_id = f"req-{uuid.uuid4()}"
+                batch_request = {
+                    "custom_id": batch_custom_id,
+                    "method": "POST",
+                    "url": "/v1/responses",
+                    "body": {
+                        "model": DEFAULT_MODEL,
+                        "input": formatted_messages,
+                    },
+                }
+
+                jsonl_payload = json.dumps(batch_request, ensure_ascii=False) + "\n"
+                input_file_id = None
+                output_file_id = None
+                try:
+                    upload_response = client_instance.files.create(
+                        purpose="batch",
+                        file=(
+                            f"batch-{batch_custom_id}.jsonl",
+                            io.BytesIO(jsonl_payload.encode("utf-8")),
+                        ),
+                    )
+                    input_file_id = getattr(upload_response, "id", None)
+                    if not input_file_id:
+                        raise RuntimeError("Не удалось получить идентификатор загруженного batch-файла")
+
+                    batch_job = client_instance.batches.create(
+                        input_file_id=input_file_id,
+                        endpoint="/v1/responses",
+                        completion_window=BATCH_COMPLETION_WINDOW,
+                    )
+
+                    batch_id = getattr(batch_job, "id", None)
+                    if not batch_id:
+                        raise RuntimeError("Не удалось получить идентификатор созданного batch-задания")
+
+                    poll_started_at = time.time()
+                    last_status = None
+                    while True:
+                        if self.stop_event.is_set():
+                            self.log_message(
+                                f"Batch {batch_id} прерван из-за остановки приложения.",
+                                "WARNING",
+                            )
+                            return None
+
+                        if time.time() - poll_started_at > BATCH_MAX_WAIT_SECONDS:
+                            raise TimeoutError(
+                                f"Batch {batch_id} не завершен в течение {BATCH_MAX_WAIT_SECONDS} секунд"
+                            )
+
+                        current_batch = client_instance.batches.retrieve(batch_id)
+                        status = getattr(current_batch, "status", None)
+                        if status != last_status:
+                            self.log_message(
+                                f"Batch {batch_id} статус: {status}",
+                                "DEBUG",
+                            )
+                            last_status = status
+
+                        if status == "completed":
+                            output_file_id = getattr(current_batch, "output_file_id", None)
+                            break
+                        if status in {"failed", "cancelled", "expired"}:
+                            raise RuntimeError(f"Batch {batch_id} завершился со статусом '{status}'")
+
+                        time.sleep(BATCH_POLL_INTERVAL_SECONDS)
+
+                    if not output_file_id:
+                        raise RuntimeError(f"Batch {batch_id} не вернул output_file_id")
+
+                    with client_instance.files.content(output_file_id) as output_stream:
+                        output_bytes = output_stream.read()
+                    if not isinstance(output_bytes, (bytes, bytearray)):
+                        output_bytes = str(output_bytes).encode("utf-8")
+
+                    decoded_output = output_bytes.decode("utf-8")
                     collected_chunks = []
-                    for item in completion.output:
-                        if not hasattr(item, "content") or not item.content:
+                    parsed_text = None
+                    for line in decoded_output.splitlines():
+                        if not line.strip():
                             continue
-                        for content_piece in item.content:
-                            text_value = getattr(content_piece, "text", None)
-                            if text_value:
-                                collected_chunks.append(text_value)
-                    if collected_chunks:
-                        return "\n".join(collected_chunks).strip()
-                return None
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError as decode_err:
+                            self.log_message(
+                                f"Batch {batch_id} не удалось распарсить строку JSON: {decode_err} | {line[:120]}",
+                                "ERROR",
+                            )
+                            continue
+                        if record.get("error"):
+                            raise RuntimeError(
+                                f"Batch {batch_id} вернул ошибку: {record['error']}"
+                            )
+                        response_payload = record.get("response") or {}
+                        if response_payload.get("output_text"):
+                            parsed_text = response_payload["output_text"].strip()
+                            break
+                        output_blocks = response_payload.get("output") or []
+                        for block in output_blocks:
+                            for content_piece in block.get("content", []) or []:
+                                text_value = content_piece.get("text")
+                                if text_value:
+                                    collected_chunks.append(text_value)
+                    if parsed_text is None and collected_chunks:
+                        parsed_text = "\n".join(collected_chunks).strip()
+
+                    if parsed_text:
+                        with api_key_last_call_time_lock:
+                            api_key_last_call_time[api_key_used_for_call] = time.time()
+                        self._mark_api_key_batch_success(api_key_used_for_call)
+                        return parsed_text
+                    return None
+                finally:
+                    if output_file_id:
+                        try:
+                            client_instance.files.delete(output_file_id)
+                        except Exception:
+                            pass
+                    if input_file_id:
+                        try:
+                            client_instance.files.delete(input_file_id)
+                        except Exception:
+                            pass
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
@@ -1448,6 +1572,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.log_message(f"Ожидание {current_delay} секунд перед следующей попыткой...",
                                      "INFO"); time.sleep(current_delay)
                 else:
+                    self._mark_api_key_batch_error(api_key_used_for_call, rle)
                     return None
             except APIStatusError as ase:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
@@ -1488,6 +1613,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                     self.log_message(f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
                                      "INFO"); time.sleep(current_delay)
                 else:
+                    self._mark_api_key_batch_error(api_key_used_for_call, ase)
                     return None
             except APIConnectionError as ace:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
@@ -1496,12 +1622,14 @@ class TextGeneratorApp(ctk.CTkFrame):
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
                 else:
+                    self._mark_api_key_batch_error(api_key_used_for_call, ace)
                     return None
             except Exception as e:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(
                     f"Неожиданная ошибка OpenAI API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
                     log_level)
+                self._mark_api_key_batch_error(api_key_used_for_call, e)
                 current_delay = delay_seconds * (attempt + 1)
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
