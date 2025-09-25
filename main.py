@@ -2,6 +2,8 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog  # ttk может понадобиться для таблицы, но постараемся обойтись CTk
 import requests
+import tempfile
+import uuid
 
 try:
     from customtkinter.windows import ctk_toplevel
@@ -84,6 +86,8 @@ MAX_TOC_TOTAL_CHARS = 2000
 PER_KEY_CALL_INTERVAL = 0.05
 # НОВОВВЕДЕНИЕ: Имя файла для статусов API ключей и мьютекс для доступа к нему
 API_KEY_STATUSES_FILE = "api_key_statuses.json"  # НОВОВВЕДЕНИЕ
+BATCH_POLL_INTERVAL_SECONDS = 2.0
+BATCH_MAX_WAIT_SECONDS = 600
 
 # Файлы для совместного использования API ключей и списка проектов
 SHARED_KEYS_FILE = "shared_keys.txt"
@@ -1350,6 +1354,124 @@ class TextGeneratorApp(ctk.CTkFrame):
                         return True
         return False
 
+    def _execute_batch_chat_completion(self, client_instance, messages, api_key_used_for_call, log_prefix=""):
+        """Submit a single chat completion request via the Batch API and wait for the result."""
+        request_custom_id = f"request-{uuid.uuid4()}"
+        batch_request_line = {
+            "custom_id": request_custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": DEFAULT_MODEL,
+                "messages": messages,
+            },
+        }
+
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl", delete=False) as tmp_file:
+                temp_file_path = tmp_file.name
+                tmp_file.write(json.dumps(batch_request_line, ensure_ascii=False))
+                tmp_file.write("\n")
+        except Exception as e_prepare:
+            raise RuntimeError(f"Не удалось подготовить Batch запрос: {e_prepare}") from e_prepare
+
+        try:
+            with open(temp_file_path, "rb") as input_file:
+                batch_input_file = client_instance.files.create(file=input_file, purpose="batch")
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
+                    pass
+
+        if log_prefix:
+            self.log_message(f"{log_prefix} Batch input файл загружен: {batch_input_file.id}", "DEBUG")
+
+        batch = client_instance.batches.create(
+            input_file_id=batch_input_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+
+        if log_prefix:
+            self.log_message(f"{log_prefix} Batch запрос создан: {batch.id}", "DEBUG")
+
+        start_time = time.time()
+        while True:
+            if self.stop_event.is_set():
+                raise RuntimeError("Операция Batch API остановлена пользователем.")
+
+            batch_status = client_instance.batches.retrieve(batch.id)
+            status = getattr(batch_status, "status", None)
+
+            if status == "completed":
+                break
+            if status in {"failed", "cancelled", "expired"}:
+                return None, self._read_batch_error_file(client_instance, getattr(batch_status, "error_file_id", None)), status, request_custom_id
+
+            if time.time() - start_time > BATCH_MAX_WAIT_SECONDS:
+                raise TimeoutError("Превышено время ожидания выполнения Batch запроса")
+
+            time.sleep(BATCH_POLL_INTERVAL_SECONDS)
+
+        output_file_id = getattr(batch_status, "output_file_id", None)
+        response_entry = None
+        if output_file_id:
+            file_response = client_instance.files.content(output_file_id)
+            if hasattr(file_response, "text"):
+                content_text = file_response.text
+            else:
+                content_bytes = getattr(file_response, "read", lambda: b"")()
+                content_text = content_bytes.decode("utf-8", "ignore") if isinstance(content_bytes, (bytes, bytearray)) else ""
+            for line in content_text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("custom_id") == request_custom_id:
+                    response_entry = payload
+                    break
+        else:
+            if log_prefix:
+                self.log_message(f"{log_prefix} Batch завершился без выходного файла.", "ERROR")
+
+        error_entries = self._read_batch_error_file(client_instance, getattr(batch_status, "error_file_id", None))
+
+        if log_prefix and error_entries:
+            for error_entry in error_entries:
+                self.log_message(
+                    f"{log_prefix} Ошибка Batch: {error_entry}",
+                    "ERROR",
+                )
+
+        return response_entry, error_entries, getattr(batch_status, "status", None), request_custom_id
+
+    def _read_batch_error_file(self, client_instance, error_file_id):
+        if not error_file_id:
+            return []
+        try:
+            error_response = client_instance.files.content(error_file_id)
+            if hasattr(error_response, "text"):
+                error_text = error_response.text
+            else:
+                error_bytes = getattr(error_response, "read", lambda: b"")()
+                error_text = error_bytes.decode("utf-8", "ignore") if isinstance(error_bytes, (bytes, bytearray)) else ""
+        except Exception:
+            return []
+        errors = []
+        for line in error_text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                errors.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return errors
+
     def call_openai_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
         for attempt in range(retries):
             if self.stop_event.is_set():
@@ -1361,14 +1483,13 @@ class TextGeneratorApp(ctk.CTkFrame):
             if to_wait > 0:
                 time.sleep(to_wait)
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
-                with api_key_last_call_time_lock:
-                    api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
+                key_short = f"{api_key_used_for_call[:7]}..." if api_key_used_for_call else "API"
+                response_entry, error_entries, batch_status, request_custom_id = self._execute_batch_chat_completion(
+                    client_instance,
+                    messages,
+                    api_key_used_for_call,
+                    log_prefix=f"[Batch {key_short}]",
+                )
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
@@ -1443,6 +1564,20 @@ class TextGeneratorApp(ctk.CTkFrame):
                     time.sleep(current_delay)
                 else:
                     return None
+            except TimeoutError as timeout_error:
+                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
+                self.log_message(
+                    f"Batch API не ответил вовремя ({timeout_error}). Попытка {attempt + 1}/{retries}.",
+                    log_level,
+                )
+                current_delay = delay_seconds * (attempt + 1)
+                if attempt + 1 < retries:
+                    time.sleep(current_delay)
+                else:
+                    return None
+            except RuntimeError as runtime_error:
+                self.log_message(f"Batch API остановлен: {runtime_error}", "WARNING")
+                return None
             except Exception as e:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(
@@ -1453,6 +1588,125 @@ class TextGeneratorApp(ctk.CTkFrame):
                     time.sleep(current_delay)
                 else:
                     return None
+            else:
+                error_entry_for_request = None
+                for err in error_entries or []:
+                    if err.get("custom_id") == request_custom_id:
+                        error_entry_for_request = err
+                        break
+
+                if response_entry is None:
+                    status_note = batch_status or "unknown"
+                    if error_entry_for_request:
+                        error_info = error_entry_for_request.get("error", {})
+                        self.log_message(
+                            f"Batch API не вернул ответ (статус {status_note}). Ошибка: {error_info}",
+                            "ERROR",
+                        )
+                        if error_info.get("code") == "batch_expired":
+                            return None
+                    else:
+                        self.log_message(
+                            f"Batch API не вернул ответ (статус {status_note}).", "ERROR"
+                        )
+                    current_delay = delay_seconds * (2 ** attempt)
+                    if attempt + 1 < retries:
+                        self.log_message(
+                            f"Ожидание {current_delay} секунд перед следующей попыткой...",
+                            "INFO",
+                        )
+                        time.sleep(current_delay)
+                        continue
+                    return None
+
+                if response_entry.get("error"):
+                    self.log_message(f"Batch API вернул ошибку: {response_entry['error']}", "ERROR")
+
+                response_obj = response_entry.get("response", {}) if isinstance(response_entry, dict) else {}
+                status_code = response_obj.get("status_code") if isinstance(response_obj, dict) else None
+                response_body = response_obj.get("body") if isinstance(response_obj, dict) else None
+                error_body = {}
+                if isinstance(response_body, dict):
+                    error_value = response_body.get("error")
+                    if isinstance(error_value, dict):
+                        error_body = error_value
+                    elif isinstance(error_value, str):
+                        error_body = {"message": error_value}
+
+                if status_code == 200:
+                    message_content = None
+                    if isinstance(response_body, dict):
+                        choices = response_body.get("choices")
+                        if isinstance(choices, list) and choices:
+                            first_choice = choices[0] or {}
+                            if isinstance(first_choice, dict):
+                                message_dict = first_choice.get("message") or {}
+                                if isinstance(message_dict, dict):
+                                    message_content = message_dict.get("content")
+                    if message_content:
+                        with api_key_last_call_time_lock:
+                            api_key_last_call_time[api_key_used_for_call] = time.time()
+                        return message_content.strip()
+                    self.log_message("Batch API вернул пустое сообщение.", "ERROR")
+                    return None
+
+                if status_code == 401:
+                    self.log_message(
+                        f"Ошибка 401: Недействительный API ключ {api_key_used_for_call[:7]}.... Ключ будет обработан как невалидный.",
+                        "ERROR",
+                    )
+                    return "INVALID_API_KEY_ERROR"
+
+                if status_code == 429:
+                    specific_error_type = None
+                    if isinstance(error_body, dict):
+                        specific_error_type = error_body.get("type")
+                    if specific_error_type in ['billing_not_active', 'insufficient_quota']:
+                        self.log_message(
+                            f"APIStatusError 429 тип '{specific_error_type}'. Ключ {api_key_used_for_call[:7]}... будет обработан как невалидный.",
+                            "ERROR",
+                        )
+                        return "INVALID_API_KEY_ERROR"
+                    self.log_message("Получен статус 429 (Batch Rate Limit).", "WARNING")
+                    current_delay = delay_seconds * (2 ** attempt) * 1.5
+                    if attempt + 1 < retries:
+                        self.log_message(
+                            f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
+                            "INFO",
+                        )
+                        time.sleep(current_delay)
+                        continue
+                    return None
+
+                if status_code and status_code >= 500:
+                    self.log_message(
+                        f"Batch API вернул статус {status_code}. Повторная попытка.",
+                        "WARNING",
+                    )
+                    current_delay = delay_seconds * (2 ** attempt)
+                    if attempt + 1 < retries:
+                        time.sleep(current_delay)
+                        continue
+                    return None
+
+                if error_entry_for_request:
+                    self.log_message(
+                        f"Batch API ошибка: {error_entry_for_request.get('error')}",
+                        "ERROR",
+                    )
+
+                if status_code:
+                    self.log_message(
+                        f"Batch API вернул неожиданный статус {status_code}.", "ERROR"
+                    )
+                else:
+                    self.log_message("Batch API вернул неизвестный ответ.", "ERROR")
+
+                current_delay = delay_seconds * (attempt + 1)
+                if attempt + 1 < retries:
+                    time.sleep(current_delay)
+                    continue
+                return None
         return None
 
     # ================================================================================
