@@ -1,9 +1,12 @@
 # bot.py ────────────────────────────────────────────────────────────────────
 import json, re, html
+import os
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 import asyncio
 import logging
+import threading
 try:
     import fcntl  # POSIX locking
 except ModuleNotFoundError:  # pragma: no cover - Windows fallback
@@ -29,16 +32,33 @@ from telegram.ext import (
 
 from telethon import TelegramClient
 from telethon.tl.types import Message
-from openai import OpenAI
+from openai import OpenAI, AuthenticationError, RateLimitError
 
 # ────────────── КОНФИГ ─────────────────────────────────────────────────────
-OPENAI_API_KEY = "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"
+logging.basicConfig(level=logging.INFO)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+def _parse_admin_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            logging.warning("Пропускаю некорректный идентификатор в ADMIN_IDS: %s", chunk)
+    return ids
+
+
+ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 TELEGRAM_BOT_TOKEN   = "7621000604:AAHrWFyNx8JCrPkCtmtC4MWAV2Ri5-EpOQo"
 TG_API_ID     = "28511990"
 TG_API_HASH = "f51873d6f1402467b6188a37100754ae"
 
 
 PROCESSED_FILE = Path("processed_ids.json")
+API_DB_PATH = Path("openai_keys.sqlite3")
 PROCESSED_LIMIT = 1000
 CONCURRENCY = 5
 MODEL_NAME     = "o3-mini"
@@ -48,17 +68,225 @@ ATTEMPT_MSG    = (
     "поменяйте промпт, или выберите другой канал"
 )
 
+API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_\-]{20,}")
+TG_SPLIT_THRESHOLD = 4000
+
 # ────────────── ГЛОБАЛЬНЫЕ КЛИЕНТЫ ─────────────────────────────────────────
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+class OpenAIConfigError(RuntimeError):
+    """Raised when OpenAI configuration is missing or invalid."""
+
+
+class APIKeyManager:
+    """Manage OpenAI API keys stored in SQLite with automatic rotation."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS openai_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self._conn.commit()
+        self._keys: list[tuple[int, str]] = []
+        self._index_map: dict[int, int] = {}
+        self._clients: dict[int, OpenAI] = {}
+        self._current_index = 0
+        self._cycle_count = 0
+        self._reload_locked()
+
+    def _reload_locked(self) -> None:
+        prev_id: int | None = None
+        if self._keys and 0 <= self._current_index < len(self._keys):
+            prev_id = self._keys[self._current_index][0]
+
+        cur = self._conn.execute(
+            "SELECT id, api_key FROM openai_keys ORDER BY id"
+        )
+        rows = cur.fetchall()
+        existing_clients = self._clients
+        self._keys = rows
+        self._index_map = {row[0]: idx for idx, row in enumerate(rows)}
+        self._clients = {
+            key_id: existing_clients[key_id]
+            for key_id, _ in rows
+            if key_id in existing_clients
+        }
+
+        if prev_id is not None and prev_id in self._index_map:
+            self._current_index = self._index_map[prev_id]
+        else:
+            self._current_index = 0
+        if not self._keys:
+            self._current_index = 0
+        self._cycle_count = 0
+
+    def _raise_empty(self) -> None:
+        raise OpenAIConfigError(
+            "Нет сохранённых OpenAI API ключей. Добавьте ключи через меню “Меню API ключей”."
+        )
+
+    def _advance_after_failure(self, failed_index: int, key_id: int) -> None:
+        if not self._keys:
+            self._raise_empty()
+
+        self._clients.pop(key_id, None)
+        if not self._keys:
+            self._current_index = 0
+            return
+
+        next_index = (failed_index + 1) % len(self._keys)
+        wrapped = next_index <= failed_index if self._keys else False
+        self._current_index = next_index
+        if wrapped:
+            self._cycle_count += 1
+            if self._cycle_count >= 2:
+                raise OpenAIConfigError(
+                    "Все OpenAI API ключи дважды отклонены. Очистите список и добавьте новые ключи через меню “Меню API ключей”."
+                )
+
+    def has_keys(self) -> bool:
+        with self._lock:
+            return bool(self._keys)
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._keys)
+
+    def masked_keys(self) -> list[str]:
+        with self._lock:
+            masked: list[str] = []
+            for _, key in self._keys:
+                if len(key) <= 12:
+                    masked.append(key)
+                else:
+                    masked.append(f"{key[:8]}…{key[-4:]}")
+            return masked
+
+    def add_keys(self, keys: list[str]) -> list[str]:
+        cleaned = [k.strip() for k in keys if k.strip()]
+        if not cleaned:
+            return []
+        added: list[str] = []
+        with self._lock:
+            for key in cleaned:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO openai_keys(api_key) VALUES (?)",
+                    (key,),
+                )
+                if cur.rowcount:
+                    added.append(key)
+            self._conn.commit()
+            if added:
+                self._reload_locked()
+        return added
+
+    def clear_keys(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM openai_keys")
+            self._conn.commit()
+            self._clients.clear()
+            self._keys = []
+            self._index_map = {}
+            self._current_index = 0
+            self._cycle_count = 0
+
+    def acquire_client(self) -> tuple[int, int, OpenAI]:
+        with self._lock:
+            if not self._keys:
+                self._raise_empty()
+
+            attempts = 0
+            total = len(self._keys)
+            while attempts < total:
+                idx = self._current_index
+                key_id, key_value = self._keys[idx]
+                client = self._clients.get(key_id)
+                if client is None:
+                    try:
+                        client = OpenAI(api_key=key_value)
+                    except AuthenticationError:
+                        self._advance_after_failure(idx, key_id)
+                        attempts += 1
+                        continue
+                    self._clients[key_id] = client
+                return idx, key_id, client
+            raise OpenAIConfigError(
+                "OpenAI API ключи недействительны. Обновите список ключей через меню “Меню API ключей”."
+            )
+
+    def report_failure(self, index: int) -> None:
+        with self._lock:
+            if not self._keys:
+                self._raise_empty()
+            if index >= len(self._keys):
+                if self._keys:
+                    self._current_index = self._current_index % len(self._keys)
+                return
+            key_id, _ = self._keys[index]
+            self._advance_after_failure(index, key_id)
+
+    def report_success(self, index: int) -> None:
+        with self._lock:
+            if not self._keys:
+                self._current_index = 0
+                self._cycle_count = 0
+                return
+            if index >= len(self._keys):
+                index = 0
+            self._current_index = index
+            self._cycle_count = 0
+
+
+key_manager = APIKeyManager(API_DB_PATH)
+
+if OPENAI_API_KEY:
+    added_env = key_manager.add_keys([OPENAI_API_KEY])
+    if added_env:
+        logging.info(
+            "Добавлен OpenAI API ключ из переменной окружения. Управляйте ключами через меню “Меню API ключей”."
+        )
+
+if not key_manager.has_keys():
+    logging.warning(
+        "Не найдены OpenAI API ключи. Добавьте их через меню “Меню API ключей” или переменную окружения OPENAI_API_KEY."
+    )
 tg_client     = TelegramClient(
     "seo_news_session", TG_API_ID, TG_API_HASH, timeout=10
 )
 
-async def openai_call(method, *args, timeout=60, **kwargs):
+async def openai_call(factory, *, timeout=60):
+    """Выполнить OpenAI запрос с автоматическим перебором ключей."""
+
     loop = asyncio.get_running_loop()
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, lambda: method(*args, **kwargs)), timeout
-    )
+    while True:
+        idx, key_id, client = key_manager.acquire_client()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: factory(client)), timeout
+            )
+        except AuthenticationError:
+            key_manager.report_failure(idx)
+            continue
+        except RateLimitError:
+            logging.warning(
+                "Ключ %s исчерпал квоту или достиг лимита, переключаюсь", key_id
+            )
+            key_manager.report_failure(idx)
+            continue
+        except OpenAIConfigError:
+            raise
+        except Exception:
+            # неудачи OpenAI не связанные с ключами не переключают ключ
+            raise
+        else:
+            key_manager.report_success(idx)
+            return result
 
 @contextmanager
 def file_lock():
@@ -82,8 +310,6 @@ def file_lock():
                 except OSError:
                     pass
 
-logging.basicConfig(level=logging.INFO)
-
 # Defaults for the filter prompt are defined before the dataclass so the
 # attributes can use them directly without a NameError.
 DEFAULT_PROMPT_YES = (
@@ -96,6 +322,7 @@ DEFAULT_PROMPT_NO = "реклама, эфир, подкаст, мерч, вак�
 class ChatConfig:
     channels: list[str] = field(default_factory=list)
     ids: dict[str, deque] = field(default_factory=dict)
+    auto_last: dict[str, int] = field(default_factory=dict)
     prompt_yes: str = DEFAULT_PROMPT_YES
     prompt_no: str = DEFAULT_PROMPT_NO
     log_enabled: bool = False
@@ -104,6 +331,33 @@ class ChatConfig:
         return build_filter_prompt(self.prompt_yes, self.prompt_no)
 
 ALL_CHATS: dict[str, ChatConfig] = {}
+
+
+@dataclass
+class AutoCandidate:
+    """Информация о посте, подготовленном для выбора лучшего из десятки."""
+
+    channel: str
+    msg_id: int
+    source: str
+    link: str
+    digest: dict
+    body: str
+
+    def choice_summary(self) -> str:
+        title = str(self.digest.get("title", "")).strip()
+        summary = str(self.digest.get("summary", "")).strip()
+        if summary and len(summary) > 400:
+            summary = summary[:400].rstrip() + "…"
+        highlights = [str(item).strip() for item in self.digest.get("highlights", []) if item]
+        parts = [f"Источник: {self.source}"]
+        if title:
+            parts.append(f"Заголовок: {title}")
+        if summary:
+            parts.append(f"Суть: {summary}")
+        if highlights:
+            parts.append("Факты: " + "; ".join(highlights[:3]))
+        return "\n".join(parts)
 
 async def log(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     cfg = get_cfg(ctx)
@@ -152,11 +406,30 @@ def load_data() -> dict[str, ChatConfig]:
         if not isinstance(cfg, dict):
             continue
         chs = [str(c).split(":")[0].lstrip("@") for c in cfg.get("channels", [])]
-        ids = {c: deque(map(int, v), maxlen=PROCESSED_LIMIT) for c, v in cfg.get("ids", {}).items()}
+        ids = {
+            c: deque(map(int, v), maxlen=PROCESSED_LIMIT)
+            for c, v in cfg.get("ids", {}).items()
+        }
+        raw_auto = cfg.get("auto_last", {})
+        auto_last: dict[str, int] = {}
+        if isinstance(raw_auto, dict):
+            for c, v in raw_auto.items():
+                key = str(c).split(":")[0].lstrip("@")
+                try:
+                    auto_last[key] = int(v)
+                except (TypeError, ValueError):
+                    continue
         p_yes = cfg.get("prompt_if_yes", DEFAULT_PROMPT_YES)
         p_no = cfg.get("prompt_if_no", DEFAULT_PROMPT_NO)
         log_en = bool(cfg.get("log_enabled", False))
-        data[str(chat_id)] = ChatConfig(chs, ids, p_yes, p_no, log_en)
+        data[str(chat_id)] = ChatConfig(
+            channels=chs,
+            ids=ids,
+            auto_last=auto_last,
+            prompt_yes=p_yes,
+            prompt_no=p_no,
+            log_enabled=log_en,
+        )
 
     return data
 
@@ -173,9 +446,18 @@ def save_all() -> None:
                 seen.add(c)
                 uniq.append(c)
         cfg.channels = uniq
+        auto_last = {}
+        for c in cfg.auto_last:
+            key = str(c).split(":")[0].lstrip("@")
+            if key in cfg.channels:
+                try:
+                    auto_last[key] = int(cfg.auto_last[c])
+                except (TypeError, ValueError):
+                    continue
         data[cid] = {
             "channels": cfg.channels,
             "ids": {c: list(v) for c, v in cfg.ids.items()},
+            "auto_last": auto_last,
             "prompt_if_yes": cfg.prompt_yes,
             "prompt_if_no": cfg.prompt_no,
             "log_enabled": cfg.log_enabled,
@@ -196,10 +478,62 @@ def get_cfg(ctx: ContextTypes.DEFAULT_TYPE) -> ChatConfig:
     return ALL_CHATS[chat_id]
 
 
+def mark_processed(cfg: ChatConfig, key: str, msg_id: int) -> bool:
+    """Запомнить ID обработанного поста и обновить последний авто-порог."""
+
+    seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+    already = msg_id in seen
+    changed = False
+    if not already:
+        seen.append(msg_id)
+        changed = True
+    try:
+        numeric_id = int(msg_id)
+    except (TypeError, ValueError):
+        numeric_id = 0
+    if numeric_id and numeric_id > cfg.auto_last.get(key, 0):
+        cfg.auto_last[key] = numeric_id
+        changed = True
+    return changed
+
+
 def task_running(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     t = ctx.chat_data.get("task")
     return bool(t) and not t.done()
 
+
+async def stop_auto_cycle(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    wait: bool = False,
+    timeout: float = 5.0,
+) -> None:
+    """Request graceful shutdown of the авто-выжимка loop.
+
+    The helper sets the common stop flags and optionally waits for the
+    background task to finish after sending it a cancellation signal.
+    """
+
+    ctx.chat_data["stop"] = True
+    ctx.chat_data["auto_stop"] = True
+
+    task = ctx.chat_data.get("auto_task")
+    if not task or task.done():
+        return
+
+    task.cancel()
+
+    if not wait:
+        return
+
+    try:
+        await asyncio.wait_for(task, timeout)
+    except asyncio.TimeoutError:
+        logging.warning("Не удалось остановить авто-выжимку за %s сек", timeout)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logging.exception("Ошибка при ожидании остановки авто-выжимки")
 
 def launch_task(ctx: ContextTypes.DEFAULT_TYPE, coro) -> None:
     task = ctx.application.create_task(coro)
@@ -241,20 +575,25 @@ async def ai_check(cfg: ChatConfig, text: str) -> tuple[bool, str | None]:
         {"role": "system", "content": cfg.filter_prompt()},
         {"role": "user", "content": text[:4000]},
     ]
-    rsp = await openai_call(openai_client.chat.completions.create, model=MODEL_NAME, messages=base)
+    rsp = await openai_call(
+        lambda client: client.chat.completions.create(
+            model=MODEL_NAME, messages=base
+        )
+    )
     answer = rsp.choices[0].message.content.strip()
     ok = answer.lower().startswith("y")
     reason = None
 
     if not ok and cfg.log_enabled:
         rsp2 = await openai_call(
-            openai_client.chat.completions.create,
-            model=MODEL_NAME,
-            messages=base
-            + [
-                {"role": "assistant", "content": answer},
-                {"role": "user", "content": "Кратко объясни почему NO"},
-            ],
+            lambda client: client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=base
+                + [
+                    {"role": "assistant", "content": answer},
+                    {"role": "user", "content": "Кратко объясни почему NO"},
+                ],
+            )
         )
         reason = rsp2.choices[0].message.content.strip()
 
@@ -262,15 +601,101 @@ async def ai_check(cfg: ChatConfig, text: str) -> tuple[bool, str | None]:
 
 async def paraphrase(text: str) -> str:
     rsp = await openai_call(
-        openai_client.chat.completions.create,
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system",
-             "content": "Ты русскоязычный SEO-журналист. Перепиши текст лёгким рерайтом, сохрани факты."},
-            {"role": "user", "content": text.strip()},
-        ],
+        lambda client: client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты русскоязычный SEO-журналист. Перепиши текст лёгким "
+                        "рерайтом, сохрани факты."
+                    ),
+                },
+                {"role": "user", "content": text.strip()},
+            ],
+        )
     )
     return rsp.choices[0].message.content.strip()
+
+
+async def build_digest_payload(text: str) -> dict:
+    """Сформировать компактную выжимку поста через OpenAI."""
+
+    instruction = (
+        "Ты работаешь редактором Telegram-канала про SEO и маркетинг. "
+        "Проанализируй оригинальную публикацию и составь короткий анонс "
+        "в деловом стиле. Выдели главную мысль и конкретные полезные факты. "
+        "Ответ верни в строгом JSON-формате со следующими полями: "
+        "emoji (один подходящий эмодзи), title (до 100 символов), "
+        "summary (2–3 предложения с ключевыми фактами), "
+        "highlights (список из 0–4 коротких выводов или рекомендаций). "
+        "Не добавляй никакого текста вне JSON."
+    )
+
+    rsp = await openai_call(
+        lambda client: client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": text.strip()},
+            ],
+        )
+    )
+    raw = rsp.choices[0].message.content.strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.warning("Не удалось разобрать JSON от OpenAI, используем запасной формат")
+        data = {
+            "emoji": "📝",
+            "title": raw.splitlines()[0][:100] if raw else "Новая публикация",
+            "summary": raw,
+            "highlights": [],
+        }
+
+    if not isinstance(data, dict):
+        data = {
+            "emoji": "📝",
+            "title": "Новая публикация",
+            "summary": raw,
+            "highlights": [],
+        }
+
+    data.setdefault("emoji", "📝")
+    data.setdefault("title", "Новая публикация")
+    data.setdefault("summary", "")
+    hl = data.get("highlights")
+    if not isinstance(hl, list):
+        hl = []
+    data["highlights"] = [str(item) for item in hl[:4]]
+    return data
+
+
+def render_digest(data: dict, source: str, link: str) -> str:
+    emoji = html.escape(str(data.get("emoji", "📝")))
+    title = html.escape(str(data.get("title", "Новая публикация")))
+    summary = html.escape(str(data.get("summary", "")))
+    highlights = [html.escape(str(item)) for item in data.get("highlights", []) if item]
+
+    parts: list[str] = []
+    parts.append(f"{emoji} <b>{title}</b>")
+    if summary:
+        parts.append("")
+        parts.append(summary)
+    if highlights:
+        parts.append("")
+        parts.append("\n".join(f"• {item}" for item in highlights))
+
+    src = html.escape(source)
+    if link:
+        link_attr = html.escape(link)
+        source_line = f"Источник: <a href='{link_attr}'>{src}</a>"
+    else:
+        source_line = f"Источник: {src}"
+    parts.append("")
+    parts.append(source_line)
+    body = "\n".join(part for part in parts if part is not None)
+    return body[:4090]
 
 # ────────────── TELETHON helpers ───────────────────────────────────────────
 def quick_score(m: Message) -> int:
@@ -283,44 +708,57 @@ async def fetch_posts(
     limit: int | None = None,
     by_popularity: bool = False,
 ) -> list[Message]:
+    async def collect(target) -> list[Message]:
+        collected: list[Message] = []
+        iter_kwargs: dict[str, int] = {}
+        if limit:
+            # Берём небольшой запас, чтобы после фильтрации по дате осталось
+            # достаточно сообщений.
+            iter_kwargs["limit"] = max(limit * 2, 50)
+        try:
+            async for msg in tg_client.iter_messages(target, **iter_kwargs):
+                if not msg.text:
+                    continue
+                dt = msg.date.replace(tzinfo=None)
+                if to_dt and dt > to_dt:
+                    continue
+                if from_dt and dt < from_dt:
+                    # iter_messages возвращает посты от новых к старым, поэтому
+                    # можно остановиться, когда ушли ниже диапазона.
+                    break
+                collected.append(msg)
+                if limit and len(collected) >= limit:
+                    break
+        except Exception:
+            raise
+        return collected
+
     try:
-        msgs = [
-            m
-            async for m in tg_client.iter_messages(channel)
-            if m.text
-        ]
+        msgs = await collect(channel)
     except ValueError:
         if isinstance(channel, str) and channel.lstrip("-").isdigit():
-            msgs = [
-                m
-                async for m in tg_client.iter_messages(int(channel))
-                if m.text
-            ]
+            msgs = await collect(int(channel))
         else:
             raise
     except Exception:
         logging.exception("Failed to fetch posts")
         return []
-    if from_dt or to_dt:
-        msgs = [
-            m
-            for m in msgs
-            if (from_dt or datetime.min)
-            <= m.date.replace(tzinfo=None)
-            <= (to_dt or datetime.max)
-        ]
+
     if by_popularity:
         msgs.sort(key=quick_score, reverse=True)
     else:
         msgs.sort(key=lambda m: m.date)
-    if limit:
-        msgs = msgs[:limit]
+    if limit and not by_popularity:
+        msgs = msgs[-limit:]
     return msgs
 
 async def process_and_send(
     ctx: ContextTypes.DEFAULT_TYPE,
     msg: Message,
     chan: str,
+    *,
+    mode: str | None = None,
+    notify: bool = True,
 ):
     if ctx.chat_data.get("stop"):
         return False
@@ -331,55 +769,302 @@ async def process_and_send(
         await log(ctx, f"Пропускаю {msg.id}: уже обработан")
         return False
     await log(ctx, f"Проверяю пост {msg.id} из {chan}")
-    ai_ok, reason = await ai_check(cfg, msg.text)
+    try:
+        ai_ok, reason = await ai_check(cfg, msg.text)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return False
+    except Exception:
+        logging.exception("AI filter failed")
+        await log(ctx, f"AI ошибка при обработке {msg.id}")
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return False
     if ctx.chat_data.get("stop"):
         return False
     await log(ctx, f"AI ответ для {msg.id}: {'YES' if ai_ok else 'NO'}")
     if not ai_ok:
         if reason:
             await log(ctx, reason)
-        seen.append(msg.id)
+        mark_processed(cfg, key, msg.id)
         save_all()
         return False
     if ctx.chat_data.get("stop"):
         return False
-    await log(ctx, f"Перефразируем пост {msg.id}")
-    rewritten = html.escape(await paraphrase(msg.text))
-    if ctx.chat_data.get("stop"):
-        return False
+    mode = mode or ctx.chat_data.get("output_mode", "rewrite")
     username = getattr(msg.chat, "username", None) or chan.lstrip("@")
     link = (
         f"https://t.me/{username}/{msg.id}" if username and not username.lstrip("-").isdigit() else ""
     )
-    footer = (
-        f"\n\n<b>Дата публикации:</b> {msg.date.strftime('%d.%m.%Y %H:%M')} "
-        f"| <b>Просмотров:</b> {msg.views or 0}"
-    )
-    src = f"@{username}" if username and not username.lstrip("-").isdigit() else chan
-    src = html.escape(src)
-    link_attr = f" href='{html.escape(link)}'" if link else ""
-    body = (
-        f"<b>Источник:</b> <a{link_attr}>{src}</a>\n\n"
-        f"{rewritten}{footer}"
-    )[:4090]
-    await ctx.bot.send_message(
-        chat_id=ctx.chat_data["target_chat"],
-        text=body,
-        parse_mode=tg_const.ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    raw_src = f"@{username}" if username and not username.lstrip("-").isdigit() else chan
+    escaped_src = html.escape(raw_src)
+    parse_mode = tg_const.ParseMode.HTML
+    disable_preview = True
+
+    if mode == "digest":
+        await log(ctx, f"Формируем выжимку для поста {msg.id}")
+        if ctx.chat_data.get("stop"):
+            return False
+        try:
+            digest = await build_digest_payload(msg.text)
+        except asyncio.CancelledError:
+            raise
+        except OpenAIConfigError as exc:
+            await log(ctx, str(exc))
+            mark_processed(cfg, key, msg.id)
+            save_all()
+            return False
+        except Exception:
+            logging.exception("Failed to build digest")
+            await log(ctx, f"Не удалось построить выжимку для {msg.id}")
+            mark_processed(cfg, key, msg.id)
+            save_all()
+            return False
+        if ctx.chat_data.get("stop"):
+            return False
+        body = render_digest(digest, raw_src, link)
+    else:
+        await log(ctx, f"Перефразируем пост {msg.id}")
+        if ctx.chat_data.get("stop"):
+            return False
+        try:
+            rewritten = html.escape(await paraphrase(msg.text))
+        except asyncio.CancelledError:
+            raise
+        except OpenAIConfigError as exc:
+            await log(ctx, str(exc))
+            mark_processed(cfg, key, msg.id)
+            save_all()
+            return False
+        except Exception:
+            logging.exception("Failed to paraphrase message")
+            await log(ctx, f"Не удалось перефразировать {msg.id}")
+            mark_processed(cfg, key, msg.id)
+            save_all()
+            return False
+        if ctx.chat_data.get("stop"):
+            return False
+        footer = (
+            f"\n\n<b>Дата публикации:</b> {msg.date.strftime('%d.%m.%Y %H:%M')} "
+            f"| <b>Просмотров:</b> {msg.views or 0}"
+        )
+        link_attr = f" href='{html.escape(link)}'" if link else ""
+        body = (
+            f"<b>Источник:</b> <a{link_attr}>{escaped_src}</a>\n\n"
+            f"{rewritten}{footer}"
+        )[:4090]
+    try:
+        await ctx.bot.send_message(
+            chat_id=ctx.chat_data["target_chat"],
+            text=body,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_preview,
+        )
+    except Exception:
+        logging.exception("Failed to send processed message to target chat")
+        await log(ctx, f"Отправка сообщения {msg.id} завершилась ошибкой")
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return False
     await log(ctx, f"Отправлено сообщение {msg.id}")
     if ctx.chat_data.get("stop"):
         return True
     log_count = ctx.chat_data.get("sent", 0) + 1
     ctx.chat_data["sent"] = log_count
-    await ctx.bot.send_message(
-        chat_id=ctx.chat_data["target_chat"],
-        text=f"✅ Сообщение {log_count} из канала {chan} отправлено",
-    )
-    seen.append(msg.id)
+    if notify:
+        try:
+            await ctx.bot.send_message(
+                chat_id=ctx.chat_data["target_chat"],
+                text=f"✅ Сообщение {log_count} из канала {chan} отправлено",
+            )
+        except Exception:
+            logging.exception("Failed to send confirmation message")
+    mark_processed(cfg, key, msg.id)
     save_all()
     return True
+
+
+async def prepare_auto_candidate(
+    ctx: ContextTypes.DEFAULT_TYPE, msg: Message, chan: str
+) -> AutoCandidate | None:
+    """Подготовить пост для режима "10 постов": сделать выжимку без отправки."""
+
+    if ctx.chat_data.get("stop"):
+        return None
+
+    cfg = get_cfg(ctx)
+    key = chan.lstrip("@")
+    seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+    if msg.id in seen:
+        await log(ctx, f"Пропускаю {msg.id}: уже обработан")
+        return None
+
+    await log(ctx, f"Проверяю пост {msg.id} из {chan}")
+    try:
+        ai_ok, reason = await ai_check(cfg, msg.text)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+    except Exception:
+        logging.exception("AI filter failed (batch mode)")
+        await log(ctx, f"AI ошибка при обработке {msg.id}")
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+
+    if ctx.chat_data.get("stop"):
+        return None
+
+    await log(ctx, f"AI ответ для {msg.id}: {'YES' if ai_ok else 'NO'}")
+    if not ai_ok:
+        if reason:
+            await log(ctx, reason)
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+
+    username = getattr(msg.chat, "username", None) or chan.lstrip("@")
+    link = (
+        f"https://t.me/{username}/{msg.id}"
+        if username and not username.lstrip("-").isdigit()
+        else ""
+    )
+    raw_src = f"@{username}" if username and not username.lstrip("-").isdigit() else chan
+
+    await log(ctx, f"Формируем выжимку для поста {msg.id} (режим 10)")
+    try:
+        digest = await build_digest_payload(msg.text)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+    except Exception:
+        logging.exception("Failed to build digest (batch mode)")
+        await log(ctx, f"Не удалось построить выжимку для {msg.id}")
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+
+    body = render_digest(digest, raw_src, link)
+    mark_processed(cfg, key, msg.id)
+    save_all()
+    await log(ctx, f"Пост {msg.id} добавлен в очередь лучших")
+    return AutoCandidate(
+        channel=chan,
+        msg_id=msg.id,
+        source=raw_src,
+        link=link,
+        digest=digest,
+        body=body,
+    )
+
+
+async def choose_best_candidate(batch: list[AutoCandidate]) -> tuple[int, str]:
+    """Выбрать лучший пост из партии через OpenAI. Возвращает индекс и сырой ответ."""
+
+    system_msg = (
+        "Ты опытный редактор SEO-дайджеста. Оцени собранные публикации и выбери одну, "
+        "которая принесёт наибольшую пользу читателям (конкретные кейсы, практические выводы, свежие инсайты)."
+    )
+    parts: list[str] = []
+    for idx, candidate in enumerate(batch, start=1):
+        block = candidate.choice_summary()
+        parts.append(f"{idx}. {block}")
+    user_msg = (
+        "\n\n".join(parts)
+        + "\n\nОтветь только числом от 1 до "
+        + str(len(batch))
+        + " — номер самой полезной публикации."
+    )
+
+    rsp = await openai_call(
+        lambda client: client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+    )
+    raw = rsp.choices[0].message.content.strip()
+    match = re.search(r"(\d+)", raw)
+    if not match:
+        raise ValueError(f"Не удалось распознать ответ модели: {raw}")
+    choice = int(match.group(1))
+    if not 1 <= choice <= len(batch):
+        raise ValueError(f"Неверный номер публикации: {choice}")
+    return choice - 1, raw
+
+
+async def deliver_best_candidate(
+    ctx: ContextTypes.DEFAULT_TYPE, batch: list[AutoCandidate]
+) -> int:
+    if ctx.chat_data.get("stop"):
+        return 0
+
+    try:
+        index, raw_answer = await choose_best_candidate(batch)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        index = 0
+        raw_answer = ""
+    except Exception:
+        logging.exception("Failed to choose best candidate")
+        await log(ctx, "Не удалось выбрать лучший пост, отправляю первый из списка")
+        index = 0
+        raw_answer = ""
+
+    candidate = batch[index]
+    extra = f" Ответ модели: {raw_answer}" if raw_answer else ""
+    await log(
+        ctx,
+        f"Выбран пост №{index + 1} из партии (канал {candidate.channel}, id {candidate.msg_id}).{extra}"
+    )
+
+    try:
+        await ctx.bot.send_message(
+            chat_id=ctx.chat_data["target_chat"],
+            text=candidate.body,
+            parse_mode=tg_const.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logging.exception("Failed to send best candidate message")
+        await log(ctx, "Не удалось отправить лучший пост")
+        return 0
+
+    sent_total = ctx.chat_data.get("sent", 0) + 1
+    ctx.chat_data["sent"] = sent_total
+    return 1
+
+
+async def finalize_auto_batches(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    buffer: list[AutoCandidate] = ctx.chat_data.get("auto_batch_queue", [])
+    if not buffer:
+        return 0
+
+    total_sent = 0
+    while len(buffer) >= 10 and not ctx.chat_data.get("auto_stop"):
+        batch = list(buffer[:10])
+        del buffer[:10]
+        sent = await deliver_best_candidate(ctx, batch)
+        total_sent += sent
+        if ctx.chat_data.get("auto_stop"):
+            break
+    return total_sent
 
 
 async def send_filtered_posts(
@@ -387,6 +1072,9 @@ async def send_filtered_posts(
     chan: str,
     posts: list[Message],
     need: int,
+    *,
+    mode: str | None = None,
+    notify: bool = True,
 ) -> tuple[int, int]:
     """Send posts that pass the AI filter until ``need`` is reached.
 
@@ -398,6 +1086,8 @@ async def send_filtered_posts(
     cfg = get_cfg(ctx)
     key = chan.lstrip("@")
     seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+    if mode is None:
+        mode = ctx.chat_data.get("output_mode", "rewrite")
     await log(ctx, f"Начинаю проверку {len(posts)} постов из {chan}")
     sem = asyncio.Semaphore(CONCURRENCY)
     async def worker(m: Message):
@@ -408,36 +1098,76 @@ async def send_filtered_posts(
             return
         async with sem:
             attempts += 1
-            if await process_and_send(ctx, m, chan):
+            if await process_and_send(ctx, m, chan, mode=mode, notify=notify):
                 sent += 1
     tasks = [asyncio.create_task(worker(m)) for m in posts]
-    for t in asyncio.as_completed(tasks):
-        await t
-        if ctx.chat_data.get("stop") or (sent >= need and need) or (attempts >= ATTEMPT_LIMIT and sent == 0):
-            for x in tasks:
-                x.cancel()
-            break
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if tasks:
+        for t in asyncio.as_completed(tasks):
+            try:
+                await t
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("send_filtered_posts worker failed")
+                await log(ctx, "Ошибка в рабочем таске, продолжаю")
+            if ctx.chat_data.get("stop") or (
+                sent >= need and need
+            ) or (attempts >= ATTEMPT_LIMIT and sent == 0):
+                for x in tasks:
+                    x.cancel()
+                break
+        await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        await log(ctx, f"Нет новых постов для обработки в {chan}")
     await log(ctx, f"Закончена проверка {chan}: отправлено {sent} из {attempts}")
     return sent, attempts
 
 # ────────────── TELEGRAM BOT HANDLERS ──────────────────────────────────────
-MAIN_KB = ReplyKeyboardMarkup(
+AUTO_BATCH_OPTION = "Накопить 10 постов и выбрать лучший."
+AUTO_NORMAL_OPTION = "Работа в обычном режиме."
+AUTO_BACK_OPTION = "🔙 Назад"
+
+AUTO_MODE_KB = ReplyKeyboardMarkup(
     [
-        ["🔍 Парсить конкретный канал", "➡️ По очереди все каналы"],
-        ["⭐ Популярные посты всех каналов"],
-        ["⭐ Популярные посты конкретного канала"],
-        ["Поиск постов за последние дни в конкретном канале"],
-        ["Поиск постов за последние дни во всех каналах"],
-        ["📅 Диапазон дат (канал)", "📅 Диапазон дат (все)"],
-        ["➕ Добавить каналы", "➖ Удалить каналы"],
-        ["Настройки"],
-        ["Очистить чат"],
-        ["⏹ Остановить"],
-        ["ℹ️ Инструкция"],
+        [AUTO_BATCH_OPTION],
+        [AUTO_NORMAL_OPTION],
+        [AUTO_BACK_OPTION],
     ],
     resize_keyboard=True,
+    one_time_keyboard=True,
 )
+
+BASE_MENU_ROWS = [
+    ["🔍 Парсить конкретный канал", "➡️ По очереди все каналы"],
+    ["⭐ Популярные посты всех каналов"],
+    ["⭐ Популярные посты конкретного канала"],
+    ["Поиск постов за последние дни в конкретном канале"],
+    ["Поиск постов за последние дни во всех каналах"],
+    ["📅 Диапазон дат (канал)", "📅 Диапазон дат (все)"],
+    ["➕ Добавить каналы", "➖ Удалить каналы"],
+    ["📰 Авто-выжимка"],
+    ["Настройки"],
+    ["Очистить чат"],
+    ["⏹ Остановить"],
+    ["ℹ️ Инструкция"],
+]
+
+
+def _clone_rows(rows: list[list[str]]) -> list[list[str]]:
+    return [row[:] for row in rows]
+
+
+ADMIN_MENU_ROWS = _clone_rows(BASE_MENU_ROWS)
+try:
+    settings_index = next(
+        idx for idx, row in enumerate(ADMIN_MENU_ROWS) if "Настройки" in row
+    )
+except StopIteration:
+    settings_index = len(ADMIN_MENU_ROWS) - 1
+ADMIN_MENU_ROWS.insert(settings_index + 1, ["Меню API ключей"])
+
+USER_MAIN_KB = ReplyKeyboardMarkup(BASE_MENU_ROWS, resize_keyboard=True)
+ADMIN_MAIN_KB = ReplyKeyboardMarkup(ADMIN_MENU_ROWS, resize_keyboard=True)
 
 SETTINGS_KB = ReplyKeyboardMarkup(
     [
@@ -450,6 +1180,24 @@ SETTINGS_KB = ReplyKeyboardMarkup(
 )
 
 CANCEL_KB = ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True)
+
+API_INPUT_KB = ReplyKeyboardMarkup(
+    [["Готово", "Отмена"]], resize_keyboard=True, one_time_keyboard=False
+)
+
+API_MENU_KB = ReplyKeyboardMarkup(
+    [
+        ["➕ Добавить API ключи"],
+        ["🗑 Очистить API ключи"],
+        ["🔙 Назад"],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
+def main_menu(ctx: ContextTypes.DEFAULT_TYPE) -> ReplyKeyboardMarkup:
+    return ADMIN_MAIN_KB if ctx.chat_data.get("is_admin") else USER_MAIN_KB
 
 
 async def make_channel_kb(chans: list[str], ctx: ContextTypes.DEFAULT_TYPE) -> ReplyKeyboardMarkup:
@@ -474,11 +1222,14 @@ async def make_channel_kb(chans: list[str], ctx: ContextTypes.DEFAULT_TYPE) -> R
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    user = update.effective_user
+    if user:
+        ctx.chat_data["is_admin"] = user.id in ADMIN_IDS
     ctx.chat_data["target_chat"] = update.effective_chat.id
     ctx.chat_data["chat_id"] = chat_id
     ctx.chat_data["start_id"] = update.message.message_id
     get_cfg(ctx)  # ensure config exists
-    await update.message.reply_text("Выберите действие:", reply_markup=MAIN_KB)
+    await update.message.reply_text("Выберите действие:", reply_markup=main_menu(ctx))
 
 
 # -------------- текстовый ввод после кнопок --------------------------------
@@ -489,18 +1240,30 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.chat_data.setdefault("target_chat", update.effective_chat.id)
     ctx.chat_data.setdefault("chat_id", str(update.effective_chat.id))
     ctx.chat_data.setdefault("start_id", update.message.message_id)
+    user = update.effective_user
+    if user:
+        ctx.chat_data["is_admin"] = user.id in ADMIN_IDS
     cfg = get_cfg(ctx)
     mode = ctx.user_data.get("mode")
 
     if text == "Отмена":
-        ctx.user_data.clear()
-        await update.message.reply_text("Отменено", reply_markup=MAIN_KB)
+        if mode == "api_add_keys":
+            ctx.user_data["mode"] = "api_menu"
+            await update.message.reply_text(
+                "Добавление ключей отменено.", reply_markup=API_MENU_KB
+            )
+        else:
+            ctx.user_data.clear()
+            await update.message.reply_text("Отменено", reply_markup=main_menu(ctx))
         return
 
     if text == "⏹ Остановить":
-        ctx.chat_data["stop"] = True
+        await stop_auto_cycle(ctx)
+        task = ctx.chat_data.get("task")
+        if task and not task.done():
+            task.cancel()
         await update.message.reply_text(
-            "Парсинг будет остановлен", reply_markup=MAIN_KB
+            "Парсинг будет остановлен", reply_markup=main_menu(ctx)
         )
         return
 
@@ -527,9 +1290,67 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "8. Меню <b>Настройки</b> позволяет очистить историю ID, заменить фильтр-промпт и включить или выключить лог (по умолчанию лог отключён).\n"
             "9. <b>Очистить чат</b> — бот удалит все сообщения в этом диалоге.\n"
             "10. Кнопка ⏹ <b>Остановить</b> прерывает любой текущий парсинг.\n"
+            "11. <b>📰 Авто-выжимка</b> — бот в реальном времени отслеживает появление новых публикаций, сразу делает по ним выжимки и присылает на апрув. Повторное нажатие останавливает мониторинг, также его можно прервать кнопкой ⏹.\n"
         )
         await update.message.reply_text(
-            instruction, reply_markup=MAIN_KB, parse_mode=tg_const.ParseMode.HTML
+            instruction, reply_markup=main_menu(ctx), parse_mode=tg_const.ParseMode.HTML
+        )
+        return
+
+    if text == "Меню API ключей":
+        if not ctx.chat_data.get("is_admin"):
+            await update.message.reply_text(
+                "Кнопка доступна только администратору.", reply_markup=main_menu(ctx)
+            )
+            return
+        ctx.user_data.clear()
+        ctx.user_data["mode"] = "api_menu"
+        ctx.chat_data.pop("api_partial", None)
+        masked = key_manager.masked_keys()
+        if masked:
+            listing = "\n".join(f"{idx + 1}. {mask}" for idx, mask in enumerate(masked))
+            msg = (
+                f"Сохранено {len(masked)} ключей:\n{listing}\n\n"
+                "Выберите действие:"
+            )
+        else:
+            msg = "Ключей пока нет. Добавьте новые ключи.\n\nВыберите действие:"
+        await update.message.reply_text(msg, reply_markup=API_MENU_KB)
+        return
+
+    auto_task = ctx.chat_data.get("auto_task")
+    auto_running = bool(auto_task) and not auto_task.done()
+
+    if text == "📰 Авто-выжимка":
+        if auto_running:
+            await stop_auto_cycle(ctx)
+            await update.message.reply_text(
+                "Останавливаю авто-выжимку…", reply_markup=main_menu(ctx)
+            )
+        else:
+            if not cfg.channels:
+                await update.message.reply_text("Список каналов пуст.", reply_markup=main_menu(ctx))
+                return
+            if task_running(ctx):
+                await update.message.reply_text(
+                    "Уже выполняется задача. Нажмите ⏹ Остановить",
+                    reply_markup=main_menu(ctx),
+                )
+                return
+            ctx.user_data.clear()
+            ctx.user_data["mode"] = "auto_select"
+            await update.message.reply_text(
+                "Выберите режим авто-выжимки:", reply_markup=AUTO_MODE_KB
+            )
+        return
+
+    auto_task = ctx.chat_data.get("auto_task")
+    auto_running = bool(auto_task) and not auto_task.done()
+
+    if auto_running and text not in {"⏹ Остановить"}:
+        await update.message.reply_text(
+            "Сейчас работает авто-выжимка. Остановите её через кнопку 📰 Авто-выжимка, чтобы выполнить другие действия.",
+            reply_markup=main_menu(ctx),
         )
         return
 
@@ -537,8 +1358,172 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if task_running(ctx):
         await update.message.reply_text(
             "Уже выполняется задача. Нажмите ⏹ Остановить",
-            reply_markup=MAIN_KB,
+            reply_markup=main_menu(ctx),
         )
+        return
+
+    if mode == "api_menu":
+        if text == "➕ Добавить API ключи":
+            ctx.user_data["mode"] = "api_add_keys"
+            ctx.chat_data["api_partial"] = ""
+            await update.message.reply_text(
+                (
+                    "Вставьте OpenAI API ключи (каждый на новой строке). "
+                    "Если сообщение разобьётся на несколько частей, бот "
+                    "склеит ключи автоматически. Когда закончите, отправьте "
+                    "«Готово» или нажмите Отмена."
+                ),
+                reply_markup=API_INPUT_KB,
+            )
+        elif text == "🗑 Очистить API ключи":
+            key_manager.clear_keys()
+            ctx.user_data["mode"] = "api_menu"
+            ctx.chat_data.pop("api_partial", None)
+            await update.message.reply_text(
+                "Все ключи удалены. Добавьте новые ключи.", reply_markup=API_MENU_KB
+            )
+        elif text == "🔙 Назад":
+            ctx.user_data.clear()
+            ctx.chat_data.pop("api_partial", None)
+            await update.message.reply_text(
+                "Возвращаюсь в главное меню.", reply_markup=main_menu(ctx)
+            )
+        else:
+            await update.message.reply_text(
+                "Выберите действие из меню API ключей.", reply_markup=API_MENU_KB
+            )
+        return
+
+    if mode == "auto_select":
+        lowered = text.strip().casefold()
+        if lowered in {"отмена", "cancel"} or text == AUTO_BACK_OPTION:
+            ctx.user_data.clear()
+            await update.message.reply_text(
+                "Возвращаюсь в главное меню.", reply_markup=main_menu(ctx)
+            )
+            return
+        if text not in {AUTO_BATCH_OPTION, AUTO_NORMAL_OPTION}:
+            await update.message.reply_text(
+                "Пожалуйста, выберите режим кнопками ниже.",
+                reply_markup=AUTO_MODE_KB,
+            )
+            return
+        if task_running(ctx):
+            ctx.user_data.clear()
+            await update.message.reply_text(
+                "Уже выполняется задача. Нажмите ⏹ Остановить",
+                reply_markup=main_menu(ctx),
+            )
+            return
+        strategy = "batch_best" if text == AUTO_BATCH_OPTION else "normal"
+        ctx.chat_data["auto_stop"] = False
+        ctx.chat_data["auto_strategy"] = strategy
+        if strategy == "batch_best":
+            ctx.chat_data["auto_batch_queue"] = []
+        ctx.user_data.clear()
+        task = ctx.application.create_task(auto_monitor(ctx))
+        ctx.chat_data["auto_task"] = task
+        start_msg = (
+            "Авто-выжимка запущена. Накоплю 10 постов и пришлю лучший."
+            if strategy == "batch_best"
+            else "Авто-выжимка запущена. Мониторю новые посты в реальном времени."
+        )
+        await update.message.reply_text(start_msg, reply_markup=main_menu(ctx))
+        return
+
+    if mode == "api_add_keys":
+        lowered = text.strip().casefold()
+        if lowered in {"отмена", "cancel"}:
+            ctx.user_data["mode"] = "api_menu"
+            ctx.chat_data.pop("api_partial", None)
+            await update.message.reply_text(
+                "Возвращаюсь в меню управления ключами.", reply_markup=API_MENU_KB
+            )
+            return
+        if lowered in {"готово", "done", "готово!", "готово."}:
+            pending = ctx.chat_data.pop("api_partial", "")
+            extra_added: list[str] = []
+            extra_message = ""
+            if pending:
+                candidate = pending.strip()
+                if API_KEY_PATTERN.fullmatch(candidate):
+                    extra_added = key_manager.add_keys([candidate])
+                    if extra_added:
+                        extra_message = (
+                            "Добавлен последний ключ из неполной строки. "
+                        )
+                    else:
+                        extra_message = (
+                            "Последний ключ уже был в списке и не добавлен. "
+                        )
+                else:
+                    extra_message = "Последняя строка выглядела неполной и была пропущена. "
+            ctx.user_data["mode"] = "api_menu"
+            total = key_manager.count()
+            summary = (
+                f"{extra_message}Всего сохранено ключей: {total}."
+            ).strip()
+            if not summary:
+                summary = f"Всего сохранено ключей: {total}."
+            await update.message.reply_text(summary, reply_markup=API_MENU_KB)
+            return
+
+        combined = (ctx.chat_data.get("api_partial", "") or "") + text
+        combined = combined.replace("\u200b", "").replace("\ufeff", "")
+        lines = combined.splitlines()
+        new_partial = ""
+        force_tail = len(text) >= TG_SPLIT_THRESHOLD and not combined.endswith(("\n", "\r"))
+        if combined and not combined.endswith(("\n", "\r")):
+            last_line = lines[-1] if lines else combined
+            if force_tail or not API_KEY_PATTERN.fullmatch(last_line.strip()):
+                new_partial = last_line
+                if lines:
+                    lines = lines[:-1]
+                else:
+                    lines = []
+        ctx.chat_data["api_partial"] = new_partial
+
+        valid: list[str] = []
+        invalid: list[str] = []
+        for line in lines:
+            candidate = line.strip().strip(",;")
+            if not candidate:
+                continue
+            if API_KEY_PATTERN.fullmatch(candidate):
+                valid.append(candidate)
+            else:
+                invalid.append(candidate)
+
+        added = key_manager.add_keys(valid) if valid else []
+        total = key_manager.count()
+        duplicates = len(valid) - len(added)
+
+        parts: list[str] = []
+        if added:
+            parts.append(f"Добавлено {len(added)} ключей.")
+        if duplicates:
+            parts.append(f"Пропущено дублей: {duplicates}.")
+        if invalid:
+            sample = ", ".join(invalid[:3])
+            parts.append(
+                "Не распознал следующие строки: "
+                f"{sample}{'…' if len(invalid) > 3 else ''}."
+            )
+        if not parts:
+            parts.append(
+                "Не удалось распознать ключи. Убедитесь, что каждый ключ начинается с sk- и находится на новой строке."
+            )
+        if new_partial:
+            parts.append(
+                "Последняя строка выглядит неполной — ожидаю продолжение следующими сообщениями."
+            )
+        else:
+            parts.append(
+                "Можно отправить следующий блок ключей или написать «Готово» для завершения."
+            )
+        parts.append(f"Всего сохранено: {total}.")
+
+        await update.message.reply_text("\n".join(parts), reply_markup=API_INPUT_KB)
         return
 
     # base menu actions should override pending modes
@@ -714,7 +1699,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.clear()
         await update.message.reply_text(
             ("Добавлено: " + ", ".join(added)) if added else "Нет новых каналов",
-            reply_markup=MAIN_KB,
+            reply_markup=main_menu(ctx),
         )
         return
 
@@ -730,7 +1715,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cfg.prompt_no = text
         save_all()
         ctx.user_data.clear()
-        await update.message.reply_text("Фильтр-промпт обновлён", reply_markup=MAIN_KB)
+        await update.message.reply_text("Фильтр-промпт обновлён", reply_markup=main_menu(ctx))
         return
 
     if mode == "toggle_log":
@@ -740,7 +1725,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.clear()
             await update.message.reply_text(
                 f"Лог {'включен' if cfg.log_enabled else 'выключен'}",
-                reply_markup=MAIN_KB,
+                reply_markup=main_menu(ctx),
             )
         else:
             await update.message.reply_text(
@@ -764,13 +1749,13 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             msg = "Неизвестный канал"
         ctx.user_data.clear()
-        await update.message.reply_text(msg, reply_markup=MAIN_KB)
+        await update.message.reply_text(msg, reply_markup=main_menu(ctx))
         return
 
     if mode == "clear_menu":
         if text == "Очистить конкретные ID постов":
             if not cfg.channels:
-                await update.message.reply_text("Список каналов пуст.", reply_markup=MAIN_KB)
+                await update.message.reply_text("Список каналов пуст.", reply_markup=main_menu(ctx))
                 ctx.user_data.clear()
             else:
                 ctx.user_data["mode"] = "clear_ids"
@@ -784,11 +1769,11 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 cfg.ids[c] = deque(maxlen=PROCESSED_LIMIT)
             save_all()
             ctx.user_data.clear()
-            await update.message.reply_text("Все ID очищены", reply_markup=MAIN_KB)
+            await update.message.reply_text("Все ID очищены", reply_markup=main_menu(ctx))
             return
         if text == "Отмена":
             ctx.user_data.clear()
-            await update.message.reply_text("Отменено", reply_markup=MAIN_KB)
+            await update.message.reply_text("Отменено", reply_markup=main_menu(ctx))
             return
 
     if mode == "clear_ids":
@@ -801,7 +1786,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             msg = "Неизвестный канал"
         ctx.user_data.clear()
-        await update.message.reply_text(msg, reply_markup=MAIN_KB)
+        await update.message.reply_text(msg, reply_markup=main_menu(ctx))
         return
 
     if mode == "by_channel":
@@ -824,12 +1809,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         chan = ctx.user_data.get("channel")
         limit = int(text)
-        await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Обрабатываю…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_channel(ctx, chan, None, None, limit))
         return
 
@@ -844,7 +1829,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
-            await update.message.reply_text("Канал не в списке.", reply_markup=MAIN_KB)
+            await update.message.reply_text("Канал не в списке.", reply_markup=main_menu(ctx))
             ctx.user_data.clear()
         return
 
@@ -867,14 +1852,14 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         chan = ctx.user_data.get("channel")
         limit = int(text)
         from_d = ctx.user_data.get("from")
         to_d = ctx.user_data.get("to")
-        await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Обрабатываю…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_channel(ctx, chan, from_d, to_d, limit))
         return
 
@@ -897,13 +1882,13 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         limit = int(text)
         from_d = ctx.user_data.get("from")
         to_d = ctx.user_data.get("to")
-        await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Обрабатываю…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_seq_all(ctx, from_d, to_d, limit))
         return
 
@@ -913,11 +1898,11 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         limit = int(text)
-        await update.message.reply_text("Стартуем…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Стартуем…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_seq_all(ctx, None, None, limit))
         return
 
@@ -927,11 +1912,11 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         limit = int(text)
-        await update.message.reply_text("Ищем популярные…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Ищем популярные…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_pop_all(ctx, limit))
         return
 
@@ -945,7 +1930,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Сколько постов проверить?", reply_markup=ReplyKeyboardRemove()
             )
         else:
-            await update.message.reply_text("Канал не в списке.", reply_markup=MAIN_KB)
+            await update.message.reply_text("Канал не в списке.", reply_markup=main_menu(ctx))
             ctx.user_data.clear()
         return
 
@@ -955,12 +1940,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         chan = ctx.user_data.get("channel")
         limit = int(text)
-        await update.message.reply_text("Ищем популярные…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Ищем популярные…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_pop_channel(ctx, chan, limit))
         return
 
@@ -975,7 +1960,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
-            await update.message.reply_text("Канал не в списке.", reply_markup=MAIN_KB)
+            await update.message.reply_text("Канал не в списке.", reply_markup=main_menu(ctx))
             ctx.user_data.clear()
         return
 
@@ -985,12 +1970,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         chan = ctx.user_data.get("channel")
         days = int(text)
-        await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Обрабатываю…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_recent_channel(ctx, chan, days))
         return
 
@@ -1000,22 +1985,224 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if task_running(ctx):
             await update.message.reply_text(
-                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=MAIN_KB
+                "Уже выполняется задача. Нажмите ⏹ Остановить", reply_markup=main_menu(ctx)
             )
             return
         days = int(text)
-        await update.message.reply_text("Обрабатываю…", reply_markup=MAIN_KB)
+        await update.message.reply_text("Обрабатываю…", reply_markup=main_menu(ctx))
         launch_task(ctx, run_recent_all(ctx, days))
         return
-
     if mode:
-        await update.message.reply_text("Не понимаю ответ, начните заново", reply_markup=MAIN_KB)
+        await update.message.reply_text("Не понимаю ответ, начните заново", reply_markup=main_menu(ctx))
         ctx.user_data.clear()
     else:
-        await update.message.reply_text("Неизвестная команда", reply_markup=MAIN_KB)
+        await update.message.reply_text("Неизвестная команда", reply_markup=main_menu(ctx))
 
 
 # -------------- задачи -----------------------------------------------------
+
+
+async def auto_cycle(
+    ctx: ContextTypes.DEFAULT_TYPE, *, client_ready: bool = False
+) -> int:
+    cfg = get_cfg(ctx)
+    if not cfg.channels:
+        return 0
+
+    total_sent = 0
+    started_here = False
+    if not client_ready:
+        await tg_client.start()
+        started_here = True
+    ctx.chat_data["stop"] = False
+    ctx.chat_data["sent"] = 0
+    strategy = ctx.chat_data.get("auto_strategy", "normal")
+    if strategy == "batch_best":
+        ctx.chat_data.setdefault("auto_batch_queue", [])
+    try:
+        for chan in cfg.channels:
+            if ctx.chat_data.get("auto_stop"):
+                break
+            posts = await fetch_posts(chan, None, None, 50)
+            if not posts:
+                continue
+            key = chan.lstrip("@")
+            seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+            last_seen = cfg.auto_last.get(key, 0)
+            if not last_seen:
+                baseline_added = False
+                for msg in posts:
+                    if mark_processed(cfg, key, msg.id):
+                        baseline_added = True
+                if baseline_added:
+                    save_all()
+                    await log(ctx, f"Синхронизировал стартовую точку для {chan}")
+                continue
+            fresh = [m for m in posts if m.id not in seen and m.id > last_seen]
+            if not fresh:
+                continue
+            if strategy == "batch_best":
+                for msg in fresh:
+                    if ctx.chat_data.get("auto_stop"):
+                        break
+                    try:
+                        candidate = await prepare_auto_candidate(ctx, msg, chan)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logging.exception("Batch preparation failed")
+                        await log(ctx, f"Ошибка при подготовке поста {msg.id}")
+                        continue
+                    if candidate:
+                        queue: list[AutoCandidate] = ctx.chat_data.setdefault(
+                            "auto_batch_queue", []
+                        )
+                        queue.append(candidate)
+                        sent_now = await finalize_auto_batches(ctx)
+                        total_sent += sent_now
+                if ctx.chat_data.get("auto_stop"):
+                    break
+            else:
+                try:
+                    sent, _ = await send_filtered_posts(
+                        ctx,
+                        chan,
+                        fresh,
+                        0,
+                        mode="digest",
+                        notify=False,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logging.exception("Auto cycle failed for channel")
+                    await log(ctx, f"Ошибка при обработке канала {chan}")
+                    continue
+                total_sent += sent
+    finally:
+        if started_here:
+            await tg_client.disconnect()
+    return total_sent
+
+
+async def prime_auto_seen(
+    ctx: ContextTypes.DEFAULT_TYPE, *, client_ready: bool = False
+) -> int:
+    """Зафиксировать текущие посты, чтобы авто-выжимка начинала только с новых."""
+
+    cfg = get_cfg(ctx)
+    if not cfg.channels:
+        return 0
+
+    added_total = 0
+    started_here = False
+    if not client_ready:
+        await tg_client.start()
+        started_here = True
+    try:
+        modified = False
+        for chan in cfg.channels:
+            posts = await fetch_posts(chan, None, None, 50)
+            if not posts:
+                continue
+            key = chan.lstrip("@")
+            added_here = 0
+            for msg in posts:
+                if mark_processed(cfg, key, msg.id):
+                    added_here += 1
+            if added_here:
+                modified = True
+                added_total += added_here
+                await log(ctx, f"Зафиксировал последние {added_here} постов из {chan}")
+        if modified:
+            save_all()
+    finally:
+        if started_here:
+            await tg_client.disconnect()
+
+    return added_total
+
+
+async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = ctx.chat_data.get("target_chat")
+    if chat_id is None:
+        return
+    strategy = ctx.chat_data.get("auto_strategy", "normal")
+    if strategy == "batch_best":
+        ctx.chat_data["auto_batch_queue"] = []
+    try:
+        await tg_client.start()
+    except Exception:
+        logging.exception("Не удалось запустить Telethon клиент для авто-выжимки")
+        await ctx.bot.send_message(
+            chat_id,
+            "Не удалось подключиться к Telegram. Попробуйте запустить авто-выжимку позже.",
+        )
+        return
+    try:
+        primed = await prime_auto_seen(ctx, client_ready=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Не удалось подготовить авто-выжимку")
+        primed = 0
+    if strategy == "batch_best":
+        mode_text = (
+            "Авто-выжимка активирована. Собираю партии по 10 постов и пришлю самый полезный."
+        )
+    else:
+        mode_text = (
+            "Авто-выжимка активирована. Новые релевантные публикации будут приходить сразу после выхода."
+        )
+    await ctx.bot.send_message(chat_id, mode_text)
+    if primed:
+        await ctx.bot.send_message(
+            chat_id,
+            "Текущие публикации помечены как просмотренные, начну с новых постов.",
+        )
+    try:
+        while not ctx.chat_data.get("auto_stop"):
+            total = await auto_cycle(ctx, client_ready=True)
+            if ctx.chat_data.get("auto_stop"):
+                break
+            if total:
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"Авто-выжимка: прислано {total} новостей на апрув.",
+                )
+            sleep_seconds = 5 if total else 10
+            for _ in range(sleep_seconds):
+                if ctx.chat_data.get("auto_stop"):
+                    break
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        logging.info("Авто-выжимка принудительно остановлена")
+    except Exception:
+        logging.exception("Ошибка в автоматическом мониторинге")
+        await ctx.bot.send_message(
+            chat_id,
+            "Авто-выжимка остановлена из-за ошибки. Проверьте логи.",
+        )
+    finally:
+        ctx.chat_data.pop("auto_stop", None)
+        ctx.chat_data.pop("auto_task", None)
+        ctx.chat_data.pop("auto_strategy", None)
+        ctx.chat_data.pop("auto_batch_queue", None)
+        try:
+            await asyncio.shield(
+                ctx.bot.send_message(chat_id, "Авто-выжимка остановлена.")
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось отправить уведомление об остановке авто-выжимки"
+            )
+        finally:
+            try:
+                await tg_client.disconnect()
+            except Exception:
+                logging.exception("Не удалось отключить Telethon клиент после авто-выжимки")
+
+
 async def run_seq_all(ctx, from_d: str | None = None, to_d: str | None = None, limit: int | None = None) -> bool:
     await tg_client.start()
     await log(ctx, "Запускаю обход всех каналов")
