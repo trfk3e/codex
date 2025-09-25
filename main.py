@@ -1494,8 +1494,16 @@ class TextGeneratorApp(ctk.CTkFrame):
                     if not output_file_id:
                         raise RuntimeError(f"Batch {batch_id} не вернул output_file_id")
 
-                    with client_instance.files.content(output_file_id) as output_stream:
+                    output_stream = client_instance.files.content(output_file_id)
+                    try:
                         output_bytes = output_stream.read()
+                    finally:
+                        close_method = getattr(output_stream, "close", None)
+                        if callable(close_method):
+                            try:
+                                close_method()
+                            except Exception:
+                                pass
                     if not isinstance(output_bytes, (bytes, bytearray)):
                         output_bytes = str(output_bytes).encode("utf-8")
 
