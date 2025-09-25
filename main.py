@@ -1361,14 +1361,53 @@ class TextGeneratorApp(ctk.CTkFrame):
             if to_wait > 0:
                 time.sleep(to_wait)
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
+                formatted_messages = []
+                for message in messages:
+                    if not isinstance(message, dict):
+                        formatted_messages.append(message)
+                        continue
+                    role = message.get("role")
+                    content_value = message.get("content")
+                    if isinstance(content_value, str):
+                        formatted_messages.append(
+                            {
+                                "role": role,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": content_value,
+                                    }
+                                ],
+                            }
+                        )
+                    else:
+                        formatted_messages.append(message)
+
+                raw_response = client_instance.responses.with_raw_response.create(
+                    model=DEFAULT_MODEL,
+                    input=formatted_messages,
+                    timeout=300,
+                )
                 completion = raw_response.parse()
                 if hasattr(raw_response, 'headers'):
                     self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
                 with api_key_last_call_time_lock:
                     api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
+                if hasattr(completion, "output_text") and completion.output_text:
+                    return completion.output_text.strip()
+                if hasattr(completion, "output") and completion.output:
+                    # Новые модели Batch API возвращают список блоков контента
+                    collected_chunks = []
+                    for item in completion.output:
+                        if not hasattr(item, "content") or not item.content:
+                            continue
+                        for content_piece in item.content:
+                            text_value = getattr(content_piece, "text", None)
+                            if text_value:
+                                collected_chunks.append(text_value)
+                    if collected_chunks:
+                        return "\n".join(collected_chunks).strip()
+                return None
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
