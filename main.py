@@ -1551,16 +1551,53 @@ class TextGeneratorApp(ctk.CTkFrame):
     def _repopulate_available_api_key_queue(self):
         with self.api_key_management_lock:
             current_master_keys = self.api_keys_list[:]
+
         new_queue = Queue()
-        active_keys_for_queue = []
+        active_keys_for_queue: list[str] = []
+        suppressed_status_counts: dict[str, int] = {}
+        revived_keys: list[str] = []
+        statuses_changed = False
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
         with self.api_key_statuses_lock:
             for key_str in current_master_keys:
                 status_data = self.api_key_statuses.get(key_str)
-                if status_data and status_data.get("status") == "active":
+                if not status_data:
+                    status_data = self._get_default_api_key_status()
+                    self.api_key_statuses[key_str] = status_data
+                    statuses_changed = True
+
+                status_value = status_data.get("status") or "active"
+                if status_value != "active":
+                    requests_ready = True
+                    tokens_ready = True
+
+                    if status_value in ("cooldown_requests", "cooldown_both"):
+                        reset_requests_at = status_data.get("reset_requests_at")
+                        requests_ready = (not reset_requests_at) or (reset_requests_at <= now_utc)
+                        if requests_ready:
+                            status_data["reset_requests_at"] = None
+                            status_data["remaining_requests"] = status_data.get("limit_requests")
+
+                    if status_value in ("cooldown_tokens", "cooldown_both"):
+                        reset_tokens_at = status_data.get("reset_tokens_at")
+                        tokens_ready = (not reset_tokens_at) or (reset_tokens_at <= now_utc)
+                        if tokens_ready:
+                            status_data["reset_tokens_at"] = None
+                            status_data["remaining_tokens"] = status_data.get("limit_tokens")
+
+                    if status_value in ("cooldown_requests", "cooldown_tokens", "cooldown_both") and requests_ready and tokens_ready:
+                        status_value = "active"
+                        status_data["status"] = "active"
+                        status_data["last_updated"] = now_utc
+                        revived_keys.append(key_str)
+                        statuses_changed = True
+
+                if status_value == "active":
                     active_keys_for_queue.append(key_str)
-                elif not status_data:
-                    self.api_key_statuses[key_str] = self._get_default_api_key_status()
-                    active_keys_for_queue.append(key_str)
+                else:
+                    suppressed_status_counts[status_value] = suppressed_status_counts.get(status_value, 0) + 1
+
         if active_keys_for_queue:
             random.shuffle(active_keys_for_queue)
             for key_str in active_keys_for_queue:
@@ -1570,9 +1607,25 @@ class TextGeneratorApp(ctk.CTkFrame):
                 f"Очередь API ключей обновлена. Активных ключей: {len(active_keys_for_queue)}",
                 "INFO",
             )
+            if revived_keys:
+                self.log_message(
+                    "Возвращены в работу ключи: " + ", ".join(f"{k[:7]}..." for k in revived_keys),
+                    "DEBUG",
+                )
+            if suppressed_status_counts:
+                suppressed_summary = ", ".join(
+                    f"{status}: {count}" for status, count in sorted(suppressed_status_counts.items())
+                )
+                self.log_message(
+                    f"Ключи исключены из очереди из-за статусов — {suppressed_summary}",
+                    "DEBUG",
+                )
         else:
             self.log_message("Нет активных API ключей для добавления в очередь.", "WARNING")
+
         self.api_key_queue = new_queue
+        if statuses_changed:
+            self._save_api_key_statuses()
         self.update_threads_label()
 
     def _parse_ratelimit_reset_time(self, reset_value_str):
