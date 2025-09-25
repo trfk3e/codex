@@ -39,6 +39,7 @@ import atexit
 import signal
 import uuid
 from tempfile import NamedTemporaryFile
+from dataclasses import dataclass, field
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 
 if getattr(sys, "frozen", False):
@@ -124,10 +125,11 @@ class BatchAPIExecutor:
             except Exception:
                 pass
 
-    def _write_single_request_file(self, request_payload: dict) -> str:
+    def _write_requests_file(self, requests_payload: list[dict]) -> str:
         with NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl", delete=False) as temp_file:
-            json.dump(request_payload, temp_file, ensure_ascii=False)
-            temp_file.write("\n")
+            for payload in requests_payload:
+                json.dump(payload, temp_file, ensure_ascii=False)
+                temp_file.write("\n")
             return temp_file.name
 
     def _parse_batch_output(self, output_text: str) -> dict:
@@ -144,35 +146,31 @@ class BatchAPIExecutor:
                 continue
         return results
 
-    def execute_single_chat_completion(self, *, messages, model: str, metadata: dict | None = None,
-                                       request_id: str | None = None) -> str:
-        custom_id = request_id or f"req-{uuid.uuid4().hex}"
-        payload = {
-            "custom_id": custom_id,
-            "method": "POST",
-            "url": "/v1/chat/completions",
-            "body": {
-                "model": model,
-                "messages": messages,
-            },
-        }
-        if metadata:
-            payload["metadata"] = metadata
+    def execute_requests(self, requests_payload: list[dict], *, metadata: dict | None = None) -> dict:
+        if not requests_payload:
+            return {}
 
-        temp_path = self._write_single_request_file(payload)
+        temp_path = self._write_requests_file(requests_payload)
         upload = None
         batch_job = None
         try:
-            self._log(f"Batch API: загрузка файла запроса {custom_id}", "DEBUG")
+            self._log(
+                f"Batch API: загрузка файла запросов ({len(requests_payload)} шт.)",
+                "DEBUG",
+            )
             with open(temp_path, "rb") as file_handle:
                 upload = self._client.files.create(file=file_handle, purpose="batch")
 
-            self._log(f"Batch API: создание батча для {custom_id}", "DEBUG")
+            batch_metadata = {"source": "desktop_app"}
+            if metadata:
+                batch_metadata.update(metadata)
+
+            self._log("Batch API: создание батча", "DEBUG")
             batch_job = self._client.batches.create(
                 input_file_id=upload.id,
                 endpoint="/v1/chat/completions",
                 completion_window="24h",
-                metadata={"source": "desktop_app", "request": custom_id}
+                metadata=batch_metadata,
             )
 
             last_status = None
@@ -188,10 +186,9 @@ class BatchAPIExecutor:
                 time.sleep(self.POLL_INTERVAL_SECONDS)
 
             if batch_job.status != "completed":
-                error_info = None
-                if batch_job.errors:
-                    error_info = batch_job.errors
-                raise RuntimeError(f"Batch API: батч {batch_job.id} завершен со статусом {batch_job.status}. {error_info}")
+                raise RuntimeError(
+                    f"Batch API: батч {batch_job.id} завершен со статусом {batch_job.status}. {batch_job.errors}"
+                )
 
             if not batch_job.output_file_id:
                 raise RuntimeError(f"Batch API: батч {batch_job.id} не вернул файл с результатами.")
@@ -199,23 +196,7 @@ class BatchAPIExecutor:
             file_response = self._client.files.content(batch_job.output_file_id)
             output_text = file_response.text if hasattr(file_response, "text") else file_response.read().decode("utf-8")
             parsed = self._parse_batch_output(output_text)
-            entry = parsed.get(custom_id)
-            if not entry:
-                raise RuntimeError(f"Batch API: не найден ответ для {custom_id}.")
-            if entry.get("error"):
-                raise RuntimeError(f"Batch API: ошибка в ответе {custom_id}: {entry['error']}")
-
-            response_body = entry.get("response", {}).get("body")
-            if not response_body:
-                raise RuntimeError(f"Batch API: пустой ответ тела для {custom_id}.")
-            choices = response_body.get("choices") or []
-            if not choices:
-                raise RuntimeError(f"Batch API: отсутствуют варианты ответа для {custom_id}.")
-            message = choices[0].get("message", {})
-            content = message.get("content")
-            if not content:
-                raise RuntimeError(f"Batch API: пустое содержимое для {custom_id}.")
-            return content.strip()
+            return parsed
         finally:
             try:
                 os.remove(temp_path)
@@ -230,7 +211,82 @@ class BatchAPIExecutor:
                 try:
                     self._client.files.delete(batch_job.output_file_id)
                 except Exception as delete_exc:
-                    self._log(f"Batch API: не удалось удалить output файл {batch_job.output_file_id}: {delete_exc}", "DEBUG")
+                    self._log(
+                        f"Batch API: не удалось удалить output файл {batch_job.output_file_id}: {delete_exc}",
+                        "DEBUG",
+                    )
+
+    def execute_single_chat_completion(self, *, messages, model: str, metadata: dict | None = None,
+                                       request_id: str | None = None) -> str:
+        custom_id = request_id or f"req-{uuid.uuid4().hex}"
+        payload = {
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": model,
+                "messages": messages,
+            },
+        }
+        if metadata:
+            payload["metadata"] = metadata
+
+        parsed = self.execute_requests([payload])
+        entry = parsed.get(custom_id)
+        if not entry:
+            raise RuntimeError(f"Batch API: не найден ответ для {custom_id}.")
+        if entry.get("error"):
+            raise RuntimeError(f"Batch API: ошибка в ответе {custom_id}: {entry['error']}")
+
+        response_body = entry.get("response", {}).get("body")
+        if not response_body:
+            raise RuntimeError(f"Batch API: пустой ответ тела для {custom_id}.")
+        choices = response_body.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"Batch API: отсутствуют варианты ответа для {custom_id}.")
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        if not content:
+            raise RuntimeError(f"Batch API: пустое содержимое для {custom_id}.")
+        return content.strip()
+
+
+@dataclass
+class ArticleBatchContext:
+    task_id: str
+    keyword: str
+    num_for_keyword: int
+    total_for_keyword: int
+    global_index: int
+    total_global: int
+    attempt: int
+    selected_lang: str
+    target_link: str
+    topic_word: str | None
+    kw_for_prompt: str
+    log_prefix_base: str
+    h1_custom_id: str = field(default_factory=lambda: f"req-h1-{uuid.uuid4().hex}")
+    body_custom_id: str = field(default_factory=lambda: f"req-body-{uuid.uuid4().hex}")
+    api_key_short: str | None = None
+    h1_messages: list | None = None
+    body_messages: list | None = None
+    h1_text: str | None = None
+    filepath_to_save: str | None = None
+    error: str | None = None
+    metadata: dict = field(default_factory=dict)
+
+    def with_api_key(self, api_key: str):
+        self.api_key_short = f"...{api_key[-5:]}" if len(api_key) > 5 else api_key
+        return self
+
+    @property
+    def log_prefix(self) -> str:
+        key_part = f", ключ {self.api_key_short}" if self.api_key_short else ""
+        return (
+            f"[{self.task_id} ({self.num_for_keyword}/{self.total_for_keyword} для '{self.keyword}', {self.selected_lang}{key_part}), "
+            f"Общая {self.global_index}/{self.total_global}]"
+        )
+
 
 def _get_system_fingerprint() -> str:
     """Return a hash representing the current machine."""
@@ -529,16 +585,597 @@ class TextGeneratorApp(ctk.CTkFrame):
         self.telegram_chat_id = None
         self._load_telegram_settings()
 
+    def _acquire_batch_api_key(self):
+        while not self.stop_event.is_set():
+            try:
+                api_key = self.api_key_queue.get(timeout=1)
+                return api_key
+            except Empty:
+                self._initial_check_and_revive_keys()
+        return None
+
+    def _return_api_key_if_active(self, api_key: str):
+        if not api_key:
+            return
+        with self.api_key_statuses_lock:
+            status_data = self.api_key_statuses.get(api_key)
+            status_value = status_data.get("status") if status_data else "active"
+        if status_value == "active":
+            self.api_key_queue.put(api_key)
+
+    def _prepare_article_contexts(self, tasks_for_this_pass, attempt_number: int):
+        contexts: list[ArticleBatchContext] = []
+        selected_lang = self.generation_language_var.get()
+        target_link = self.target_link_var.get().strip()
+        topic_word = self.topic_word.strip() if self.topic_word else None
+        total = len(tasks_for_this_pass)
+        for idx, task_def in enumerate(tasks_for_this_pass, start=1):
+            keyword = task_def["keyword"]
+            kw_for_prompt = (
+                f"язык: {selected_lang}, тема {topic_word} для ключевого слова: {keyword}"
+                if topic_word
+                else keyword
+            )
+            log_prefix_base = (
+                f"[{task_def['id']} ({task_def['num_for_kw']}/{task_def['total_for_kw']} для '{keyword}', {selected_lang}), "
+                f"Общая {idx}/{total}]"
+            )
+            context = ArticleBatchContext(
+                task_id=task_def["id"],
+                keyword=keyword,
+                num_for_keyword=task_def["num_for_kw"],
+                total_for_keyword=task_def["total_for_kw"],
+                global_index=idx,
+                total_global=total,
+                attempt=attempt_number,
+                selected_lang=selected_lang,
+                target_link=target_link,
+                topic_word=topic_word,
+                kw_for_prompt=kw_for_prompt,
+                log_prefix_base=log_prefix_base,
+            )
+            contexts.append(context)
+        return contexts
+
+    def _build_h1_requests(self, contexts: list[ArticleBatchContext]):
+        requests_payload = []
+        for context in contexts:
+            h1_user_prompt_variations = [
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Придумай короткий, ясный, интригующий SEO H1 для статьи на тему I-Gaming (Не упоминай термин 'I-Gaming' в заголовке): {context.keyword}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Создай привлекающий внимание SEO заголовок H1 для текста о {context.keyword}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Какой SEO H1 лучше всего подойдет для статьи о {context.keyword}? Заголовок должен быть цепляющим. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Сформулируй основной SEO заголовок (H1) для материала по {context.keyword}. Кратко и по существу. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Напиши вопросительный SEO H1 для статьи, раскрывающей {context.keyword}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Предложи SEO H1, который подчеркивает пользу или решение проблемы, связанной с {context.keyword}. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка ЭТО ВАЖНО!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+                f"Язык: {context.selected_lang}. Тема: {context.topic_word} - Сгенерируй SEO H1, который содержит цифру или статистический факт (если уместно для темы I-Gaming (Не упоминай термин 'I-Gaming' в заголовке) {context.keyword}). Если неуместно, то просто интригующий H1. Ответ должен содержать только текст заголовка, без HTML-тегов или кавычек. Ключевое слово {context.keyword} не должно быть в начале и конце, оно должно быть гармонично вставлено в средину заголовка!! Заголовок не должен быть такой как у всех!!! Только одно предложение в заголовке!",
+            ]
+            selected_h1_user_prompt = random.choice(h1_user_prompt_variations)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты SEO-копирайтер. Придумай I-Gaming (Не упоминай термин 'I-Gaming' в тексте) заголовок H1. "
+                        f"Ответ на {context.selected_lang} языке. Начало не должно быть типичным: избегай слов 'Discover', 'Dive', 'How', 'Ultimate', 'What', 'Reel', 'Is', 'Unlocking' и подобных. Заголовок должен начинаться уникально. Ключевое слово {context.keyword} не должно быть в начале!"
+                    ),
+                },
+                {"role": "user", "content": selected_h1_user_prompt},
+            ]
+            context.h1_messages = messages
+            requests_payload.append(
+                {
+                    "custom_id": context.h1_custom_id,
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": DEFAULT_MODEL,
+                        "messages": messages,
+                    },
+                    "metadata": {
+                        "stage": "h1",
+                        "task_id": context.task_id,
+                        "attempt": context.attempt,
+                    },
+                }
+            )
+        return requests_payload
+
+    def _apply_h1_batch_results(self, contexts: list[ArticleBatchContext], responses: dict):
+        ready_contexts = []
+        for context in contexts:
+            if self.stop_event.is_set():
+                break
+            entry = responses.get(context.h1_custom_id)
+            if not entry:
+                context.error = "Ответ H1 отсутствует"
+                self.log_message(f"{context.log_prefix_base} H1 не получен из Batch API.", "ERROR")
+                continue
+            if entry.get("error"):
+                context.error = str(entry["error"])
+                self.log_message(
+                    f"{context.log_prefix_base} Ошибка Batch API при получении H1: {entry['error']}",
+                    "ERROR",
+                )
+                continue
+            response_body = entry.get("response", {}).get("body")
+            choices = response_body.get("choices") if response_body else None
+            if not choices:
+                context.error = "Пустой ответ H1"
+                self.log_message(
+                    f"{context.log_prefix_base} Batch API вернул пустой ответ для H1.",
+                    "ERROR",
+                )
+                continue
+            message = choices[0].get("message", {})
+            content = message.get("content")
+            if not content:
+                context.error = "Пустое содержимое H1"
+                self.log_message(
+                    f"{context.log_prefix_base} В ответе H1 отсутствует контент.",
+                    "ERROR",
+                )
+                continue
+
+            original_h1_text = content.replace('"', '').replace("'", "").strip()
+            if original_h1_text.lower().startswith("h1:"):
+                context.error = "H1 содержит префикс"
+                self.log_message(
+                    f"{context.log_prefix_base} H1 содержит префикс 'H1:' и будет пересоздан.",
+                    "WARNING",
+                )
+                continue
+            if not original_h1_text:
+                original_h1_text = context.keyword
+
+            context.h1_text = original_h1_text
+            try:
+                context.filepath_to_save = self.get_unique_filepath(original_h1_text)
+            except Exception as file_exc:
+                context.error = f"Ошибка пути: {file_exc}"
+                self.log_message(
+                    f"{context.log_prefix_base} Не удалось определить путь для сохранения: {file_exc}",
+                    "ERROR",
+                )
+                continue
+
+            self.log_message(f"{context.log_prefix_base} H1 (оригинал): '{original_h1_text}'")
+            ready_contexts.append(context)
+        return ready_contexts
+
+    def _compose_body_messages(self, context: ArticleBatchContext):
+        selected_lang = context.selected_lang
+        keyword_phrase = context.keyword
+        kw_for_prompt = context.kw_for_prompt
+        original_h1_text = context.h1_text or context.keyword
+
+        intro_word_count = random.randint(150, 300)
+        intro_paragraphs = intro_word_count // 50
+        num_h2_sections = random.randint(6, 9)
+        h3_per_section = random.choice([2, 3, 4])
+        total_h3 = num_h2_sections * h3_per_section
+        section_word_count = random.choice([150, 200, 250])
+        section_paragraphs = section_word_count // 50
+        num_tables = random.choice([1, 2, 3])
+        num_lists = random.choice([1, 2, 3])
+
+        body_prompt_user = (
+            f"Язык: {selected_lang}\n. Думай и пиши только на нем, избегай символов других языков, придерживайся правильности написания и грамматики языка {selected_lang}."
+            f"Твоя главная цель — создать **максимально подробный, объемный и всесторонне раскрывающий тему казино - {context.topic_word} (Не упоминай термин 'I-Gaming' в тексте) текст-статью с уникальным заголовком H1**. "
+            "Не экономь на словах, каждый аспект должен быть объяснен глубоко и детально."
+            "**Критически важно: стремись к верхней границе указанных диапазонов слов, а не к нижней.** "
+            f"Напиши статью на {selected_lang} языке только на казино тематику - {context.topic_word} (Не упоминай термин 'I-Gaming' в тексте) на тему '{kw_for_prompt}' (определи что это, не пиши билиберду) под основным заголовком (H1) '{original_h1_text}'.\n\n"
+            "**ТРЕБОВАНИЯ К HTML-СТРУКТУРЕ И РАЗМЕЩЕНИЮ ЭЛЕМЕНТОВ (согласно системным инструкциям):**\n"
+            "Помни, что статья ОБЯЗАТЕЛЬНО должна содержать HTML-таблицы и HTML-списки, как указано в системных инструкциях. "
+            "**КЛЮЧЕВОЕ УСЛОВИЕ:** Эти элементы (таблицы и списки) должны быть **логично интегрированы ВНУТРИ** соответствующих разделов H2 или H3. "
+            "Они НЕ должны группироваться в конце статьи или после заключения. Размещай их после одного или нескольких абзацев текста внутри раздела, но до следующего подзаголовка, чтобы они дополняли и иллюстрировали изложенный материал.\n"
+            "Используй для выделения ключевых слов теги <strong></strong>. Не используй Markdown-разметку (типа `**текст**`, `__текст__`, `*текст*` или `_текст_`) для этих целей.\n"
+            "В маркированных и нумерованных списках для выделения также используй <strong></strong>, а не Markdown.\n\n"
+            "**СОДЕРЖАНИЕ СТАТЬИ:**\n"
+            f"Язык: {selected_lang}\n. Думай и пиши только на нем, избегай символов других языков, придерживайся правильности написания и грамматики языка {selected_lang}."
+            f"1.  **Вступление:** Напиши подробное вступление ({intro_word_count} слов, {intro_paragraphs} абзацев), плавно вводящее в тему.\n"
+            f"2.  **Основные разделы (H2) и Интеграция Элементов:** Создай примерно {num_h2_sections} основных разделов с подзаголовками H2 (<h2>…</h2>). Каждый раздел должен быть объемом около {section_word_count} слов ({section_paragraphs} абзацев).\n"
+            "    * **Во время написания этих разделов H2 (или их H3 подразделах), ты ДОЛЖЕН интегрировать HTML-элементы:**\n"
+            "        * **Первую HTML-таблицу** постарайся разместить внутри одного из первых 2-3 разделов H2 (или его H3 подраздела), после нескольких абзацев текста.\n"
+            "        * **HTML-маркированный список** интегрируй в один из следующих разделов H2/H3, также внутри текстового контента.\n"
+            "        * **HTML-нумерованный список** (и вторую таблицу, если создаешь две) размести в последующих разделах H2/H3, аналогично интегрируя в текст.\n"
+            "    * **Не добавляй все элементы в один раздел и не оставляй их на конец статьи.**\n"
+            f"3.  **Подразделы (H3):** Где это уместно, под каждым H2 добавь {h3_per_section} подзаголовков H3 (<h3>…</h3>). Каждый подраздел H3 должен содержать примерно {random.randint(150, 180)} слов ({random.randint(2, 3)} абзаца).\n"
+            f"    * **Общее количество H2 и H3:** Убедись, что общее число заголовков H2 и H3 составляет от 8 до 10 (не считая H1). Распредели {total_h3} подзаголовков H3 по разделам H2.\n\n"
+            "4. **Подводящее итоги статьи** Напиши содержательно (1-2 абзаца, примерно 100-150 слов), подводящее итоги статьи. **HTML-таблицы и списки НЕ должны идти ПОСЛЕ итогов статьи, не употребляй слово 'Заключение'**\n\n"
+            "**ДОПОЛНИТЕЛЬНЫЕ ТРЕБОВАНИЯ К ТЕКСТУ:**\n"
+            f"Язык: {selected_lang}\n. Думай и пиши только на нем, избегай символов других языков, придерживайся правильности написания и грамматики языка {selected_lang}."
+            f"-   **Абзацы:** Каждый абзац во всей статье должен состоять минимум из 3–5 полных предложений.\n"
+            f"-   **Ключевая фраза:** Включи ключевую фразу '{keyword_phrase}' 1–2 раза **внутри тегов <p>…</p>** так, чтобы она выглядела естественно в тексте.\n"
+            "-   **Оригинальность:** Не повторяй основной H1 в других заголовках или абзацах. Текст должен быть оригинальным, с уникальной структурой заголовков.\n"
+            "-   **Наполнение:** Проверь, чтобы не было пустых или слишком коротких разделов.\n"
+            "-   **Форматирование:** Для выделения жирным шрифтом всегда используй теги `<strong></strong>`. Для курсивного начертания всегда используй теги `<em></em>`. Не используй Markdown-разметку.\n"
+            "-   **Не нумеруй** заголовки цифрами типа '1.', '2.', '3.' и т.д. Заголовки должны быть текстовыми, без префиксов из чисел.\n"
+            "-   **Перепроверь** чтобы не было ошибки с заголовками и они не повторялись одинаково между собой, например два H1. H1 должен быть только один в тексте.\n"
+        )
+
+        body_prompt_system = (
+            f"Язык: {selected_lang}\n. Думай и пиши только на нем, избегай символов других языков, придерживайся правильности написания и грамматики языка {selected_lang}."
+            "Ты опытный SEO-копирайтер. Твоя задача — сгенерировать **высококачественный, объёмный и подробный** HTML-контент для сайта. "
+            "**Строго следуй инструкциям пользователя по содержанию, объему текста (вступление, H2, H3, заключение) и количеству абзацев.**\n\n"
+            "**ГЛАВНОЕ ТРЕБОВАНИЕ: ГЕНЕРАЦИЯ И ИНТЕГРАЦИЯ HTML-ЭЛЕМЕНТОВ:**\n"
+            "1.  **ОБЯЗАТЕЛЬНО СОЗДАЙ И ВКЛЮЧИ В ТЕКСТ СТАТЬИ:**\n"
+            "    * **Одну или две (1-2) HTML-таблицы.** Таблицы должны быть информативными и релевантными теме. Структура таблицы: `<table><thead><tr><th>Заголовок1</th><th>Заголовок2</th>...</tr></thead><tbody><tr><td>Данные1</td><td>Данные2</td>...</tr><tr><td>Данные3</td><td>Данные4</td>...</tr>...</tbody></table>`. Заголовки таблицы (теги `<th>`) ОБЯЗАТЕЛЬНО внутри `<thead>`. Данные таблицы (теги `<td>`) ОБЯЗАТЕЛЬНО внутри `<tbody>`.\n"
+            "    * **Один (1) HTML-маркированный список.** Формат: `<ul><li>Пункт 1</li><li>Пункт 2</li>...</ul>`.\n"
+            "    * **Один (1) HTML-нумерованный список.** Формат: `<ol><li>Пункт A</li><li>Пункт B</li>...</ol>`.\n"
+            "2.  **КРИТИЧЕСКИ ВАЖНОЕ ПРАВИЛО РАЗМЕЩЕНИЯ ЭЛЕМЕНТОВ:**\n"
+            "    * **ИНТЕГРИРУЙ** эти HTML-элементы (таблицы и списки) **НЕПОСРЕДСТВЕННО ВНУТРИ ТЕКСТА** соответствующих разделов H2 или H3, как указано в пользовательском промпте (например, таблица в одном из первых H2, списки в последующих). Они должны быть окружены абзацами текста этих разделов.\n"
+            "    * **АБСОЛЮТНО ЗАПРЕЩЕНО:** Размещать таблицы или списки ПОСЛЕ заключительного раздела статьи. Они также НЕ должны быть сгруппированы вместе в конце статьи или перед заключением.\n"
+            "    * Элементы должны логически дополнять и иллюстрировать текст раздела, в который они вставлены.\n\n"
+            "**ПРАВИЛА ФОРМАТИРОВАНИЯ HTML:**\n"
+            "-   **Только HTML:** Весь контент должен быть представлен в виде чистой HTML-разметки. Ответ должен начинаться непосредственно с первого HTML-тега основного контента (например, `<p>` из вступления или `<h2>` первого раздела, если вступление отсутствует в ТЗ) и заканчиваться последним HTML-тегом (например, `</p>` из заключения).\n"
+            "-   **Без оберток и посторонних элементов:** НЕ включай `<!DOCTYPE>`, `<html>`, `<head>`, `<body>`. НЕ включай в свой ответ заголовок H1 (он будет добавлен отдельно). НЕ генерируй таблицы содержания (ToC) или любые другие навигационные блоки, если это не указано явно.\n"
+            "-   **НЕ оборачивай HTML-ответ** в блоки ```html ... ```, ``` ```, или любые другие markdown-конструкции.\n"
+            "-   **Заголовки:** Используй `<h2>` и `<h3>` для заголовков.\n"
+            "-   **Абзацы:** Каждый абзац должен быть обернут в теги `<p>…</p>`.\n"
+            "-   **Выделение текста:**\n"
+            "    * Для выделения жирным шрифтом **ВСЕГДА** используй теги `<strong></strong>`.\n"
+            "    * Для курсивного начертания **ВСЕГДА** используй теги `<em></em>`.\n"
+            "    * **ЗАПРЕЩЕНО** использовать Markdown для выделения (например, `**текст**`, `__текст__`, `*текст*`, `_текст_`). Это касается как основного текста, так и текста внутри списков и таблиц.\n"
+            "-   **Списки и таблицы:** Убедись, что все HTML-теги (`<table>`, `<thead>`, `<tbody>`, `<tr>`, `<th>`, `<td>`, `<ul>`, `<ol>`, `<li>`) корректно открыты и закрыты. Каждый элемент `<li>` должен быть отдельным пунктом. Таблица должна быть минимум 2x2.\n\n"
+            "**СТРУКТУРА КОНТЕНТА (краткое напоминание из пользовательского запроса):**\n"
+            "-   Вступление, затем разделы H2/H3, затем заключение, как указано пользователем.\n"
+            "-   **Интеграция HTML-элементов (таблиц, списков) должна происходить ВНУТРИ разделов H2/H3, ДО заключения.**\n\n"
+            "**ФИНАЛЬНАЯ ПРОВЕРКА ПЕРЕД ОТВЕТОМ (выполни мысленно):**\n"
+            "1. Все ли запрошенные HTML-элементы (таблицы, списки) присутствуют?\n"
+            "2. Интегрированы ли они ВНУТРИ различных разделов H2/H3, а НЕ в конце статьи и НЕ после заключения?\n"
+            "3. Соответствует ли весь текст HTML-форматированию и другим требованиям (отсутствие Markdown, правильные теги и т.д.)?\n"
+            f"4. Начинается ли ответ с `<p>` или `<h2>` и не содержит ли он H1 или блоков ToC?\n"
+            f"5. Нету ли в тексте символов которых нету в языке {selected_lang}, все ли правильно ?\n"
+            "**Если какой-либо из этих пунктов нарушен, исправь свой ответ ПЕРЕД тем, как его предоставить.**"
+        )
+
+        context.body_messages = [
+            {"role": "system", "content": body_prompt_system},
+            {"role": "user", "content": body_prompt_user},
+        ]
+        context.metadata.update(
+            {
+                "body_intro_words": intro_word_count,
+                "body_sections": num_h2_sections,
+                "body_tables": num_tables,
+                "body_lists": num_lists,
+            }
+        )
+        return context.body_messages
+
+    def _build_body_requests(self, contexts: list[ArticleBatchContext]):
+        requests_payload = []
+        for context in contexts:
+            if context.h1_text is None:
+                continue
+            messages = context.body_messages or self._compose_body_messages(context)
+            requests_payload.append(
+                {
+                    "custom_id": context.body_custom_id,
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": DEFAULT_MODEL,
+                        "messages": messages,
+                    },
+                    "metadata": {
+                        "stage": "body",
+                        "task_id": context.task_id,
+                        "attempt": context.attempt,
+                    },
+                }
+            )
+        return requests_payload
+
+    def _apply_body_batch_results(self, contexts: list[ArticleBatchContext], responses: dict):
+        for context in contexts:
+            if self.stop_event.is_set():
+                break
+
+            entry = responses.get(context.body_custom_id)
+            log_prefix = context.log_prefix
+            filepath_to_save = context.filepath_to_save
+            original_h1_text = context.h1_text or context.keyword
+            selected_lang = context.selected_lang
+            keyword_phrase = context.keyword
+            target_link = context.target_link
+
+            if not entry:
+                context.error = "Ответ тела отсутствует"
+                self.log_message(f"{log_prefix} Ответ для тела не получен из Batch API.", "ERROR")
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+            if entry.get("error"):
+                context.error = str(entry["error"])
+                self.log_message(f"{log_prefix} Ошибка Batch API при получении тела: {entry['error']}", "ERROR")
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+
+            response_body = entry.get("response", {}).get("body")
+            choices = response_body.get("choices") if response_body else None
+            if not choices:
+                context.error = "Пустой ответ тела"
+                self.log_message(f"{log_prefix} Batch API вернул пустой ответ для тела статьи.", "ERROR")
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+            message = choices[0].get("message", {})
+            article_body_raw_from_api = message.get("content")
+            if not article_body_raw_from_api:
+                context.error = "Пустое содержимое тела"
+                self.log_message(f"{log_prefix} В ответе тела отсутствует контент.", "ERROR")
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+
+            link_inserted_flag = False
+            heading_id_counter = 1
+
+            cleaned_api_response_for_wrappers = article_body_raw_from_api
+            cleaned_api_response_for_wrappers = re.sub(r'^\s*<p>\s*```html\s*</p>\s*\n?', '',
+                                                       cleaned_api_response_for_wrappers,
+                                                       flags=re.IGNORECASE | re.MULTILINE)
+            cleaned_api_response_for_wrappers = re.sub(r'\n?\s*<p>\s*```\s*</p>\s*$', '',
+                                                       cleaned_api_response_for_wrappers,
+                                                       flags=re.IGNORECASE | re.MULTILINE)
+            cleaned_api_response_for_wrappers = re.sub(r'^\s*```html\s*\n?', '', cleaned_api_response_for_wrappers,
+                                                       flags=re.IGNORECASE)
+            cleaned_api_response_for_wrappers = re.sub(r'\n?\s*```\s*$', '', cleaned_api_response_for_wrappers,
+                                                       flags=re.IGNORECASE)
+
+            article_to_clean_further = cleaned_api_response_for_wrappers.strip()
+            cleaned_body_html_str = self._clean_html_structure(article_to_clean_further, log_prefix)
+
+            soup_container = BeautifulSoup(f"<div>{cleaned_body_html_str}</div>", 'html.parser')
+            actual_body_root = soup_container.div
+
+            if actual_body_root and actual_body_root.contents:
+                first_significant_child = None
+                for node in actual_body_root.contents:
+                    if hasattr(node, 'name') and node.name:
+                        first_significant_child = node
+                        break
+
+                if first_significant_child and first_significant_child.name == 'h1':
+                    h1_text_in_body = first_significant_child.get_text(strip=True)
+                    if h1_text_in_body.lower() == original_h1_text.lower() or (
+                        len(h1_text_in_body) > 3 and len(h1_text_in_body) < (len(original_h1_text) + 30)
+                        and original_h1_text.lower() in h1_text_in_body.lower()
+                    ):
+                        self.log_message(
+                            f"{log_prefix} Обнаружен и удален тег H1 ('{h1_text_in_body[:60]}...') из тела ответа API (DOM).",
+                            "INFO",
+                        )
+                        first_significant_child.extract()
+
+            if actual_body_root and actual_body_root.find('h1'):
+                context.error = "Лишний H1"
+                self.log_message(
+                    f"{log_prefix} Обнаружен лишний тег H1 в тексте после очистки. Статья будет пересоздана.",
+                    "WARNING",
+                )
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+
+            toc_items = []
+            main_h1_id = f"t{heading_id_counter}"
+            toc_items.append({"level": 1, "text": original_h1_text, "id": main_h1_id})
+            generated_h1_html = f'<h1 id="{main_h1_id}">{original_h1_text}</h1>'
+            heading_id_counter += 1
+
+            if actual_body_root:
+                for h_tag in actual_body_root.find_all(['h2', 'h3']):
+                    level = int(h_tag.name[1:])
+                    heading_text_clean = h_tag.get_text(strip=True) or f"Подзаголовок {level}"
+
+                    h_id = f"t{heading_id_counter}"
+                    h_tag['id'] = h_id
+                    toc_items.append({"level": level, "text": heading_text_clean, "id": h_id})
+                    heading_id_counter += 1
+
+                    link_inserted_flag_ref = [link_inserted_flag]
+                    if actual_body_root and target_link and keyword_phrase and not link_inserted_flag_ref[0]:
+                        candidate_tags_in_first_section = []
+                        for child_node in actual_body_root.children:
+                            if not hasattr(child_node, 'name'):
+                                continue
+                            if child_node.name == 'h2':
+                                break
+                            if child_node.name in ['p', 'li']:
+                                candidate_tags_in_first_section.append(child_node)
+                            elif hasattr(child_node, 'find_all') and child_node.find_all(['p', 'li'], recursive=False):
+                                for sub_tag in child_node.find_all(['p', 'li'], recursive=False):
+                                    if hasattr(sub_tag, 'find') and not sub_tag.find('h2'):
+                                        candidate_tags_in_first_section.append(sub_tag)
+
+                        if not candidate_tags_in_first_section:
+                            self.log_message(
+                                f"{log_prefix} Не найдено подходящих тегов (<p> или <li>) под H1 (до первого H2) для вставки ссылки.",
+                                "WARNING",
+                            )
+                        else:
+                            temp_shuffled_candidates_for_search = list(candidate_tags_in_first_section)
+                            random.shuffle(temp_shuffled_candidates_for_search)
+
+                            for tag in temp_shuffled_candidates_for_search:
+                                if link_inserted_flag_ref[0]:
+                                    break
+
+                                existing_keyword_links = tag.find_all('a', string=re.compile(re.escape(keyword_phrase), re.IGNORECASE))
+                                already_linked_correctly = any(link_tag.get('href') == target_link for link_tag in existing_keyword_links)
+                                if already_linked_correctly:
+                                    self.log_message(
+                                        f"{log_prefix} Ссылка для '{keyword_phrase}' на '{target_link}' уже есть в <{tag.name}> (зона под H1).",
+                                        "DEBUG",
+                                    )
+                                    link_inserted_flag_ref[0] = True
+                                    break
+
+                                text_nodes = tag.find_all(string=True, recursive=True)
+                                for text_node in text_nodes:
+                                    if text_node.parent.name == 'a':
+                                        continue
+
+                                    node_text = str(text_node)
+                                    match = re.search(r'(?i)\b(' + re.escape(keyword_phrase) + r')\b', node_text)
+                                    if match:
+                                        original_kw_casing = match.group(1)
+                                        text_before_keyword = node_text[:match.start()]
+                                        text_after_keyword = node_text[match.end():]
+
+                                        link_tag_obj = soup_container.new_tag('a', href=target_link)
+                                        link_tag_obj.string = original_kw_casing
+
+                                        current_node_to_operate_on = text_node
+                                        if text_after_keyword:
+                                            current_node_to_operate_on.insert_after(NavigableString(text_after_keyword))
+                                        current_node_to_operate_on.insert_after(link_tag_obj)
+                                        if text_before_keyword:
+                                            current_node_to_operate_on.insert_after(NavigableString(text_before_keyword))
+                                        current_node_to_operate_on.extract()
+
+                                        link_inserted_flag_ref[0] = True
+                                        self.log_message(
+                                            f"{log_prefix} Ссылка для '{keyword_phrase}' успешно вставлена в <{tag.name}> (зона под H1, ключ найден).",
+                                            "INFO",
+                                        )
+                                        break
+                                if link_inserted_flag_ref[0]:
+                                    break
+
+                    link_inserted_flag = link_inserted_flag_ref[0]
+
+            if actual_body_root and keyword_phrase:
+                found_kw = soup_container.find(string=re.compile(re.escape(keyword_phrase), re.IGNORECASE))
+                if not found_kw:
+                    candidate_targets = []
+                    if actual_body_root:
+                        candidate_targets.extend(actual_body_root.find_all('p'))
+                        candidate_targets.extend(actual_body_root.find_all('li'))
+                    if candidate_targets:
+                        tgt = random.choice(candidate_targets)
+                        words = tgt.get_text(" ", strip=True).split()
+                        if words:
+                            idx = random.randint(0, max(0, len(words) - 2))
+                            words.insert(idx + 1, keyword_phrase)
+                            for child in list(tgt.children):
+                                child.extract()
+                            tgt.append(NavigableString(" ".join(words)))
+                        self.log_message(f"{log_prefix} Ключевая фраза добавлена в тег <{tgt.name}>.", "INFO")
+
+            article_body_html_processed = "".join(str(content_node) for content_node in actual_body_root.contents) if actual_body_root else ""
+
+            if not self._has_text_under_h1(actual_body_root):
+                context.error = "Нет текста под H1"
+                self.log_message(
+                    f"{log_prefix} Нет текста под H1. Статья будет пересоздана.",
+                    "WARNING",
+                )
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+
+            total_toc_len = sum(len(it["text"]) for it in toc_items)
+            if any(len(it["text"]) > MAX_TOC_ITEM_CHARS for it in toc_items) or total_toc_len > MAX_TOC_TOTAL_CHARS:
+                context.error = "Некорректное оглавление"
+                self.log_message(
+                    f"{log_prefix} Некорректное оглавление (слишком длинные пункты). Статья будет пересоздана.",
+                    "WARNING",
+                )
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+
+            toc_li_html = "".join(f'<li><a href="#{item["id"]}">{item["text"]}</a></li>' for item in toc_items)
+            chosen_toc_bg_color = random.choice(self.article_toc_background_colors)
+            toc_div = f'''<div id="texter" style="background: {chosen_toc_bg_color};border: 1px solid #aaa;display: table;margin-bottom: 1em;padding: 1em;width: 350px;">
+                                <p class="toctitle" style="font-weight: 700; text-align: center">
+                    </p>
+                    <ul class="toc_list">{toc_li_html}</ul>
+            </div>'''
+
+            final_body_content_parts = [toc_div, generated_h1_html, article_body_html_processed]
+            final_body_content = "\n".join(final_body_content_parts)
+
+            plain_text_for_repetition = BeautifulSoup(final_body_content, 'html.parser').get_text(separator=' ')
+            repeat_match = re.search(r'\b(\w+)\b(?:\s+\1\b){2,}', plain_text_for_repetition, flags=re.IGNORECASE)
+            if repeat_match:
+                repeated_word = repeat_match.group(1)
+                context.error = "Повтор слов"
+                self.log_message(
+                    f"{log_prefix} Обнаружено повторение слова '{repeated_word}' более трёх раз подряд. Статья будет пересоздана.",
+                    "WARNING",
+                )
+                if filepath_to_save:
+                    self.release_filepath(filepath_to_save)
+                continue
+
+            output_format = self.output_format_var.get()
+
+            try:
+                with open(filepath_to_save, "w", encoding="utf-8") as f:
+                    f.write(final_body_content)
+                size_written = os.path.getsize(filepath_to_save)
+                if size_written < MIN_ARTICLE_SIZE:
+                    os.remove(filepath_to_save)
+                    context.error = "Файл слишком маленький"
+                    self.log_message(
+                        f"{log_prefix} Файл слишком маленький и будет пересоздан: {os.path.basename(filepath_to_save)}",
+                        "WARNING",
+                    )
+                    self.release_filepath(filepath_to_save)
+                    continue
+                if size_written > MAX_ARTICLE_SIZE:
+                    os.remove(filepath_to_save)
+                    context.error = "Файл слишком большой"
+                    self.log_message(
+                        f"{log_prefix} Удален слишком большой файл: {os.path.basename(filepath_to_save)}",
+                        "WARNING",
+                    )
+                    self.release_filepath(filepath_to_save)
+                    continue
+            except Exception as e_size:
+                context.error = f"Ошибка сохранения: {e_size}"
+                self.log_message(
+                    f"{log_prefix} Ошибка проверки размера файла {os.path.basename(filepath_to_save)}: {e_size}",
+                    "ERROR",
+                )
+                if os.path.exists(filepath_to_save):
+                    try:
+                        os.remove(filepath_to_save)
+                    except Exception:
+                        pass
+                self.release_filepath(filepath_to_save)
+                continue
+
+            self.log_message(f"{log_prefix} Файл ('{output_format}') сохранен: {os.path.basename(filepath_to_save)}")
+            if target_link and not link_inserted_flag:
+                self.log_message(f"{log_prefix} ВНИМАНИЕ: Ссылка для '{keyword_phrase}' НЕ БЫЛА ВСТАВЛЕНА.", "WARNING")
+
+            with self.success_lock:
+                self.successful_task_ids.add(context.task_id)
+            with self.output_count_lock:
+                self.output_file_counter += 1
+            self.update_progress(context.task_id, keyword_phrase, context.num_for_keyword)
+            with self.previous_h1_lock:
+                self.previous_h1_text = original_h1_text
+
+
+
     def _run_task_batch(self):
-        """Run generation loops for current self.all_task_definitions."""
+        """Execute all pending tasks via the Batch API in as few passes as possible."""
         self._initial_check_and_revive_keys()
         if self.api_key_queue.empty():
             self.log_message("Нет доступных API ключей для начала генерации. Проверьте статусы.", "ERROR")
             return
+
         for pass_num in range(MAX_RETRY_PASSES):
             if self.stop_event.is_set():
                 self.log_message("Процесс генерации остановлен до начала нового прохода.", "INFO")
                 break
+
             if pass_num > 0:
                 self.log_message(f"Проход {pass_num + 1}: Проверка и оживление cooldown ключей...", "DEBUG")
                 self._initial_check_and_revive_keys()
@@ -556,21 +1193,104 @@ class TextGeneratorApp(ctk.CTkFrame):
             self.log_message(f"--- Проход генерации {pass_num + 1}/{MAX_RETRY_PASSES} ---")
             self.log_message(f"Задач к выполнению на этом проходе: {len(tasks_for_this_pass)}")
 
-            for current_index, task_def in enumerate(tasks_for_this_pass, start=1):
-                if self.stop_event.is_set():
-                    break
-                self.generate_single_article_content(
-                    task_def["id"],
-                    task_def["keyword"],
-                    task_def["num_for_kw"],
-                    task_def["total_for_kw"],
-                    current_index,
-                    len(tasks_for_this_pass),
-                )
+            contexts = self._prepare_article_contexts(tasks_for_this_pass, pass_num + 1)
+            if not contexts:
+                continue
 
-            if self.stop_event.is_set():
-                self.log_message(f"Проход генерации {pass_num + 1} прерван.", "INFO")
+            api_key = self._acquire_batch_api_key()
+            if not api_key:
+                self.log_message("Не удалось получить API ключ для Batch API.", "ERROR")
                 break
+
+            with api_key_last_call_time_lock:
+                last_ts = api_key_last_call_time.get(api_key, 0.0)
+            to_wait = PER_KEY_CALL_INTERVAL - (time.time() - last_ts)
+            if to_wait > 0:
+                time.sleep(to_wait)
+
+            try:
+                client_instance = OpenAI(api_key=api_key, timeout=120.0, max_retries=0)
+            except Exception as init_exc:
+                self.log_message(f"Ошибка инициализации клиента OpenAI для ключа {api_key[:7]}...: {init_exc}", "ERROR")
+                self.after(0, self._update_gui_and_log_bad_key, api_key)
+                continue
+
+            executor = BatchAPIExecutor(client_instance, self.log_message)
+            for context in contexts:
+                context.with_api_key(api_key)
+
+            try:
+                h1_requests = self._build_h1_requests(contexts)
+                h1_responses = executor.execute_requests(
+                    h1_requests,
+                    metadata={"stage": "h1", "pass": pass_num + 1, "tasks": len(h1_requests)},
+                )
+                ready_contexts = self._apply_h1_batch_results(contexts, h1_responses)
+
+                if not ready_contexts:
+                    self.log_message(
+                        f"Проход {pass_num + 1}: Ни один H1 не был успешно получен, переход к следующему проходу.",
+                        "WARNING",
+                    )
+                    continue
+
+                body_requests = self._build_body_requests(ready_contexts)
+                if not body_requests:
+                    self.log_message(
+                        f"Проход {pass_num + 1}: Нет задач для генерации тела статьи после этапа H1.",
+                        "WARNING",
+                    )
+                else:
+                    body_responses = executor.execute_requests(
+                        body_requests,
+                        metadata={"stage": "body", "pass": pass_num + 1, "tasks": len(body_requests)},
+                    )
+                    self._apply_body_batch_results(ready_contexts, body_responses)
+
+            except APIStatusError as ase:
+                log_level = "ERROR" if ase.status_code in (401, 403) else "WARNING"
+                self.log_message(
+                    f"Batch API StatusError: {ase}. Status Code: {ase.status_code}. Проход {pass_num + 1}.",
+                    log_level,
+                )
+                if ase.status_code == 401:
+                    self.after(0, self._update_gui_and_log_bad_key, api_key)
+                elif ase.status_code == 429:
+                    time.sleep(2)
+            except RateLimitError as rle:
+                self.log_message(f"Batch API RateLimitError: {rle}. Проход {pass_num + 1}.", "WARNING")
+                time.sleep(2)
+            except APIConnectionError as ace:
+                self.log_message(f"Batch API ConnectionError: {ace}. Проход {pass_num + 1}.", "WARNING")
+                time.sleep(2)
+            except RuntimeError as rte:
+                self.log_message(f"Batch API RuntimeError: {rte}. Проход {pass_num + 1}.", "ERROR")
+            except Exception as e:
+                self.log_message(
+                    f"Необработанная ошибка Batch API ({type(e).__name__}): {e}. Проход {pass_num + 1}.",
+                    "ERROR",
+                )
+            finally:
+                with api_key_last_call_time_lock:
+                    api_key_last_call_time[api_key] = time.time()
+                with self.api_key_statuses_lock:
+                    status_entry = self.api_key_statuses.get(api_key)
+                    if status_entry is None:
+                        status_entry = self._get_default_api_key_status()
+                        self.api_key_statuses[api_key] = status_entry
+                    status_entry["status"] = "active"
+                    status_entry["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+                self._return_api_key_if_active(api_key)
+
+            remaining_after_pass = [d for d in self.all_task_definitions if d["id"] not in self.successful_task_ids]
+            if not remaining_after_pass:
+                self.log_message("Все задачи успешно выполнены в текущем проходе.", "INFO")
+                break
+            else:
+                self.log_message(
+                    f"После прохода {pass_num + 1} осталось {len(remaining_after_pass)} задач для повторной генерации.",
+                    "INFO",
+                )
         else:
             remaining_tasks_count = len([d for d in self.all_task_definitions if d['id'] not in self.successful_task_ids])
             if remaining_tasks_count == 0:
@@ -578,7 +1298,8 @@ class TextGeneratorApp(ctk.CTkFrame):
             else:
                 self.log_message(
                     f"После {MAX_RETRY_PASSES} проходов не удалось сгенерировать {remaining_tasks_count} из {len(self.all_task_definitions)} статей.",
-                    "WARNING")
+                    "WARNING",
+                )
 
     def log_message(self, message, level="INFO"):
         if getattr(self, 'silent_stop', False) and self.stop_event.is_set():
