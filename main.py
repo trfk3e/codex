@@ -42,7 +42,7 @@ import tempfile
 from typing import Callable, Dict, List, Optional, Any
 import contextlib
 from types import SimpleNamespace
-from requests import Response
+from requests import Response, Request
 from requests import exceptions as requests_exceptions
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 
@@ -163,6 +163,14 @@ class BatchAPIManager:
         self.api_key = api_key
         self.model = model
         self.default_logger = default_logger
+        self._session = requests.Session()
+        self._session.trust_env = False
+        try:
+            self._session.headers.clear()
+        except Exception:
+            # В некоторых версиях requests headers может быть обычным dict
+            self._session.headers = {}
+        self._session.cookies.clear()
         self.pending_requests: List[BatchRequestRecord] = []
         self.condition = threading.Condition()
         self.shutdown_flag = False
@@ -204,6 +212,10 @@ class BatchAPIManager:
             self.condition.notify_all()
         if wait and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=5.0)
+        try:
+            self._session.close()
+        except Exception:
+            pass
 
     def _worker_loop(self):
         while True:
@@ -402,20 +414,41 @@ class BatchAPIManager:
         }
         if json_body is not None:
             headers["Content-Type"] = "application/json"
+        headers = {
+            **headers,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        }
+        request = Request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=json_body,
+            data=data,
+            files=files,
+        )
+        prepared = self._session.prepare_request(request)
+        # Удаляем любые автоматически добавленные cookie, чтобы Cloudflare не получал длинный заголовок
+        if "Cookie" in prepared.headers:
+            prepared.headers.pop("Cookie", None)
+        send_kwargs = self._session.merge_environment_settings(
+            prepared.url,
+            proxies={},
+            stream=stream,
+            verify=None,
+            cert=None,
+        )
+        send_kwargs["timeout"] = BATCH_HTTP_TIMEOUT_SECONDS
+        send_kwargs["stream"] = stream
         try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                json=json_body,
-                data=data,
-                files=files,
-                timeout=BATCH_HTTP_TIMEOUT_SECONDS,
-                cookies={},
-                stream=stream,
-            )
+            response = self._session.send(prepared, **send_kwargs)
         except requests_exceptions.RequestException as exc:
             raise BatchAPIError(f"Ошибка сети при обращении к Batch API ({method} {path}): {exc}")
+        finally:
+            # Гарантируем, что куки не накапливаются между запросами
+            with contextlib.suppress(Exception):
+                self._session.cookies.clear()
 
         if response.status_code == 401:
             raise BatchInvalidAPIKeyError("Batch API вернул код 401: недействительный ключ.")
