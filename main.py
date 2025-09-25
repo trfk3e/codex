@@ -332,6 +332,33 @@ class ChatConfig:
 
 ALL_CHATS: dict[str, ChatConfig] = {}
 
+
+@dataclass
+class AutoCandidate:
+    """Информация о посте, подготовленном для выбора лучшего из десятки."""
+
+    channel: str
+    msg_id: int
+    source: str
+    link: str
+    digest: dict
+    body: str
+
+    def choice_summary(self) -> str:
+        title = str(self.digest.get("title", "")).strip()
+        summary = str(self.digest.get("summary", "")).strip()
+        if summary and len(summary) > 400:
+            summary = summary[:400].rstrip() + "…"
+        highlights = [str(item).strip() for item in self.digest.get("highlights", []) if item]
+        parts = [f"Источник: {self.source}"]
+        if title:
+            parts.append(f"Заголовок: {title}")
+        if summary:
+            parts.append(f"Суть: {summary}")
+        if highlights:
+            parts.append("Факты: " + "; ".join(highlights[:3]))
+        return "\n".join(parts)
+
 async def log(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     cfg = get_cfg(ctx)
     if cfg.log_enabled and ctx.chat_data.get("target_chat"):
@@ -861,6 +888,185 @@ async def process_and_send(
     return True
 
 
+async def prepare_auto_candidate(
+    ctx: ContextTypes.DEFAULT_TYPE, msg: Message, chan: str
+) -> AutoCandidate | None:
+    """Подготовить пост для режима "10 постов": сделать выжимку без отправки."""
+
+    if ctx.chat_data.get("stop"):
+        return None
+
+    cfg = get_cfg(ctx)
+    key = chan.lstrip("@")
+    seen = cfg.ids.setdefault(key, deque(maxlen=PROCESSED_LIMIT))
+    if msg.id in seen:
+        await log(ctx, f"Пропускаю {msg.id}: уже обработан")
+        return None
+
+    await log(ctx, f"Проверяю пост {msg.id} из {chan}")
+    try:
+        ai_ok, reason = await ai_check(cfg, msg.text)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+    except Exception:
+        logging.exception("AI filter failed (batch mode)")
+        await log(ctx, f"AI ошибка при обработке {msg.id}")
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+
+    if ctx.chat_data.get("stop"):
+        return None
+
+    await log(ctx, f"AI ответ для {msg.id}: {'YES' if ai_ok else 'NO'}")
+    if not ai_ok:
+        if reason:
+            await log(ctx, reason)
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+
+    username = getattr(msg.chat, "username", None) or chan.lstrip("@")
+    link = (
+        f"https://t.me/{username}/{msg.id}"
+        if username and not username.lstrip("-").isdigit()
+        else ""
+    )
+    raw_src = f"@{username}" if username and not username.lstrip("-").isdigit() else chan
+
+    await log(ctx, f"Формируем выжимку для поста {msg.id} (режим 10)")
+    try:
+        digest = await build_digest_payload(msg.text)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+    except Exception:
+        logging.exception("Failed to build digest (batch mode)")
+        await log(ctx, f"Не удалось построить выжимку для {msg.id}")
+        mark_processed(cfg, key, msg.id)
+        save_all()
+        return None
+
+    body = render_digest(digest, raw_src, link)
+    mark_processed(cfg, key, msg.id)
+    save_all()
+    await log(ctx, f"Пост {msg.id} добавлен в очередь лучших")
+    return AutoCandidate(
+        channel=chan,
+        msg_id=msg.id,
+        source=raw_src,
+        link=link,
+        digest=digest,
+        body=body,
+    )
+
+
+async def choose_best_candidate(batch: list[AutoCandidate]) -> tuple[int, str]:
+    """Выбрать лучший пост из партии через OpenAI. Возвращает индекс и сырой ответ."""
+
+    system_msg = (
+        "Ты опытный редактор SEO-дайджеста. Оцени собранные публикации и выбери одну, "
+        "которая принесёт наибольшую пользу читателям (конкретные кейсы, практические выводы, свежие инсайты)."
+    )
+    parts: list[str] = []
+    for idx, candidate in enumerate(batch, start=1):
+        block = candidate.choice_summary()
+        parts.append(f"{idx}. {block}")
+    user_msg = (
+        "\n\n".join(parts)
+        + "\n\nОтветь только числом от 1 до "
+        + str(len(batch))
+        + " — номер самой полезной публикации."
+    )
+
+    rsp = await openai_call(
+        lambda client: client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+    )
+    raw = rsp.choices[0].message.content.strip()
+    match = re.search(r"(\d+)", raw)
+    if not match:
+        raise ValueError(f"Не удалось распознать ответ модели: {raw}")
+    choice = int(match.group(1))
+    if not 1 <= choice <= len(batch):
+        raise ValueError(f"Неверный номер публикации: {choice}")
+    return choice - 1, raw
+
+
+async def deliver_best_candidate(
+    ctx: ContextTypes.DEFAULT_TYPE, batch: list[AutoCandidate]
+) -> int:
+    if ctx.chat_data.get("stop"):
+        return 0
+
+    try:
+        index, raw_answer = await choose_best_candidate(batch)
+    except asyncio.CancelledError:
+        raise
+    except OpenAIConfigError as exc:
+        await log(ctx, str(exc))
+        index = 0
+        raw_answer = ""
+    except Exception:
+        logging.exception("Failed to choose best candidate")
+        await log(ctx, "Не удалось выбрать лучший пост, отправляю первый из списка")
+        index = 0
+        raw_answer = ""
+
+    candidate = batch[index]
+    extra = f" Ответ модели: {raw_answer}" if raw_answer else ""
+    await log(
+        ctx,
+        f"Выбран пост №{index + 1} из партии (канал {candidate.channel}, id {candidate.msg_id}).{extra}"
+    )
+
+    try:
+        await ctx.bot.send_message(
+            chat_id=ctx.chat_data["target_chat"],
+            text=candidate.body,
+            parse_mode=tg_const.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logging.exception("Failed to send best candidate message")
+        await log(ctx, "Не удалось отправить лучший пост")
+        return 0
+
+    sent_total = ctx.chat_data.get("sent", 0) + 1
+    ctx.chat_data["sent"] = sent_total
+    return 1
+
+
+async def finalize_auto_batches(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    buffer: list[AutoCandidate] = ctx.chat_data.get("auto_batch_queue", [])
+    if not buffer:
+        return 0
+
+    total_sent = 0
+    while len(buffer) >= 10 and not ctx.chat_data.get("auto_stop"):
+        batch = list(buffer[:10])
+        del buffer[:10]
+        sent = await deliver_best_candidate(ctx, batch)
+        total_sent += sent
+        if ctx.chat_data.get("auto_stop"):
+            break
+    return total_sent
+
+
 async def send_filtered_posts(
     ctx: ContextTypes.DEFAULT_TYPE,
     chan: str,
@@ -917,6 +1123,20 @@ async def send_filtered_posts(
     return sent, attempts
 
 # ────────────── TELEGRAM BOT HANDLERS ──────────────────────────────────────
+AUTO_BATCH_OPTION = "Накопить 10 постов и выбрать лучший."
+AUTO_NORMAL_OPTION = "Работа в обычном режиме."
+AUTO_BACK_OPTION = "🔙 Назад"
+
+AUTO_MODE_KB = ReplyKeyboardMarkup(
+    [
+        [AUTO_BATCH_OPTION],
+        [AUTO_NORMAL_OPTION],
+        [AUTO_BACK_OPTION],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
 BASE_MENU_ROWS = [
     ["🔍 Парсить конкретный канал", "➡️ По очереди все каналы"],
     ["⭐ Популярные посты всех каналов"],
@@ -1118,12 +1338,9 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             ctx.user_data.clear()
-            ctx.chat_data["auto_stop"] = False
-            task = ctx.application.create_task(auto_monitor(ctx))
-            ctx.chat_data["auto_task"] = task
+            ctx.user_data["mode"] = "auto_select"
             await update.message.reply_text(
-                "Авто-выжимка запущена. Мониторю новые посты в реальном времени.",
-                reply_markup=main_menu(ctx),
+                "Выберите режим авто-выжимки:", reply_markup=AUTO_MODE_KB
             )
         return
 
@@ -1175,6 +1392,43 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Выберите действие из меню API ключей.", reply_markup=API_MENU_KB
             )
+        return
+
+    if mode == "auto_select":
+        lowered = text.strip().casefold()
+        if lowered in {"отмена", "cancel"} or text == AUTO_BACK_OPTION:
+            ctx.user_data.clear()
+            await update.message.reply_text(
+                "Возвращаюсь в главное меню.", reply_markup=main_menu(ctx)
+            )
+            return
+        if text not in {AUTO_BATCH_OPTION, AUTO_NORMAL_OPTION}:
+            await update.message.reply_text(
+                "Пожалуйста, выберите режим кнопками ниже.",
+                reply_markup=AUTO_MODE_KB,
+            )
+            return
+        if task_running(ctx):
+            ctx.user_data.clear()
+            await update.message.reply_text(
+                "Уже выполняется задача. Нажмите ⏹ Остановить",
+                reply_markup=main_menu(ctx),
+            )
+            return
+        strategy = "batch_best" if text == AUTO_BATCH_OPTION else "normal"
+        ctx.chat_data["auto_stop"] = False
+        ctx.chat_data["auto_strategy"] = strategy
+        if strategy == "batch_best":
+            ctx.chat_data["auto_batch_queue"] = []
+        ctx.user_data.clear()
+        task = ctx.application.create_task(auto_monitor(ctx))
+        ctx.chat_data["auto_task"] = task
+        start_msg = (
+            "Авто-выжимка запущена. Накоплю 10 постов и пришлю лучший."
+            if strategy == "batch_best"
+            else "Авто-выжимка запущена. Мониторю новые посты в реальном времени."
+        )
+        await update.message.reply_text(start_msg, reply_markup=main_menu(ctx))
         return
 
     if mode == "api_add_keys":
@@ -1762,6 +2016,9 @@ async def auto_cycle(
         started_here = True
     ctx.chat_data["stop"] = False
     ctx.chat_data["sent"] = 0
+    strategy = ctx.chat_data.get("auto_strategy", "normal")
+    if strategy == "batch_best":
+        ctx.chat_data.setdefault("auto_batch_queue", [])
     try:
         for chan in cfg.channels:
             if ctx.chat_data.get("auto_stop"):
@@ -1784,22 +2041,44 @@ async def auto_cycle(
             fresh = [m for m in posts if m.id not in seen and m.id > last_seen]
             if not fresh:
                 continue
-            try:
-                sent, _ = await send_filtered_posts(
-                    ctx,
-                    chan,
-                    fresh,
-                    0,
-                    mode="digest",
-                    notify=False,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logging.exception("Auto cycle failed for channel")
-                await log(ctx, f"Ошибка при обработке канала {chan}")
-                continue
-            total_sent += sent
+            if strategy == "batch_best":
+                for msg in fresh:
+                    if ctx.chat_data.get("auto_stop"):
+                        break
+                    try:
+                        candidate = await prepare_auto_candidate(ctx, msg, chan)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logging.exception("Batch preparation failed")
+                        await log(ctx, f"Ошибка при подготовке поста {msg.id}")
+                        continue
+                    if candidate:
+                        queue: list[AutoCandidate] = ctx.chat_data.setdefault(
+                            "auto_batch_queue", []
+                        )
+                        queue.append(candidate)
+                        sent_now = await finalize_auto_batches(ctx)
+                        total_sent += sent_now
+                if ctx.chat_data.get("auto_stop"):
+                    break
+            else:
+                try:
+                    sent, _ = await send_filtered_posts(
+                        ctx,
+                        chan,
+                        fresh,
+                        0,
+                        mode="digest",
+                        notify=False,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logging.exception("Auto cycle failed for channel")
+                    await log(ctx, f"Ошибка при обработке канала {chan}")
+                    continue
+                total_sent += sent
     finally:
         if started_here:
             await tg_client.disconnect()
@@ -1848,6 +2127,9 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = ctx.chat_data.get("target_chat")
     if chat_id is None:
         return
+    strategy = ctx.chat_data.get("auto_strategy", "normal")
+    if strategy == "batch_best":
+        ctx.chat_data["auto_batch_queue"] = []
     try:
         await tg_client.start()
     except Exception:
@@ -1864,10 +2146,15 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logging.exception("Не удалось подготовить авто-выжимку")
         primed = 0
-    await ctx.bot.send_message(
-        chat_id,
-        "Авто-выжимка активирована. Новые релевантные публикации будут приходить сразу после выхода.",
-    )
+    if strategy == "batch_best":
+        mode_text = (
+            "Авто-выжимка активирована. Собираю партии по 10 постов и пришлю самый полезный."
+        )
+    else:
+        mode_text = (
+            "Авто-выжимка активирована. Новые релевантные публикации будут приходить сразу после выхода."
+        )
+    await ctx.bot.send_message(chat_id, mode_text)
     if primed:
         await ctx.bot.send_message(
             chat_id,
@@ -1899,6 +2186,8 @@ async def auto_monitor(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         ctx.chat_data.pop("auto_stop", None)
         ctx.chat_data.pop("auto_task", None)
+        ctx.chat_data.pop("auto_strategy", None)
+        ctx.chat_data.pop("auto_batch_queue", None)
         try:
             await asyncio.shield(
                 ctx.bot.send_message(chat_id, "Авто-выжимка остановлена.")
