@@ -113,10 +113,17 @@ class BatchAPIExecutor:
     """Utility helper for executing Chat Completions requests through the Batch API."""
 
     POLL_INTERVAL_SECONDS = 3
+    # Safety margins relative to documented limits (50k requests, 200 MB file)
+    MAX_REQUESTS_PER_FILE = 4000
+    MAX_FILE_BYTES = 180 * 1024 * 1024  # 180 MB to leave headroom for encoding/headers
 
-    def __init__(self, client: OpenAI, log_callback):
+    def __init__(self, client: OpenAI, log_callback, *,
+                 max_requests_per_file: int | None = None,
+                 max_file_bytes: int | None = None):
         self._client = client
         self._log_callback = log_callback
+        self._max_requests_per_file = max_requests_per_file or self.MAX_REQUESTS_PER_FILE
+        self._max_file_bytes = max_file_bytes or self.MAX_FILE_BYTES
 
     def _log(self, message: str, level: str = "INFO") -> None:
         if callable(self._log_callback):
@@ -125,37 +132,61 @@ class BatchAPIExecutor:
             except Exception:
                 pass
 
-    def _write_requests_file(self, requests_payload: list[dict]) -> str:
+    def _write_requests_file(self, serialized_requests: list[str]) -> str:
         with NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl", delete=False) as temp_file:
-            for payload in requests_payload:
-                json.dump(payload, temp_file, ensure_ascii=False)
+            for line in serialized_requests:
+                temp_file.write(line)
                 temp_file.write("\n")
             return temp_file.name
 
-    def _parse_batch_output(self, output_text: str) -> dict:
-        results = {}
-        for line in output_text.splitlines():
-            if not line.strip():
-                continue
-            try:
-                data = json.loads(line)
-                custom_id = data.get("custom_id")
-                if custom_id:
-                    results[custom_id] = data
-            except json.JSONDecodeError:
-                continue
-        return results
+    def _chunk_requests(self, requests_payload: list[dict]):
+        """Yield chunks that respect both request-count and approximate byte-size limits."""
 
-    def execute_requests(self, requests_payload: list[dict], *, metadata: dict | None = None) -> dict:
-        if not requests_payload:
-            return {}
+        chunk_payloads: list[dict] = []
+        chunk_lines: list[str] = []
+        chunk_bytes = 0
 
-        temp_path = self._write_requests_file(requests_payload)
+        for payload in requests_payload:
+            serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            encoded = serialized.encode("utf-8")
+            line_size = len(encoded) + 1  # account for newline in jsonl
+
+            if chunk_payloads and (
+                len(chunk_payloads) >= self._max_requests_per_file
+                or chunk_bytes + line_size > self._max_file_bytes
+            ):
+                yield {
+                    "payloads": chunk_payloads,
+                    "lines": chunk_lines,
+                    "bytes": chunk_bytes,
+                }
+                chunk_payloads = []
+                chunk_lines = []
+                chunk_bytes = 0
+
+            if line_size > self._max_file_bytes:
+                raise RuntimeError(
+                    "Batch API: одиночный запрос превышает допустимый размер файла (200 МБ)."
+                )
+
+            chunk_payloads.append(payload)
+            chunk_lines.append(serialized)
+            chunk_bytes += line_size
+
+        if chunk_payloads:
+            yield {
+                "payloads": chunk_payloads,
+                "lines": chunk_lines,
+                "bytes": chunk_bytes,
+            }
+
+    def _execute_chunk(self, *, serialized_lines: list[str], metadata: dict | None = None) -> dict:
+        temp_path = self._write_requests_file(serialized_lines)
         upload = None
         batch_job = None
         try:
             self._log(
-                f"Batch API: загрузка файла запросов ({len(requests_payload)} шт.)",
+                f"Batch API: загрузка файла запросов ({len(serialized_lines)} шт.)",
                 "DEBUG",
             )
             with open(temp_path, "rb") as file_handle:
@@ -163,7 +194,7 @@ class BatchAPIExecutor:
 
             batch_metadata = {"source": "desktop_app"}
             if metadata:
-                batch_metadata.update(metadata)
+                batch_metadata.update({k: str(v) for k, v in metadata.items()})
 
             self._log("Batch API: создание батча", "DEBUG")
             batch_job = self._client.batches.create(
@@ -194,7 +225,11 @@ class BatchAPIExecutor:
                 raise RuntimeError(f"Batch API: батч {batch_job.id} не вернул файл с результатами.")
 
             file_response = self._client.files.content(batch_job.output_file_id)
-            output_text = file_response.text if hasattr(file_response, "text") else file_response.read().decode("utf-8")
+            output_text = (
+                file_response.text
+                if hasattr(file_response, "text")
+                else file_response.read().decode("utf-8")
+            )
             parsed = self._parse_batch_output(output_text)
             return parsed
         finally:
@@ -215,6 +250,53 @@ class BatchAPIExecutor:
                         f"Batch API: не удалось удалить output файл {batch_job.output_file_id}: {delete_exc}",
                         "DEBUG",
                     )
+
+    def _parse_batch_output(self, output_text: str) -> dict:
+        results = {}
+        for line in output_text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+                custom_id = data.get("custom_id")
+                if custom_id:
+                    results[custom_id] = data
+            except json.JSONDecodeError:
+                continue
+        return results
+
+    def execute_requests(self, requests_payload: list[dict], *, metadata: dict | None = None) -> dict:
+        if not requests_payload:
+            return {}
+
+        aggregated: dict = {}
+        chunks = list(self._chunk_requests(requests_payload))
+        total_chunks = len(chunks)
+
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk_metadata = dict(metadata or {})
+            chunk_metadata.update(
+                {
+                    "chunk_index": idx,
+                    "chunk_total": total_chunks,
+                    "chunk_requests": len(chunk["payloads"]),
+                }
+            )
+            size_mb = chunk["bytes"] / (1024 * 1024)
+            self._log(
+                (
+                    f"Batch API: подготовка чанка {idx}/{total_chunks} – "
+                    f"{len(chunk['payloads'])} запросов (~{size_mb:.2f} МБ)."
+                ),
+                "DEBUG",
+            )
+            parsed = self._execute_chunk(
+                serialized_lines=chunk["lines"],
+                metadata=chunk_metadata,
+            )
+            aggregated.update(parsed)
+
+        return aggregated
 
     def execute_single_chat_completion(self, *, messages, model: str, metadata: dict | None = None,
                                        request_id: str | None = None) -> str:
