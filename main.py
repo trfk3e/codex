@@ -2,6 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog  # ttk может понадобиться для таблицы, но постараемся обойтись CTk
 import requests
+import io
 
 try:
     from customtkinter.windows import ctk_toplevel
@@ -25,6 +26,8 @@ import time
 import re
 from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
+
+import uuid
 
 import random
 import traceback
@@ -1360,15 +1363,98 @@ class TextGeneratorApp(ctk.CTkFrame):
             to_wait = PER_KEY_CALL_INTERVAL - (time.time() - last_ts)
             if to_wait > 0:
                 time.sleep(to_wait)
+
+            custom_id = f"request-{uuid.uuid4()}"
+            batch_file_obj = None
+            uploaded_file = None
+            batch_job = None
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
+                batch_line = json.dumps({
+                    "custom_id": custom_id,
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": DEFAULT_MODEL,
+                        "messages": messages,
+                    },
+                }) + "\n"
+
+                batch_file_obj = io.BytesIO(batch_line.encode("utf-8"))
+                batch_file_obj.name = f"batch_{custom_id}.jsonl"
+
+                uploaded_file = client_instance.files.create(file=batch_file_obj, purpose="batch")
+
+                batch_job = client_instance.batches.create(
+                    input_file_id=uploaded_file.id,
+                    endpoint="/v1/chat/completions",
+                    completion_window="24h",
+                )
+
+                poll_start = time.time()
+                poll_interval = 2.0
+                max_wait_seconds = 600
+
+                while True:
+                    if self.stop_event.is_set():
+                        self.log_message("Остановка запрошена во время ожидания выполнения Batch API.", "WARNING")
+                        return None
+
+                    batch_job = client_instance.batches.retrieve(batch_job.id)
+
+                    if batch_job.status == "completed":
+                        break
+
+                    if batch_job.status in {"failed", "cancelled", "expired"}:
+                        error_details = None
+                        if getattr(batch_job, "error_file_id", None):
+                            try:
+                                error_response = client_instance.files.content(batch_job.error_file_id)
+                                if hasattr(error_response, "text"):
+                                    error_details = error_response.text
+                                else:
+                                    error_details = error_response.read().decode("utf-8", "ignore")
+                            except Exception as read_error:
+                                error_details = f"Не удалось получить файл ошибок: {read_error}"
+                        raise RuntimeError(
+                            f"Batch API завершился со статусом '{batch_job.status}'. Детали: {error_details}"
+                        )
+
+                    if time.time() - poll_start > max_wait_seconds:
+                        raise TimeoutError("Превышено время ожидания ответа от Batch API")
+
+                    time.sleep(poll_interval)
+
+                if not getattr(batch_job, "output_file_id", None):
+                    raise RuntimeError("Batch API завершился без output_file_id")
+
+                file_response = client_instance.files.content(batch_job.output_file_id)
+                if hasattr(file_response, "text"):
+                    output_content = file_response.text
+                else:
+                    output_content = file_response.read().decode("utf-8", "ignore")
+
+                completion_text = None
+                for line in output_content.splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        parsed_line = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if parsed_line.get("custom_id") != custom_id:
+                        continue
+                    response_body = parsed_line.get("response", {}).get("body", {})
+                    choices = response_body.get("choices")
+                    if choices:
+                        completion_text = choices[0].get("message", {}).get("content")
+                    break
+
+                if completion_text is None:
+                    raise RuntimeError("Не удалось получить результат из Batch API")
+
                 with api_key_last_call_time_lock:
                     api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
+                return completion_text.strip()
             except RateLimitError as rle:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
