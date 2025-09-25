@@ -23,7 +23,6 @@ import threading
 import os
 import time
 import re
-from openai import OpenAI, APIStatusError
 from queue import Queue, Empty
 
 import random
@@ -42,6 +41,9 @@ import uuid
 import tempfile
 from typing import Callable, Dict, List, Optional, Any
 import contextlib
+from types import SimpleNamespace
+from requests import Response
+from requests import exceptions as requests_exceptions
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 
 if getattr(sys, "frozen", False):
@@ -95,6 +97,9 @@ BATCH_FLUSH_INTERVAL_SECONDS = 15.0  # Максимальное ожидание
 BATCH_REQUEST_TIMEOUT_SECONDS = 1800  # 30 минут ожидания результата конкретного запроса
 BATCH_COMPLETION_TIMEOUT_SECONDS = 4 * 3600  # 4 часа на завершение батча
 BATCH_STATUS_POLL_INTERVAL_SECONDS = 5.0  # Интервал опроса статуса батча
+BATCH_HTTP_TIMEOUT_SECONDS = 60.0  # Таймаут HTTP-запросов к Batch API
+BATCH_HTTP_USER_AGENT = "CodexBatchClient/1.0"
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 # Формат custom_id: используем UUID для уникальности
 BATCH_CUSTOM_ID_PREFIX = "req"
@@ -158,7 +163,6 @@ class BatchAPIManager:
         self.api_key = api_key
         self.model = model
         self.default_logger = default_logger
-        self.client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
         self.pending_requests: List[BatchRequestRecord] = []
         self.condition = threading.Condition()
         self.shutdown_flag = False
@@ -293,20 +297,9 @@ class BatchAPIManager:
             finally:
                 temp_file.close()
 
-            try:
-                with open(temp_file_path, "rb") as f:
-                    upload = self.client.files.create(file=f, purpose="batch")
-                input_file_id = upload.id
-            except APIStatusError as ase:
-                if ase.status_code == 401:
-                    raise BatchInvalidAPIKeyError("Невозможно загрузить файл для Batch API: недействительный ключ.")
-                raise
+            input_file_id = self._upload_batch_file(temp_file_path)
 
-            batch_job = self.client.batches.create(
-                input_file_id=input_file_id,
-                endpoint="/v1/chat/completions",
-                completion_window="24h"
-            )
+            batch_job = self._create_batch_job(input_file_id)
             broadcast(f"Batch API: создан батч {batch_job.id} ({len(batch_requests)} запросов).", "INFO")
 
             start_wait = time.time()
@@ -316,7 +309,7 @@ class BatchAPIManager:
                     raise BatchAPIError(
                         f"Батч {batch_job.id} не завершился за {BATCH_COMPLETION_TIMEOUT_SECONDS} секунд.")
                 time.sleep(BATCH_STATUS_POLL_INTERVAL_SECONDS)
-                batch_job = self.client.batches.retrieve(batch_job.id)
+                batch_job = self._retrieve_batch_job(batch_job.id)
                 current_status = batch_job.status
 
             if current_status != "completed":
@@ -391,24 +384,102 @@ class BatchAPIManager:
                     pass
             if input_file_id:
                 with contextlib.suppress(Exception):
-                    self.client.files.delete(input_file_id)
+                    self._delete_file(input_file_id)
             if output_file_id:
                 with contextlib.suppress(Exception):
-                    self.client.files.delete(output_file_id)
+                    self._delete_file(output_file_id)
             if error_file_id:
                 with contextlib.suppress(Exception):
-                    self.client.files.delete(error_file_id)
+                    self._delete_file(error_file_id)
+
+    def _request(self, method: str, path: str, *, json_body: Optional[Dict[str, Any]] = None,
+                 data: Optional[Dict[str, Any]] = None, files: Optional[Dict[str, Any]] = None,
+                 stream: bool = False) -> Response:
+        url = f"{OPENAI_API_BASE_URL}{path}"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": BATCH_HTTP_USER_AGENT,
+        }
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=json_body,
+                data=data,
+                files=files,
+                timeout=BATCH_HTTP_TIMEOUT_SECONDS,
+                cookies={},
+                stream=stream,
+            )
+        except requests_exceptions.RequestException as exc:
+            raise BatchAPIError(f"Ошибка сети при обращении к Batch API ({method} {path}): {exc}")
+
+        if response.status_code == 401:
+            raise BatchInvalidAPIKeyError("Batch API вернул код 401: недействительный ключ.")
+        if response.status_code >= 400:
+            snippet = response.text[:400] if response.text else f"HTTP {response.status_code}"
+            raise BatchAPIError(
+                f"Batch API запрос {method} {path} завершился с ошибкой {response.status_code}: {snippet}")
+        return response
+
+    def _upload_batch_file(self, file_path: str) -> str:
+        with open(file_path, "rb") as file_obj:
+            files = {
+                "file": (os.path.basename(file_path), file_obj, "application/jsonl")
+            }
+            response = self._request(
+                "POST",
+                "/files",
+                data={"purpose": "batch"},
+                files=files,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BatchAPIError(f"Не удалось распарсить ответ загрузки файла Batch API: {exc}")
+        file_id = payload.get("id")
+        if not file_id:
+            raise BatchAPIError("Ответ загрузки файла не содержит идентификатор файла.")
+        return file_id
+
+    def _create_batch_job(self, input_file_id: str):
+        response = self._request(
+            "POST",
+            "/batches",
+            json_body={
+                "input_file_id": input_file_id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            },
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise BatchAPIError(f"Не удалось распарсить ответ при создании батча: {exc}")
+        return SimpleNamespace(**data)
+
+    def _retrieve_batch_job(self, batch_id: str):
+        response = self._request("GET", f"/batches/{batch_id}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise BatchAPIError(f"Не удалось распарсить ответ при получении статуса батча: {exc}")
+        return SimpleNamespace(**data)
 
     def _read_file_contents(self, file_id: str) -> str:
-        file_response = self.client.files.content(file_id)
-        if hasattr(file_response, "text"):
-            return file_response.text
-        if hasattr(file_response, "read"):
-            data = file_response.read()
-            if isinstance(data, bytes):
-                return data.decode("utf-8", "ignore")
-            return str(data)
-        return str(file_response)
+        response = self._request("GET", f"/files/{file_id}/content", stream=False)
+        return response.text
+
+    def _delete_file(self, file_id: str):
+        try:
+            self._request("DELETE", f"/files/{file_id}")
+        except BatchInvalidAPIKeyError:
+            pass
+        except BatchAPIError:
+            pass
 
 
 class GlobalBatchDispatcher:
