@@ -32,7 +32,7 @@ from telegram.ext import (
 
 from telethon import TelegramClient
 from telethon.tl.types import Message
-from openai import OpenAI, AuthenticationError
+from openai import OpenAI, AuthenticationError, RateLimitError
 
 # ────────────── КОНФИГ ─────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -67,6 +67,9 @@ ATTEMPT_MSG    = (
     "После 50 попыток все ответы AI были - NO, повторите ещё раз, "
     "поменяйте промпт, или выберите другой канал"
 )
+
+API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_\-]{20,}")
+TG_SPLIT_THRESHOLD = 4000
 
 # ────────────── ГЛОБАЛЬНЫЕ КЛИЕНТЫ ─────────────────────────────────────────
 class OpenAIConfigError(RuntimeError):
@@ -262,12 +265,18 @@ async def openai_call(factory, *, timeout=60):
 
     loop = asyncio.get_running_loop()
     while True:
-        idx, _key_id, client = key_manager.acquire_client()
+        idx, key_id, client = key_manager.acquire_client()
         try:
             result = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: factory(client)), timeout
             )
         except AuthenticationError:
+            key_manager.report_failure(idx)
+            continue
+        except RateLimitError:
+            logging.warning(
+                "Ключ %s исчерпал квоту или достиг лимита, переключаюсь", key_id
+            )
             key_manager.report_failure(idx)
             continue
         except OpenAIConfigError:
@@ -952,6 +961,10 @@ SETTINGS_KB = ReplyKeyboardMarkup(
 
 CANCEL_KB = ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True)
 
+API_INPUT_KB = ReplyKeyboardMarkup(
+    [["Готово", "Отмена"]], resize_keyboard=True, one_time_keyboard=False
+)
+
 API_MENU_KB = ReplyKeyboardMarkup(
     [
         ["➕ Добавить API ключи"],
@@ -1072,6 +1085,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         ctx.user_data.clear()
         ctx.user_data["mode"] = "api_menu"
+        ctx.chat_data.pop("api_partial", None)
         masked = key_manager.masked_keys()
         if masked:
             listing = "\n".join(f"{idx + 1}. {mask}" for idx, mask in enumerate(masked))
@@ -1134,18 +1148,26 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "api_menu":
         if text == "➕ Добавить API ключи":
             ctx.user_data["mode"] = "api_add_keys"
+            ctx.chat_data["api_partial"] = ""
             await update.message.reply_text(
-                "Вставьте OpenAI API ключи (каждый на новой строке).",
-                reply_markup=CANCEL_KB,
+                (
+                    "Вставьте OpenAI API ключи (каждый на новой строке). "
+                    "Если сообщение разобьётся на несколько частей, бот "
+                    "склеит ключи автоматически. Когда закончите, отправьте "
+                    "«Готово» или нажмите Отмена."
+                ),
+                reply_markup=API_INPUT_KB,
             )
         elif text == "🗑 Очистить API ключи":
             key_manager.clear_keys()
             ctx.user_data["mode"] = "api_menu"
+            ctx.chat_data.pop("api_partial", None)
             await update.message.reply_text(
                 "Все ключи удалены. Добавьте новые ключи.", reply_markup=API_MENU_KB
             )
         elif text == "🔙 Назад":
             ctx.user_data.clear()
+            ctx.chat_data.pop("api_partial", None)
             await update.message.reply_text(
                 "Возвращаюсь в главное меню.", reply_markup=main_menu(ctx)
             )
@@ -1156,23 +1178,98 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "api_add_keys":
-        raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
-        keys = raw_lines or []
-        added = key_manager.add_keys(keys)
-        total = key_manager.count()
-        if not keys:
-            message = "Не удалось распознать ключи. Вставьте каждый ключ на новой строке."
-        elif added:
-            skipped = len(keys) - len(added)
-            extra = f" (пропущено дублей: {skipped})" if skipped else ""
-            message = f"Добавлено {len(added)} ключей{extra}. Всего сохранено: {total}."
-        else:
-            message = (
-                "Новые ключи не добавлены. Возможно, такие ключи уже есть или формат неверный."
-                f" Всего сохранено: {total}."
+        lowered = text.strip().casefold()
+        if lowered in {"отмена", "cancel"}:
+            ctx.user_data["mode"] = "api_menu"
+            ctx.chat_data.pop("api_partial", None)
+            await update.message.reply_text(
+                "Возвращаюсь в меню управления ключами.", reply_markup=API_MENU_KB
             )
-        ctx.user_data["mode"] = "api_menu"
-        await update.message.reply_text(message, reply_markup=API_MENU_KB)
+            return
+        if lowered in {"готово", "done", "готово!", "готово."}:
+            pending = ctx.chat_data.pop("api_partial", "")
+            extra_added: list[str] = []
+            extra_message = ""
+            if pending:
+                candidate = pending.strip()
+                if API_KEY_PATTERN.fullmatch(candidate):
+                    extra_added = key_manager.add_keys([candidate])
+                    if extra_added:
+                        extra_message = (
+                            "Добавлен последний ключ из неполной строки. "
+                        )
+                    else:
+                        extra_message = (
+                            "Последний ключ уже был в списке и не добавлен. "
+                        )
+                else:
+                    extra_message = "Последняя строка выглядела неполной и была пропущена. "
+            ctx.user_data["mode"] = "api_menu"
+            total = key_manager.count()
+            summary = (
+                f"{extra_message}Всего сохранено ключей: {total}."
+            ).strip()
+            if not summary:
+                summary = f"Всего сохранено ключей: {total}."
+            await update.message.reply_text(summary, reply_markup=API_MENU_KB)
+            return
+
+        combined = (ctx.chat_data.get("api_partial", "") or "") + text
+        combined = combined.replace("\u200b", "").replace("\ufeff", "")
+        lines = combined.splitlines()
+        new_partial = ""
+        force_tail = len(text) >= TG_SPLIT_THRESHOLD and not combined.endswith(("\n", "\r"))
+        if combined and not combined.endswith(("\n", "\r")):
+            last_line = lines[-1] if lines else combined
+            if force_tail or not API_KEY_PATTERN.fullmatch(last_line.strip()):
+                new_partial = last_line
+                if lines:
+                    lines = lines[:-1]
+                else:
+                    lines = []
+        ctx.chat_data["api_partial"] = new_partial
+
+        valid: list[str] = []
+        invalid: list[str] = []
+        for line in lines:
+            candidate = line.strip().strip(",;")
+            if not candidate:
+                continue
+            if API_KEY_PATTERN.fullmatch(candidate):
+                valid.append(candidate)
+            else:
+                invalid.append(candidate)
+
+        added = key_manager.add_keys(valid) if valid else []
+        total = key_manager.count()
+        duplicates = len(valid) - len(added)
+
+        parts: list[str] = []
+        if added:
+            parts.append(f"Добавлено {len(added)} ключей.")
+        if duplicates:
+            parts.append(f"Пропущено дублей: {duplicates}.")
+        if invalid:
+            sample = ", ".join(invalid[:3])
+            parts.append(
+                "Не распознал следующие строки: "
+                f"{sample}{'…' if len(invalid) > 3 else ''}."
+            )
+        if not parts:
+            parts.append(
+                "Не удалось распознать ключи. Убедитесь, что каждый ключ начинается с sk- и находится на новой строке."
+            )
+        if new_partial:
+            parts.append(
+                "Последняя строка выглядит неполной — ожидаю продолжение следующими сообщениями."
+            )
+        else:
+            parts.append(
+                "Можно отправить следующий блок ключей или написать «Готово» для завершения."
+            )
+        parts.append(f"Всего сохранено: {total}.")
+
+        await update.message.reply_text("\n".join(parts), reply_markup=API_INPUT_KB)
         return
 
     # base menu actions should override pending modes
