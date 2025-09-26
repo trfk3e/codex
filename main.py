@@ -23,7 +23,6 @@ import threading
 import os
 import time
 import re
-from openai import OpenAI, RateLimitError, APIConnectionError, APIStatusError
 from queue import Queue, Empty
 
 import random
@@ -48,7 +47,8 @@ def app_path(name: str) -> str:
     return os.path.join(APP_DIR, name)
 
 DEFAULT_CONFIG_FILE = "settings.ini"
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+DEEPINFRA_API_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
 MAX_FILENAME_LENGTH = 100
 MAX_RETRY_PASSES = 3
 # Количество попыток генерации для одного ключевого слова
@@ -151,9 +151,9 @@ def check_first_run_password():
 
 
 HELP_TEXT = (
-    "Программа генерирует статьи с использованием ChatGPT.\n\n"
+    "Программа генерирует статьи с использованием модели DeepInfra meta-llama/Llama-4-Scout-17B-16E-Instruct.\n\n"
 
-    "1. В поле API ключей внесите ваши ключи OpenAI, каждый с новой строкой.\n\n"
+    "1. В поле API ключей внесите ваши ключи DeepInfra, каждый с новой строкой.\n\n"
 
     "2. Укажите папку для сохранения файлов.\n\n"
 
@@ -162,7 +162,7 @@ HELP_TEXT = (
     "   - '!==+ ссылка' — URL, куда будет вести ссылка.\n"
     "   - '!===+ язык' — язык создаваемых текстов.\n"
     "   - '!====+ тема' — например '!====+ Краш игра'. Добавляется перед каждой\n"
-    "     ключевой фразой, если ChatGPT не знает игру.\n\n"
+    "     ключевой фразой, если модель не знает игру.\n\n"
 
     "4. Если ключевая фраза отсутствует в ответе, она вставляется случайно\n"
     "   в один из абзацев до конца текста.\n\n"
@@ -720,6 +720,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         with self.api_key_statuses_lock:
             status_entry = self.api_key_statuses.get(api_key, self._get_default_api_key_status())
             changed_in_function = False
+            was_active = status_entry["status"] == "active"
             try:
                 limit_req_hdr = headers.get('x-ratelimit-limit-requests')
                 remaining_req_hdr = headers.get('x-ratelimit-remaining-requests')
@@ -727,24 +728,32 @@ class TextGeneratorApp(ctk.CTkFrame):
                 limit_tok_hdr = headers.get('x-ratelimit-limit-tokens')
                 remaining_tok_hdr = headers.get('x-ratelimit-remaining-tokens')
                 reset_tok_hdr = headers.get('x-ratelimit-reset-tokens')
+                def _safe_int(value):
+                    try:
+                        return int(value)
+                    except (TypeError, ValueError):
+                        return None
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
                 status_entry["last_updated"] = now_utc
-                if limit_req_hdr: status_entry["limit_requests"] = int(limit_req_hdr)
-                if remaining_req_hdr: status_entry["remaining_requests"] = int(remaining_req_hdr)
+                limit_requests = _safe_int(limit_req_hdr)
+                remaining_requests = _safe_int(remaining_req_hdr)
+                limit_tokens = _safe_int(limit_tok_hdr)
+                remaining_tokens = _safe_int(remaining_tok_hdr)
+                if limit_requests is not None: status_entry["limit_requests"] = limit_requests
+                if remaining_requests is not None: status_entry["remaining_requests"] = remaining_requests
                 if reset_req_hdr: status_entry["reset_requests_at"] = self._parse_ratelimit_reset_time(reset_req_hdr)
-                if limit_tok_hdr: status_entry["limit_tokens"] = int(limit_tok_hdr)
-                if remaining_tok_hdr: status_entry["remaining_tokens"] = int(remaining_tok_hdr)
+                if limit_tokens is not None: status_entry["limit_tokens"] = limit_tokens
+                if remaining_tokens is not None: status_entry["remaining_tokens"] = remaining_tokens
                 if reset_tok_hdr: status_entry["reset_tokens_at"] = self._parse_ratelimit_reset_time(reset_tok_hdr)
 
-                was_active = status_entry["status"] == "active"
                 if is_error and status_code == 429:
-                    if remaining_req_hdr and int(remaining_req_hdr) <= 1:
+                    if remaining_requests is not None and remaining_requests <= 1:
                         status_entry["status"] = "cooldown_requests"
                         self.log_message(
                             f"Ключ {api_key[:7]}... переведен в cooldown (запросы, код 429). Сброс: {status_entry.get('reset_requests_at')}",
                             "WARNING")
                         changed_in_function = True
-                    elif remaining_tok_hdr and int(remaining_tok_hdr) <= 100:
+                    elif remaining_tokens is not None and remaining_tokens <= 100:
                         status_entry["status"] = "cooldown_tokens"
                         self.log_message(
                             f"Ключ {api_key[:7]}... переведен в cooldown (токены, код 429). Сброс: {status_entry.get('reset_tokens_at')}",
@@ -785,7 +794,7 @@ class TextGeneratorApp(ctk.CTkFrame):
         main_frame.pack(padx=20, pady=20, fill="both", expand=True)
         api_frame = ctk.CTkFrame(main_frame)
         api_frame.pack(pady=(10, 5), padx=10, fill="x")
-        ctk.CTkLabel(api_frame, text="API Ключи ChatGPT (каждый с новой строки):").pack(anchor="w", pady=(0, 5))
+        ctk.CTkLabel(api_frame, text="API Ключи DeepInfra (каждый с новой строки):").pack(anchor="w", pady=(0, 5))
         self.api_keys_textbox = ctk.CTkTextbox(api_frame, height=80)
         self.api_keys_textbox.pack(fill="x", expand=True)
         if self.api_keys_list: self.api_keys_textbox.insert("1.0", "\n".join(self.api_keys_list))
@@ -1350,7 +1359,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         return True
         return False
 
-    def call_openai_api(self, client_instance, messages, api_key_used_for_call, retries=3, delay_seconds=0.5):
+    def call_deepinfra_api(self, api_key_used_for_call, messages, retries=3, delay_seconds=0.5):
         for attempt in range(retries):
             if self.stop_event.is_set():
                 self.log_message("API вызов прерван сигналом остановки.", "WARNING")
@@ -1360,84 +1369,103 @@ class TextGeneratorApp(ctk.CTkFrame):
             to_wait = PER_KEY_CALL_INTERVAL - (time.time() - last_ts)
             if to_wait > 0:
                 time.sleep(to_wait)
+
+            headers = {
+                "Authorization": f"Bearer {api_key_used_for_call}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": DEFAULT_MODEL,
+                "messages": messages,
+            }
+
             try:
-                raw_response = client_instance.chat.completions.with_raw_response.create(model=DEFAULT_MODEL,
-        messages=messages, timeout=300)
-                completion = raw_response.parse()
-                if hasattr(raw_response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, raw_response.headers)
+                response = requests.post(DEEPINFRA_API_URL, headers=headers, json=payload, timeout=300)
+                self._update_api_key_status_from_headers(api_key_used_for_call, response.headers)
                 with api_key_last_call_time_lock:
                     api_key_last_call_time[api_key_used_for_call] = time.time()
-                return completion.choices[0].message.content.strip()
-            except RateLimitError as rle:
-                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(f"OpenAI API RateLimitError: {rle}. Попытка {attempt + 1}/{retries}.", log_level)
-                if hasattr(rle, 'response') and rle.response is not None and hasattr(rle.response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, rle.response.headers, is_error=True,
-                                                             status_code=429)
-                specific_error_type = None
-                try:
-                    if hasattr(rle, 'response') and rle.response is not None:
-                        error_details = rle.response.json().get("error", {}); specific_error_type = error_details.get(
-                            "type")
-                    elif hasattr(rle, 'body') and rle.body is not None and 'error' in rle.body:
-                        specific_error_type = rle.body.get('error', {}).get('type')
-                except Exception as e_parse:
-                    self.log_message(f"Не удалось извлечь specific_error_type из RateLimitError: {e_parse}", "DEBUG")
-                if specific_error_type in ['billing_not_active', 'insufficient_quota']:
-                    self.log_message(
-                        f"RateLimitError тип '{specific_error_type}'. Ключ {api_key_used_for_call[:7]}... будет обработан как невалидный.",
-                        "ERROR")
-                    return "INVALID_API_KEY_ERROR"
-                current_delay = delay_seconds * (2 ** attempt)
-                if attempt + 1 < retries:
-                    self.log_message(f"Ожидание {current_delay} секунд перед следующей попыткой...",
-                                     "INFO"); time.sleep(current_delay)
-                else:
-                    return None
-            except APIStatusError as ase:
-                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(
-                    f"OpenAI API StatusError: {ase}. Status Code: {ase.status_code}. Попытка {attempt + 1}/{retries}.",
-                    log_level)
-                if hasattr(ase, 'response') and ase.response is not None and hasattr(ase.response, 'headers'):
-                    self._update_api_key_status_from_headers(api_key_used_for_call, ase.response.headers, is_error=True,
-                                                             status_code=ase.status_code)
-                if ase.status_code == 401:
-                    self.log_message(
-                        f"Ошибка 401: Недействительный API ключ {api_key_used_for_call[:7]}.... Ключ будет обработан как невалидный.",
-                        "ERROR")
-                    return "INVALID_API_KEY_ERROR"
-                if ase.status_code == 429:
-                    specific_error_type_ase = None
+
+                if response.status_code == 200:
                     try:
-                        if hasattr(ase, 'response') and ase.response is not None:
-                            error_details_ase = ase.response.json().get("error",
-                                                                        {}); specific_error_type_ase = error_details_ase.get(
-                                "type")
-                        elif hasattr(ase, 'body') and ase.body is not None and 'error' in ase.body:
-                            specific_error_type_ase = ase.body.get('error', {}).get('type')
-                    except Exception as e_parse_ase:
-                        self.log_message(f"Не удалось извлечь specific_error_type из APIStatusError 429: {e_parse_ase}",
-                                         "DEBUG")
-                    if specific_error_type_ase in ['billing_not_active', 'insufficient_quota']:
+                        completion = response.json()
+                    except ValueError as parse_exc:
                         self.log_message(
-                            f"APIStatusError 429 тип '{specific_error_type_ase}'. Ключ {api_key_used_for_call[:7]}... будет обработан как невалидный.",
-                            "ERROR")
+                            f"DeepInfra API: не удалось разобрать JSON ответа: {parse_exc}.", "ERROR"
+                        )
+                        return None
+                    choices = completion.get("choices") or []
+                    if not choices:
+                        self.log_message("DeepInfra API вернул пустой список choices.", "ERROR")
+                        return None
+                    message_content = choices[0].get("message", {}).get("content")
+                    if not message_content:
+                        self.log_message("DeepInfra API вернул пустой ответ сообщения.", "ERROR")
+                        return None
+                    return message_content.strip()
+
+                error_details = {}
+                try:
+                    error_details = response.json().get("error", {})
+                except ValueError:
+                    error_details = {"message": response.text}
+
+                status_code = response.status_code
+                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
+                if status_code == 401:
+                    self.log_message(
+                        f"DeepInfra API 401: Недействительный API ключ {api_key_used_for_call[:7]}.... Ключ будет обработан как невалидный.",
+                        "ERROR",
+                    )
+                    return "INVALID_API_KEY_ERROR"
+                if status_code == 403:
+                    self.log_message(
+                        f"DeepInfra API 403: доступ запрещен для ключа {api_key_used_for_call[:7]}....", "ERROR"
+                    )
+                    return "INVALID_API_KEY_ERROR"
+                if status_code == 429:
+                    specific_error_type = error_details.get("type")
+                    if specific_error_type in ["billing_not_active", "insufficient_quota"]:
+                        self.log_message(
+                            f"DeepInfra API 429 тип '{specific_error_type}'. Ключ {api_key_used_for_call[:7]}... будет обработан как невалидный.",
+                            "ERROR",
+                        )
                         return "INVALID_API_KEY_ERROR"
-                    self.log_message(f"Получен статус 429 (Rate Limit) как APIStatusError. Увеличенная задержка.",
-                                     "WARNING")
+                    self.log_message(
+                        f"DeepInfra API: превышен лимит (429). Попытка {attempt + 1}/{retries}.", log_level
+                    )
+                    self._update_api_key_status_from_headers(
+                        api_key_used_for_call, response.headers, is_error=True, status_code=status_code
+                    )
                     current_delay = delay_seconds * (2 ** attempt) * 1.5
                 else:
-                    current_delay = delay_seconds * (2 ** attempt)
+                    error_message = error_details.get("message") or response.text
+                    self.log_message(
+                        f"DeepInfra API ошибка {status_code}: {error_message}. Попытка {attempt + 1}/{retries}.",
+                        log_level,
+                    )
+                    current_delay = delay_seconds * (attempt + 1)
+
                 if attempt + 1 < retries:
-                    self.log_message(f"Ожидание {current_delay:.2f} секунд перед следующей попыткой...",
-                                     "INFO"); time.sleep(current_delay)
+                    time.sleep(current_delay)
+                    continue
+                return None
+
+            except requests.Timeout as timeout_exc:
+                log_level = "ERROR" if attempt + 1 == retries else "WARNING"
+                self.log_message(
+                    f"DeepInfra API timeout: {timeout_exc}. Попытка {attempt + 1}/{retries}.", log_level
+                )
+                current_delay = delay_seconds * (attempt + 1)
+                if attempt + 1 < retries:
+                    time.sleep(current_delay)
                 else:
                     return None
-            except APIConnectionError as ace:
+            except requests.RequestException as req_exc:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
-                self.log_message(f"OpenAI API ConnectionError: {ace}. Попытка {attempt + 1}/{retries}.", log_level)
+                self.log_message(
+                    f"DeepInfra API ошибка соединения ({type(req_exc).__name__}): {req_exc}. Попытка {attempt + 1}/{retries}.",
+                    log_level,
+                )
                 current_delay = delay_seconds * (attempt + 1)
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
@@ -1446,8 +1474,9 @@ class TextGeneratorApp(ctk.CTkFrame):
             except Exception as e:
                 log_level = "ERROR" if attempt + 1 == retries else "WARNING"
                 self.log_message(
-                    f"Неожиданная ошибка OpenAI API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
-                    log_level)
+                    f"Неожиданная ошибка DeepInfra API ({type(e).__name__}): {e}. Попытка {attempt + 1}/{retries}.",
+                    log_level,
+                )
                 current_delay = delay_seconds * (attempt + 1)
                 if attempt + 1 < retries:
                     time.sleep(current_delay)
@@ -1582,7 +1611,6 @@ class TextGeneratorApp(ctk.CTkFrame):
         if self.stop_event.is_set(): return False
 
         retrieved_api_key_str = None
-        openai_client = None
         key_marked_as_bad_in_this_task = False
         key_went_to_cooldown_in_this_task = False
 
@@ -1604,25 +1632,9 @@ class TextGeneratorApp(ctk.CTkFrame):
             key_short_display = f"...{retrieved_api_key_str[-5:]}" if len(
                 retrieved_api_key_str) > 5 else retrieved_api_key_str
             log_prefix = f"[{task_id} ({task_num_for_keyword}/{total_tasks_for_keyword} для '{keyword_phrase}', {selected_lang}, ключ {key_short_display}), Общая {global_task_num}/{total_global_tasks}]"
-            openai_client = OpenAI(api_key=retrieved_api_key_str, timeout=30.0, max_retries=0)
-            if openai_client is None: raise ValueError("Клиент OpenAI не был инициализирован.")
         except Empty:
             self.log_message(f"{log_prefix_base} Ошибка: Таймаут получения API ключа из очереди.", "ERROR")
             self._initial_check_and_revive_keys()
-            return False
-        except Exception as e_init:
-            self.log_message(
-                f"{log_prefix_base} Ошибка инициализации клиента OpenAI ({retrieved_api_key_str[:7] if retrieved_api_key_str else 'N/A'}...): {e_init}. Пропуск.",
-                "ERROR")
-            if retrieved_api_key_str:
-                with self.api_key_statuses_lock:
-                    status_data = self.api_key_statuses.get(retrieved_api_key_str, self._get_default_api_key_status())
-                if status_data.get("status") == "active":
-                    self.api_key_queue.put(retrieved_api_key_str)
-                else:
-                    self.log_message(
-                        f"Ключ {key_short_display} не возвращен в очередь, статус: {status_data.get('status')}.",
-                        "DEBUG")
             return False
 
         try:
@@ -1651,7 +1663,7 @@ class TextGeneratorApp(ctk.CTkFrame):
                         "content": f"Сделай так, чтобы главный первый заголовок не был похож вообще на этот, проработай тщательно начало и конец, чтобы не было повторений: \"{self.previous_h1_text}\". ОБЗЯТАТЕЛЬНО НАЧАЛО НЕ ДОЛЖНО СОВПАДАТЬ!!!"
                     })
 
-            original_h1_text_raw = self.call_openai_api(openai_client, base_h1_prompt, retrieved_api_key_str)
+            original_h1_text_raw = self.call_deepinfra_api(retrieved_api_key_str, base_h1_prompt)
 
             if original_h1_text_raw == "INVALID_API_KEY_ERROR":
                 self.log_message(f"{log_prefix} API ключ {key_short_display} невалиден (H1). Обработка...", "ERROR")
@@ -1797,12 +1809,14 @@ class TextGeneratorApp(ctk.CTkFrame):
                                                                                original_h1_text)
             # --- КОНЕЦ ВАЖНОГО ИЗМЕНЕНИЯ ---
 
-            article_body_raw_from_api = self.call_openai_api(openai_client,
-                                                             [{"role": "system", "content": body_prompt_system},
-                                                              # Теперь body_prompt_system определена
-                                                              {"role": "user", "content": body_prompt_user}],
-                                                             # Теперь body_prompt_user определена
-                                                             retrieved_api_key_str)
+            article_body_raw_from_api = self.call_deepinfra_api(
+                retrieved_api_key_str,
+                [
+                    {"role": "system", "content": body_prompt_system},
+                    # Теперь body_prompt_system определена
+                    {"role": "user", "content": body_prompt_user},
+                ],
+            )
 
             # ... (остальной код вашего метода)
 
@@ -2458,7 +2472,7 @@ class ApiKeyStatusWindow(ctk.CTkToplevel):
         self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.main_frame.pack(padx=10, pady=10, fill="both", expand=True)
 
-        ctk.CTkLabel(self.main_frame, text="Состояние API ключей OpenAI:",
+        ctk.CTkLabel(self.main_frame, text="Состояние API ключей DeepInfra:",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(0, 10))
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self.main_frame)
