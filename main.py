@@ -44,6 +44,7 @@ import contextlib
 from types import SimpleNamespace
 from requests import Response, Request
 from requests import exceptions as requests_exceptions
+from requests.cookies import RequestsCookieJar
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 
 if getattr(sys, "frozen", False):
@@ -155,6 +156,19 @@ class BatchRequestRecord:
         self.error: Optional[Exception] = None
 
 
+class _NullCookieJar(RequestsCookieJar):
+    """CookieJar, игнорирующий любые куки от Cloudflare."""
+
+    def set_cookie(self, *args, **kwargs):  # type: ignore[override]
+        return
+
+    def update(self, other):  # type: ignore[override]
+        return
+
+    def copy(self):  # type: ignore[override]
+        return _NullCookieJar()
+
+
 class BatchAPIManager:
     """Менеджер, который накапливает запросы и выполняет их через Batch API."""
 
@@ -170,7 +184,7 @@ class BatchAPIManager:
         except Exception:
             # В некоторых версиях requests headers может быть обычным dict
             self._session.headers = {}
-        self._session.cookies.clear()
+        self._session.cookies = _NullCookieJar()
         self.pending_requests: List[BatchRequestRecord] = []
         self.condition = threading.Condition()
         self.shutdown_flag = False
@@ -429,6 +443,7 @@ class BatchAPIManager:
             files=files,
         )
         prepared = self._session.prepare_request(request)
+        prepared.prepare_cookies({})
         # Удаляем любые автоматически добавленные cookie, чтобы Cloudflare не получал длинный заголовок
         if "Cookie" in prepared.headers:
             prepared.headers.pop("Cookie", None)
