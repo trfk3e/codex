@@ -45,6 +45,7 @@ from types import SimpleNamespace
 from requests import Response, Request
 from requests import exceptions as requests_exceptions
 from requests.cookies import RequestsCookieJar
+from requests.adapters import HTTPAdapter
 # from multiprocessing import Process, freeze_support  # Multiprocessing no longer used
 
 if getattr(sys, "frozen", False):
@@ -169,6 +170,29 @@ class _NullCookieJar(RequestsCookieJar):
         return _NullCookieJar()
 
 
+class _NoCookieHTTPAdapter(HTTPAdapter):
+    """Адаптер, удаляющий Cookie-заголовки перед отправкой."""
+
+    def send(self, request, **kwargs):  # type: ignore[override]
+        try:
+            headers = request.headers  # type: ignore[attr-defined]
+        except AttributeError:
+            headers = {}
+        if headers:
+            for header_name in list(headers.keys()):
+                if header_name.lower() == "cookie":
+                    headers.pop(header_name, None)
+        # Убеждаемся, что cookies не будут восстановлены внутри requests
+        try:
+            request._cookies = _NullCookieJar()
+        except AttributeError:
+            pass
+        response = super().send(request, **kwargs)
+        with contextlib.suppress(Exception):
+            response.cookies.clear()
+        return response
+
+
 class BatchAPIManager:
     """Менеджер, который накапливает запросы и выполняет их через Batch API."""
 
@@ -185,6 +209,9 @@ class BatchAPIManager:
             # В некоторых версиях requests headers может быть обычным dict
             self._session.headers = {}
         self._session.cookies = _NullCookieJar()
+        adapter = _NoCookieHTTPAdapter()
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self.pending_requests: List[BatchRequestRecord] = []
         self.condition = threading.Condition()
         self.shutdown_flag = False
@@ -443,10 +470,14 @@ class BatchAPIManager:
             files=files,
         )
         prepared = self._session.prepare_request(request)
-        prepared.prepare_cookies({})
         # Удаляем любые автоматически добавленные cookie, чтобы Cloudflare не получал длинный заголовок
-        if "Cookie" in prepared.headers:
-            prepared.headers.pop("Cookie", None)
+        for header_name in list(prepared.headers.keys()):
+            if header_name.lower() == "cookie":
+                prepared.headers.pop(header_name, None)
+        try:
+            prepared._cookies = _NullCookieJar()
+        except AttributeError:
+            pass
         send_kwargs = self._session.merge_environment_settings(
             prepared.url,
             proxies={},
